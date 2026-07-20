@@ -87,7 +87,8 @@ export function PromptOptionsMenu({
         <Icon name="chevronDown" size={9} className="text-faint" />
       </button>
       {open && (
-        <div className="absolute bottom-full left-0 z-40 mb-1.5 w-[min(360px,calc(100vw-32px))] rounded-lg border border-line2 bg-raise p-3 shadow-[var(--shadow-float)] animate-fade-up">
+        // Open downward so the panel never covers the textarea above the toolbar.
+        <div className="absolute left-0 top-full z-50 mt-1.5 w-[min(360px,calc(100vw-32px))] rounded-lg border border-line2 bg-raise p-3 shadow-[var(--shadow-float)] animate-fade-up">
           <OptionRow label={language === "zh-CN" ? "工作模式" : "Mode"} values={[
             ["agent", language === "zh-CN" ? "执行" : "Agent"],
             ["plan", language === "zh-CN" ? "计划" : "Plan"],

@@ -25,6 +25,7 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
     deny: language === "zh-CN" ? "拒绝" : "Deny",
   };
 
+  const optionKey = options.join(",");
   useEffect(() => {
     if (resolved || !isActive) return;
     const onKey = (e: KeyboardEvent) => {
@@ -36,7 +37,8 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [resolved, isActive, options, block.id, resolvePermission]);
+    // optionKey is a stable string form of `options` (rebuilt each render).
+  }, [resolved, isActive, optionKey, block.id, resolvePermission]);
 
   return (
     <div

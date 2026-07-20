@@ -43,7 +43,7 @@ WebView 不直接启动任意命令。Rust 层只托管已解析的 Grok Build �
 
 ## 快速开始
 
-开发源码需要 Node.js、pnpm、Rust，以及 Windows WebView2 或对应平台的 Tauri 系统依赖。正式安装包已经内置 Grok Build 运行时，普通用户无需另行安装 CLI；如果检测到本机已有 Grok CLI，Grox 会优先使用它。
+开发源码需要 Node.js、pnpm、Rust，以及 Windows WebView2 或对应平台的 Tauri 系统依赖。默认 **lite** 模式只打包桌面壳，运行时使用本机已安装的 Grok Build CLI（`~/.grok/bin/grok`、PATH，或 `GROK_DESKTOP_CLI`）；需要零依赖安装包时再用 bundled 模式内置 Agent。
 
 ```powershell
 cd apps/desktop
@@ -52,8 +52,11 @@ pnpm install
 # 浏览器 Mock，适合只看界面
 pnpm dev
 
-# 编译 debug Agent sidecar 并启动真实桌面端
+# lite：不编译 Agent，使用本机 Grok CLI 启动桌面端
 pnpm desktop:dev
+
+# 可选：编译 debug sidecar 并以内置 Agent 启动
+pnpm desktop:dev:bundled
 ```
 
 桌面端默认使用真实 ACP。浏览器环境自动使用 Mock；Tauri 中可用 `?mock=1` 临时切换 Mock。
@@ -63,17 +66,22 @@ pnpm desktop:dev
 ```powershell
 $env:GROK_DESKTOP_CLI = "D:\path\to\grok.exe"
 $env:GROK_DESKTOP_CWD = "D:\path\to\workspace"
-pnpm tauri dev
+pnpm desktop:dev
 ```
 
 ## 构建安装包
 
 ```powershell
 cd apps/desktop
+
+# lite（推荐，自用 / 已安装 Grok CLI）：只构建 Tauri 壳，不编译 sidecar
 pnpm desktop:build
+
+# bundled：用 release-dist 编译 xai-grok-pager 并打进安装包（慢）
+pnpm desktop:build:bundled
 ```
 
-该命令会使用根工作区的 `release-dist` profile 编译 `xai-grok-pager`，复制为 Tauri 目标三元组 sidecar，再构建当前平台安装包。Windows 构建已内置 vendored `protoc`，不需要额外安装 protobuf 编译器。
+`desktop:build` 不会编译根工作区的 Grok Agent，构建会快很多；运行时解析顺序为 `GROK_DESKTOP_CLI` → 系统 `grok` →（仅 bundled 包）内置 sidecar。GitHub Release 默认也走 lite。Windows 上若走 bundled 构建，已内置 vendored `protoc`。
 
 代码签名、macOS notarization 和更新服务凭据属于发布环境配置，不应提交到仓库。
 

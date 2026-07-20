@@ -7,6 +7,7 @@ import type { SessionBlock } from "../../bridge/types";
 import { fmtClock } from "../../lib/format";
 import { useI18n } from "../../lib/i18n";
 import { Markdown } from "../../lib/markdown";
+import { ImageLightbox } from "../common/ImageLightbox";
 import { BlackHole } from "../fx/BlackHole";
 import { Icon } from "../fx/Icon";
 import { RewindMenu } from "./RewindMenu";
@@ -21,10 +22,16 @@ export function UserMsg({ block, rewindPromptIndex }: { block: UserBlock; rewind
   const zh = language === "zh-CN";
   const [expanded, setExpanded] = useState(false);
   const [overflowing, setOverflowing] = useState(false);
+  const [preview, setPreview] = useState<{ src: string; alt: string } | null>(null);
   const textRef = useRef<HTMLParagraphElement>(null);
   useLayoutEffect(() => {
     const element = textRef.current;
-    if (element && !expanded) setOverflowing(element.scrollHeight > element.clientHeight + 1);
+    if (!element || expanded) {
+      setOverflowing(false);
+      return;
+    }
+    const next = element.scrollHeight > element.clientHeight + 1;
+    setOverflowing((prev) => (prev === next ? prev : next));
   }, [block.text, expanded]);
   return (
     <div className="group/user mb-5 flex animate-fade-up justify-end">
@@ -36,14 +43,47 @@ export function UserMsg({ block, rewindPromptIndex }: { block: UserBlock; rewind
             </p>
           ) : null}
           {block.attachments && block.attachments.length > 0 && (
-            <div className={`${block.text ? "mt-2.5" : ""} flex flex-wrap gap-1.5`}>
-              {block.attachments.map((attachment) => (
-                <span key={attachment.id} className="flex max-w-[220px] items-center gap-1.5 rounded-md bg-raise/80 px-2.5 py-1 text-[11px] text-mute">
-                  <Icon name={attachment.kind === "image" ? "square" : "file"} size={9} className={attachment.kind === "image" ? "text-acc" : "text-dim"} />
-                  <span className="truncate">{attachment.name}</span>
-                  <span className="text-faint">{attachment.size < 1024 * 1024 ? `${Math.max(1, Math.round(attachment.size / 1024))}K` : `${(attachment.size / 1024 / 1024).toFixed(1)}M`}</span>
-                </span>
-              ))}
+            <div className={`${block.text ? "mt-2.5" : ""} flex flex-wrap gap-2`}>
+              {block.attachments.map((attachment) =>
+                attachment.kind === "image" && attachment.data ? (
+                  <button
+                    key={attachment.id}
+                    type="button"
+                    className="group/thumb block overflow-hidden rounded-xl border border-line2 bg-raise shadow-sm transition-opacity hover:opacity-95"
+                    title={zh ? `点击预览 ${attachment.name}` : `Preview ${attachment.name}`}
+                    onClick={() =>
+                      setPreview({
+                        src: `data:${attachment.mime};base64,${attachment.data}`,
+                        alt: attachment.name,
+                      })
+                    }
+                  >
+                    <img
+                      src={`data:${attachment.mime};base64,${attachment.data}`}
+                      alt={attachment.name}
+                      className="h-28 w-28 object-cover transition-transform duration-150 group-hover/thumb:scale-[1.02]"
+                      loading="lazy"
+                    />
+                  </button>
+                ) : (
+                  <span
+                    key={attachment.id}
+                    className="flex max-w-[220px] items-center gap-1.5 rounded-md bg-raise/80 px-2.5 py-1 text-[11px] text-mute"
+                  >
+                    <Icon
+                      name={attachment.kind === "image" ? "square" : "file"}
+                      size={9}
+                      className={attachment.kind === "image" ? "text-acc" : "text-dim"}
+                    />
+                    <span className="truncate">{attachment.name}</span>
+                    <span className="text-faint">
+                      {attachment.size < 1024 * 1024
+                        ? `${Math.max(1, Math.round(attachment.size / 1024))}K`
+                        : `${(attachment.size / 1024 / 1024).toFixed(1)}M`}
+                    </span>
+                  </span>
+                ),
+              )}
             </div>
           )}
           {(overflowing || expanded || rewindPromptIndex !== undefined) && (
@@ -62,6 +102,9 @@ export function UserMsg({ block, rewindPromptIndex }: { block: UserBlock; rewind
           {fmtClock(block.ts)}
         </span>
       </div>
+      {preview && (
+        <ImageLightbox src={preview.src} alt={preview.alt} onClose={() => setPreview(null)} />
+      )}
     </div>
   );
 }

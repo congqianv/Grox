@@ -5,6 +5,9 @@ const zh = {
   newProject: "新项目",
   projects: "项目",
   missions: "任务",
+  sessions: "会话",
+  expandAll: "全部展开",
+  collapseAll: "全部折叠",
   archived: "已归档",
   pin: "置顶",
   unpin: "取消置顶",
@@ -88,7 +91,8 @@ const zh = {
 } as const;
 
 const en: Record<keyof typeof zh, string> = {
-  newProject: "New project", projects: "Projects", missions: "Missions", archived: "Archived",
+  newProject: "New project", projects: "Projects", missions: "Missions", sessions: "Sessions",
+  expandAll: "Expand all", collapseAll: "Collapse all", archived: "Archived",
   pin: "Pin", unpin: "Unpin", archive: "Archive", unarchive: "Unarchive", rename: "Rename",
   remove: "Remove", delete: "Delete", openExplorer: "Open in Explorer", settings: "Settings",
   account: "Account", appearance: "Appearance & language", extensions: "Extensions",

@@ -30,6 +30,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Lite release: desktop shell only. Runtime uses system Grok CLI
+          # (~/.grok/bin/grok, PATH, or GROK_DESKTOP_CLI). No bundled sidecar.
           - name: Windows x64
             platform: windows-latest
             args: ""
@@ -67,7 +69,6 @@ jobs:
         uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
-            . -> target
             apps/desktop/src-tauri -> target
 
       - name: Install frontend dependencies
@@ -78,11 +79,7 @@ jobs:
         working-directory: apps/desktop
         run: node scripts/sync-release-version.mjs ${{ github.ref_name }}
 
-      - name: Build Grok sidecar
-        working-directory: apps/desktop
-        run: pnpm agent:sidecar -- ${{ matrix.args }}
-
-      - name: Build and publish release
+      - name: Build and publish lite release
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

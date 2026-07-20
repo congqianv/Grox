@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useDesktop, type ProjectMeta } from "../../state/store";
 import { usePreferences } from "../../state/preferences";
@@ -8,6 +8,8 @@ import { Wordmark } from "../fx/Wordmark";
 import { Icon } from "../fx/Icon";
 import type { Session, SessionMeta } from "../../bridge/types";
 import { BlackHole } from "../fx/BlackHole";
+
+const EMPTY_SESSIONS: SessionMeta[] = [];
 
 export function Sidebar() {
   const { t, language } = useI18n();
@@ -55,14 +57,34 @@ export function Sidebar() {
     return () => document.removeEventListener("pointerdown", close);
   }, [accountOpen]);
 
-  const orderedProjects = [...projects].sort(
-    (a, b) => Number(b.pinned) - Number(a.pinned) || b.lastOpenedAt - a.lastOpenedAt,
+  const orderedProjects = useMemo(
+    () => [...projects].sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.lastOpenedAt - a.lastOpenedAt),
+    [projects],
   );
-  const orderedSessions = [...sessionIndex].sort(
-    (a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || b.updatedAt - a.updatedAt,
+  const orderedSessions = useMemo(
+    () => [...sessionIndex].sort(
+      (a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || b.updatedAt - a.updatedAt,
+    ),
+    [sessionIndex],
   );
+  const sessionsByProject = useMemo(() => {
+    const map = new Map<string, SessionMeta[]>();
+    for (const session of orderedSessions) {
+      const key = projectKey(session.cwd);
+      const list = map.get(key);
+      if (list) list.push(session);
+      else map.set(key, [session]);
+    }
+    return map;
+  }, [orderedSessions]);
+
   const activeProjects = orderedProjects.filter((project) => !project.archived);
   const archivedProjects = orderedProjects.filter((project) => project.archived);
+  const foldableIds = activeProjects.map((project) => project.id);
+  const allExpanded = foldableIds.length > 0 && foldableIds.every((id) => expandedProjectIds.has(id));
+
+  const expandAll = () => setExpandedProjectIds(new Set(foldableIds));
+  const collapseAll = () => setExpandedProjectIds(new Set());
 
   return (
     <aside className="relative flex shrink-0 flex-col border-r border-line bg-panel" style={{ width }}>
@@ -96,14 +118,30 @@ export function Sidebar() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
-        <SectionTitle label={t("projects")} count={projects.length} />
+        <SectionTitle
+          label={t("projects")}
+          count={projects.length}
+          action={
+            foldableIds.length > 0 ? (
+              <button
+                type="button"
+                onClick={allExpanded ? collapseAll : expandAll}
+                title={allExpanded ? t("collapseAll") : t("expandAll")}
+                className="flex h-6 items-center gap-1 rounded-md px-1.5 text-[11px] text-faint transition-colors hover:bg-high hover:text-fg2"
+              >
+                <Icon name={allExpanded ? "collapseAll" : "expandAll"} size={11} />
+                <span className="hidden min-[220px]:inline">{allExpanded ? t("collapseAll") : t("expandAll")}</span>
+              </button>
+            ) : null
+          }
+        />
         {activeProjects.map((project) => (
           <ProjectGroup
             key={project.id}
             project={project}
             active={project.id === activeProjectId}
             expanded={expandedProjectIds.has(project.id)}
-            sessions={orderedSessions.filter((session) => sameWorkspace(session.cwd, project.path))}
+            sessions={sessionsByProject.get(projectKey(project.path)) ?? EMPTY_SESSIONS}
             activeId={activeId}
             loadedSessions={sessions}
             onOpenSession={(id) => void openSession(id)}
@@ -123,7 +161,7 @@ export function Sidebar() {
                 project={project}
                 active={project.id === activeProjectId}
                 expanded={expandedProjectIds.has(project.id)}
-                sessions={orderedSessions.filter((session) => sameWorkspace(session.cwd, project.path))}
+                sessions={sessionsByProject.get(projectKey(project.path)) ?? EMPTY_SESSIONS}
                 activeId={activeId}
                 loadedSessions={sessions}
                 onOpenSession={(id) => void openSession(id)}
@@ -203,9 +241,8 @@ export function Sidebar() {
   );
 }
 
-const sameWorkspace = (left: string, right: string) =>
-  left.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase() ===
-  right.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
+const projectKey = (path: string) =>
+  path.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
 
 function ProjectGroup({
   project,
@@ -230,7 +267,7 @@ function ProjectGroup({
   const visible = sessions.filter((session) => !session.archived);
   const archived = sessions.filter((session) => session.archived);
   return (
-    <div className="mb-1">
+    <div className="mb-2">
       <ProjectRow
         project={project}
         active={active}
@@ -238,33 +275,39 @@ function ProjectGroup({
         count={visible.length}
         onToggle={onToggle}
       />
-      {expanded && sessions.length > 0 && (
-        <div className="ml-2 space-y-0.5 pl-1">
-          {visible.map((meta) => (
-            <MissionRow
-              key={meta.id}
-              meta={meta}
-              running={loadedSessions[meta.id]?.status === "running"}
-              awaiting={["awaiting_permission", "awaiting_input"].includes(loadedSessions[meta.id]?.status ?? "")}
-              active={meta.id === activeId}
-              tokens={(loadedSessions[meta.id]?.usage.inputTokens ?? 0) + (loadedSessions[meta.id]?.usage.outputTokens ?? 0)}
-              onOpen={() => onOpenSession(meta.id)}
-            />
-          ))}
-          {archived.length > 0 && (
-            <ArchiveGroup label={t("archived")}>
-              {archived.map((meta) => (
+      {expanded && (
+        <div className="relative ml-3 mt-0.5 space-y-0.5 border-l border-line2 pl-2.5">
+          {visible.length === 0 && archived.length === 0 ? (
+            <p className="px-2 py-1.5 text-[11px] text-faint">{t("noMission")}</p>
+          ) : (
+            <>
+              {visible.map((meta) => (
                 <MissionRow
                   key={meta.id}
                   meta={meta}
-                  running={false}
-                  awaiting={false}
+                  running={loadedSessions[meta.id]?.status === "running"}
+                  awaiting={["awaiting_permission", "awaiting_input"].includes(loadedSessions[meta.id]?.status ?? "")}
                   active={meta.id === activeId}
                   tokens={(loadedSessions[meta.id]?.usage.inputTokens ?? 0) + (loadedSessions[meta.id]?.usage.outputTokens ?? 0)}
                   onOpen={() => onOpenSession(meta.id)}
                 />
               ))}
-            </ArchiveGroup>
+              {archived.length > 0 && (
+                <ArchiveGroup label={t("archived")}>
+                  {archived.map((meta) => (
+                    <MissionRow
+                      key={meta.id}
+                      meta={meta}
+                      running={false}
+                      awaiting={false}
+                      active={meta.id === activeId}
+                      tokens={(loadedSessions[meta.id]?.usage.inputTokens ?? 0) + (loadedSessions[meta.id]?.usage.outputTokens ?? 0)}
+                      onOpen={() => onOpenSession(meta.id)}
+                    />
+                  ))}
+                </ArchiveGroup>
+              )}
+            </>
           )}
         </div>
       )}
@@ -272,11 +315,22 @@ function ProjectGroup({
   );
 }
 
-function SectionTitle({ label, count }: { label: string; count: number }) {
+function SectionTitle({
+  label,
+  count,
+  action,
+}: {
+  label: string;
+  count: number;
+  action?: React.ReactNode;
+}) {
   return (
-    <div className="flex h-7 items-center justify-between px-2">
-      <span className="text-[11.5px] font-medium text-mute">{label}</span>
-      <span className="tnum text-[11px] text-faint">{count}</span>
+    <div className="mb-1 flex h-7 items-center justify-between gap-1 px-1.5">
+      <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-mute">{label}</span>
+      <div className="flex items-center gap-1">
+        {action}
+        <span className="tnum text-[11px] text-faint">{count}</span>
+      </div>
     </div>
   );
 }
@@ -310,12 +364,24 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
   };
 
   return (
-    <div className={`group relative mb-px flex h-8 items-center gap-1 rounded-md px-1 ${active ? "bg-high text-fg" : "text-fg2 hover:bg-high/70"}`}>
-      <button onClick={onToggle} className="flex h-6 w-5 shrink-0 items-center justify-center text-faint hover:text-fg" title={expanded ? "Collapse" : "Expand"}>
-        <Icon name="chevronRight" size={10} className={`transition-transform ${expanded ? "rotate-90" : ""}`} />
+    <div
+      className={`group relative mb-px flex h-9 items-center gap-1 rounded-md border px-1 ${
+        active
+          ? "border-line2 bg-raise text-fg shadow-[inset_0_0_0_1px_var(--color-line)]"
+          : "border-transparent text-fg2 hover:border-line hover:bg-high/50"
+      }`}
+    >
+      <button
+        onClick={onToggle}
+        className="flex h-7 w-6 shrink-0 items-center justify-center text-faint hover:text-fg"
+        title={expanded ? t("collapse") : t("expand")}
+      >
+        <Icon name="chevronRight" size={11} className={`transition-transform ${expanded ? "rotate-90" : ""}`} />
       </button>
       <button onClick={() => void openProject(project.id)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
-        <Icon name={project.pinned ? "pin" : "folder"} size={12} className={project.pinned ? "text-acc" : "text-dim"} />
+        <span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded ${active ? "bg-acc-wash text-acc" : "bg-high text-dim"}`}>
+          <Icon name={project.pinned ? "pin" : expanded ? "folderOpen" : "folder"} size={12} />
+        </span>
         {editing ? (
           <input
             autoFocus
@@ -327,11 +393,19 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
             className="min-w-0 flex-1 rounded border border-line2 bg-raise px-1.5 text-[12.5px] outline-none"
           />
         ) : (
-          <span className="truncate text-[12.5px] font-medium leading-none">{project.name}</span>
+          <span className="truncate text-[13px] font-semibold leading-none tracking-tight">{project.name}</span>
         )}
       </button>
-      {count > 0 && <span className="tnum text-[11px] text-faint">{count}</span>}
-      <button onClick={() => setMenu((open) => !open)} className="hidden h-6 w-6 items-center justify-center rounded-md text-dim hover:bg-raise hover:text-fg group-hover:flex">
+      {count > 0 && (
+        <span className="tnum shrink-0 rounded bg-high px-1.5 py-0.5 text-[10px] font-medium text-mute">
+          {count}
+        </span>
+      )}
+      {/* Always reserve width — toggling display causes hover layout jitter. */}
+      <button
+        onClick={() => setMenu((open) => !open)}
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-dim opacity-0 transition-opacity hover:bg-raise hover:text-fg group-hover:opacity-100 focus-visible:opacity-100"
+      >
         <Icon name="more" size={12} />
       </button>
       {menu && (
@@ -363,21 +437,38 @@ function MissionRow({ meta, running, awaiting, active, tokens, onOpen }: { meta:
   };
 
   return (
-    <div className={`group relative cursor-pointer rounded-md px-2 py-1.5 transition-colors ${active ? "bg-high" : "hover:bg-high/60"}`} onClick={onOpen}>
-      <div className="flex items-center gap-2">
-        <span className={awaiting ? "opacity-90" : running ? "" : "opacity-50"}><BlackHole size={11} spin={running ? true : awaiting ? "slow" : false} /></span>
+    <div
+      className={`group relative cursor-pointer rounded-lg px-2.5 py-1.5 transition-colors ${
+        active
+          ? "bg-high text-fg shadow-[inset_0_0_0_1px_var(--color-line)]"
+          : "bg-transparent text-mute hover:bg-high/55"
+      }`}
+      onClick={onOpen}
+    >
+      <div className="flex min-w-0 items-center gap-2">
+        <span className={`flex h-4 w-4 shrink-0 items-center justify-center ${awaiting ? "opacity-90" : running ? "" : "opacity-55"}`}>
+          {running || awaiting ? (
+            <BlackHole size={11} spin={running ? true : "slow"} />
+          ) : (
+            <Icon name="chat" size={11} className={active ? "text-acc" : "text-faint"} />
+          )}
+        </span>
         {editing ? (
           <input autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => event.key === "Enter" && commit()} onClick={(event) => event.stopPropagation()} className="min-w-0 flex-1 rounded border border-line2 bg-raise px-1.5 text-[12.5px] text-fg outline-none" />
         ) : (
-          <span className={`min-w-0 flex-1 truncate text-[12.5px] leading-snug ${active ? "font-medium text-fg" : "text-fg2"}`}>{meta.title}</span>
+          <span className={`min-w-0 flex-1 truncate text-[12.5px] font-normal leading-snug ${active ? "font-medium text-fg" : "text-mute"}`}>{meta.title}</span>
         )}
-        <button onClick={(event) => { event.stopPropagation(); setMenu((open) => !open); }} className="hidden h-6 w-6 items-center justify-center rounded-md text-dim hover:bg-raise hover:text-fg group-hover:flex">
+        {/* Fixed slot — never toggle display or text reflow/jitter on hover. */}
+        <button
+          onClick={(event) => { event.stopPropagation(); setMenu((open) => !open); }}
+          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-dim opacity-0 transition-opacity hover:bg-raise hover:text-fg group-hover:opacity-100 focus-visible:opacity-100"
+        >
           <Icon name="more" size={12} />
         </button>
       </div>
-      <div className="mt-0.5 flex items-center justify-between pl-4">
-        <span className="text-[11px] text-faint">{fmtRelTime(meta.updatedAt)}</span>
-        {tokens > 0 && <span className="tnum text-[11px] text-faint">{fmtTokens(tokens)}</span>}
+      <div className="mt-0.5 flex min-w-0 items-center justify-between gap-2 pl-6">
+        <span className="min-w-0 truncate text-[10.5px] text-faint">{fmtRelTime(meta.updatedAt)}</span>
+        {tokens > 0 && <span className="tnum shrink-0 text-[10.5px] text-faint">{fmtTokens(tokens)}</span>}
       </div>
       {menu && (
         <ContextMenu close={() => setMenu(false)}>

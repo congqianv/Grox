@@ -315,6 +315,8 @@ export interface PromptAttachmentSummary {
   name: string;
   mime: string;
   size: number;
+  /** Optional base64 image preview kept only for transcript thumbnails. */
+  data?: string;
 }
 
 export interface ConfigDocument {

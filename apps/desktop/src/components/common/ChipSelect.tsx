@@ -51,7 +51,7 @@ export function ChipSelect({
       </button>
       {open && (
         <div
-          className="absolute bottom-full left-0 z-40 mb-1.5 max-h-[min(360px,60vh)] overflow-y-auto overflow-x-hidden rounded-lg border border-line2 bg-raise py-1 shadow-[var(--shadow-float)] animate-fade-up"
+          className="absolute left-0 top-full z-50 mt-1.5 max-h-[min(360px,50vh)] overflow-y-auto overflow-x-hidden rounded-lg border border-line2 bg-raise py-1 shadow-[var(--shadow-float)] animate-fade-up"
           style={{ width: `min(${width}px, calc(100vw - 32px))` }}
         >
           {items.map((it) => (

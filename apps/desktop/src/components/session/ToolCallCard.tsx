@@ -8,6 +8,7 @@
 import { useState } from "react";
 import type { SessionBlock, ToolCall, ToolKind } from "../../bridge/types";
 import { fmtDuration } from "../../lib/format";
+import { ImageLightbox } from "../common/ImageLightbox";
 import { Icon, type IconProps } from "../fx/Icon";
 import { DiffView } from "./DiffView";
 import { useDesktop } from "../../state/store";
@@ -218,16 +219,31 @@ function Locations({ paths }: { paths: string[] }) {
 }
 
 function ToolImages({ images }: { images: NonNullable<ToolCall["images"]> }) {
+  const { language } = useI18n();
+  const [preview, setPreview] = useState<{ src: string; alt: string } | null>(null);
   return (
     <div className="mt-2 grid grid-cols-2 gap-2">
-      {images.map((image, index) => (
-        <img
-          key={`${image.mime}-${index}`}
-          src={`data:${image.mime};base64,${image.data}`}
-          alt="Tool output"
-          className="max-h-44 w-full rounded-[4px] border border-line2 bg-void object-contain"
-        />
-      ))}
+      {images.map((image, index) => {
+        const src = `data:${image.mime};base64,${image.data}`;
+        return (
+          <button
+            key={`${image.mime}-${index}`}
+            type="button"
+            title={language === "zh-CN" ? "点击预览" : "Click to preview"}
+            onClick={() => setPreview({ src, alt: language === "zh-CN" ? "工具输出图片" : "Tool output" })}
+            className="block overflow-hidden rounded-[4px] border border-line2 bg-void transition-opacity hover:opacity-95"
+          >
+            <img
+              src={src}
+              alt="Tool output"
+              className="max-h-44 w-full object-contain"
+            />
+          </button>
+        );
+      })}
+      {preview && (
+        <ImageLightbox src={preview.src} alt={preview.alt} onClose={() => setPreview(null)} />
+      )}
     </div>
   );
 }

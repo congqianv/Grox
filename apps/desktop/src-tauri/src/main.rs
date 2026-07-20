@@ -1957,6 +1957,30 @@ fn main() {
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
             if let Some(window) = app.get_webview_window("main") {
                 window.set_icon(icon)?;
+                // Size against the monitor *work area* (excludes menu bar + Dock).
+                // Default: width = 80% work area, height = 90% work area, centered both axes.
+                if let Ok(Some(monitor)) = window.current_monitor() {
+                    let work = monitor.work_area();
+                    let work_w = work.size.width.max(1);
+                    let work_h = work.size.height.max(1);
+                    let width = (((work_w as f64) * 0.8).round() as u32)
+                        .max(960)
+                        .min(work_w);
+                    let height = (((work_h as f64) * 0.9).round() as u32)
+                        .max(640)
+                        .min(work_h);
+                    let x = work.position.x
+                        + ((work_w.saturating_sub(width) as i32) / 2);
+                    let y = work.position.y
+                        + ((work_h.saturating_sub(height) as i32) / 2);
+                    let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
+                        width,
+                        height,
+                    }));
+                    let _ = window.set_position(tauri::Position::Physical(
+                        tauri::PhysicalPosition { x, y },
+                    ));
+                }
             }
             Ok(())
         })

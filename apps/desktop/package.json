@@ -10,8 +10,10 @@
     "preview": "vite preview",
     "agent:dev": "node scripts/prepare-sidecar.mjs --debug",
     "agent:sidecar": "node scripts/prepare-sidecar.mjs",
-    "desktop:dev": "pnpm agent:dev && pnpm tauri dev",
-    "desktop:build": "pnpm agent:sidecar && pnpm tauri build",
+    "desktop:dev": "pnpm tauri dev",
+    "desktop:build": "pnpm tauri build",
+    "desktop:dev:bundled": "pnpm agent:dev && pnpm tauri dev --config src-tauri/tauri.conf.bundled.json",
+    "desktop:build:bundled": "pnpm agent:sidecar && pnpm tauri build --config src-tauri/tauri.conf.bundled.json",
     "tauri": "tauri",
     "electron": "electron .",
     "electron:dev": "node scripts/dev-electron.mjs"

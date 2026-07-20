@@ -14,14 +14,19 @@
       {
         "label": "main",
         "title": "Grox",
-        "width": 1440,
-        "height": 900,
-        "minWidth": 1080,
-        "minHeight": 700,
+        "width": 1280,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 640,
         "center": true,
-        "decorations": false,
+        "decorations": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
+        "transparent": false,
+        "maximizable": true,
+        "minimizable": true,
+        "closable": true,
+        "resizable": true,
         "backgroundColor": "#0a0a0a"
       }
     ],
@@ -31,7 +36,6 @@
   },
   "bundle": {
     "active": true,
-    "externalBin": ["binaries/grok"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -23,6 +23,30 @@ const paths: Record<string, JSX.Element> = {
     </>
   ),
   folder: <path d="M3.5 6.5v11a2 2 0 0 0 2 2h13a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-7.5l-2-3h-3.5a2 2 0 0 0-2 2z" />,
+  folderOpen: (
+    <>
+      <path d="M3.5 9.5v8a2 2 0 0 0 2 2h13a2 2 0 0 0 2-2v-6.5H8.2L6.4 8H5.5a2 2 0 0 0-2 1.5z" />
+      <path d="M3.5 9.5l1.4-4.2A1.5 1.5 0 0 1 6.3 4.2h4.1l1.8 2.3H19a1.5 1.5 0 0 1 1.5 1.5V9.5" />
+    </>
+  ),
+  chat: (
+    <>
+      <path d="M5 5.5h14a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5H9.2L5 19.5v-3H5A1.5 1.5 0 0 1 3.5 15V7A1.5 1.5 0 0 1 5 5.5z" />
+      <path d="M8 10h8M8 13h5" />
+    </>
+  ),
+  collapseAll: (
+    <>
+      <path d="M5 8l7 7 7-7" />
+      <path d="M5 4h14" />
+    </>
+  ),
+  expandAll: (
+    <>
+      <path d="M5 12l7-7 7 7" />
+      <path d="M5 20h14" />
+    </>
+  ),
   mic: (
     <>
       <rect x="9" y="2.5" width="6" height="11" rx="3" />

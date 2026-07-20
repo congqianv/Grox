@@ -203,13 +203,54 @@ function loadJson<T>(key: string, fallback: T): T {
   }
 }
 
+function normalizeComposer(
+  partial: Partial<SessionComposerState> | undefined,
+  fallback: Pick<SessionComposerState, "model" | "effort" | "mode" | "permissionMode">,
+): SessionComposerState {
+  const model = typeof partial?.model === "string" && partial.model.trim()
+    ? partial.model
+    : fallback.model;
+  const effort = partial?.effort && ["low", "medium", "high", "xhigh"].includes(partial.effort)
+    ? partial.effort
+    : fallback.effort;
+  const mode = partial?.mode && ["agent", "plan", "ask"].includes(partial.mode)
+    ? partial.mode
+    : fallback.mode;
+  const permissionMode = partial?.permissionMode && ["default", "auto", "bypass"].includes(partial.permissionMode)
+    ? partial.permissionMode
+    : fallback.permissionMode;
+  return {
+    text: typeof partial?.text === "string" ? partial.text : "",
+    attachments: Array.isArray(partial?.attachments) ? partial.attachments : [],
+    model,
+    effort,
+    mode,
+    permissionMode,
+  };
+}
+
 function loadSessionComposers(): Record<string, SessionComposerState> {
-  const stored = loadJson<Record<string, Omit<SessionComposerState, "attachments">>>(
+  const stored = loadJson<Record<string, Partial<SessionComposerState>>>(
     SESSION_COMPOSERS_KEY,
     {},
   );
+  const fallback = {
+    model: localStorage.getItem("grok.model") ?? "grok-build",
+    effort: (localStorage.getItem("grok.effort") as Effort) ?? "high",
+    mode: "agent" as AgentMode,
+    permissionMode: (
+      localStorage.getItem("grok.permissionMode") === "auto"
+        ? "auto"
+        : localStorage.getItem("grok.permissionMode") === "bypass"
+          ? "bypass"
+          : "default"
+    ) as PermissionMode,
+  };
   return Object.fromEntries(
-    Object.entries(stored).map(([id, state]) => [id, { ...state, attachments: [] }]),
+    Object.entries(stored).map(([id, state]) => [
+      id,
+      normalizeComposer({ ...state, attachments: [] }, fallback),
+    ]),
   );
 }
 
@@ -507,17 +548,15 @@ export const useDesktop = create<DesktopState>((set, get) => {
         const projects = ensureProject(get().projects, e.session.cwd);
         persistSessionCatalog(nextIndex);
         const state = get();
-        const existingComposer = state.sessionComposers[e.session.id];
-        const composer: SessionComposerState = existingComposer ?? {
-          text: "",
-          attachments: [],
-          model: state.models.some((item) => item.id === e.session.model)
-            ? e.session.model
-            : state.model,
-          effort: state.effort,
-          mode: state.mode,
-          permissionMode: state.permissionMode,
-        };
+        const fallbackModel = state.models.some((item) => item.id === e.session.model)
+          ? e.session.model
+          : (state.model || state.models[0]?.id || MODELS[0]?.id || "grok-build");
+        const composer = normalizeComposer(state.sessionComposers[e.session.id], {
+          model: fallbackModel,
+          effort: state.effort || "high",
+          mode: state.mode || "agent",
+          permissionMode: state.permissionMode || "default",
+        });
         const sessionComposers = { ...state.sessionComposers, [e.session.id]: composer };
         persistSessionComposers(sessionComposers);
         bridge.setPermissionMode(composer.permissionMode);
@@ -782,23 +821,67 @@ export const useDesktop = create<DesktopState>((set, get) => {
     goHome: () => set({ view: "home", activeId: null }),
 
     async openSession(id) {
-      const meta = get().sessionIndex.find((entry) => entry.id === id);
-      if (meta && !samePath(meta.cwd, get().workspace)) await get().setWorkspace(meta.cwd);
-      const state = get();
-      const has = state.sessions[id];
-      const composer = state.sessionComposers[id];
-      if (composer) bridge.setPermissionMode(composer.permissionMode);
-      set({
-        activeId: id,
-        view: "session",
-        ...(composer ? {
+      try {
+        // Fast path: already loaded and in the same workspace — switch UI only.
+        const current = get();
+        if (current.activeId === id && current.sessions[id] && current.view === "session") {
+          return;
+        }
+
+        const meta = current.sessionIndex.find((entry) => entry.id === id);
+        // Cross-project switch: update workspace without the heavy setWorkspace
+        // home-reset / full file tree refresh that makes session switching feel laggy.
+        if (meta && !samePath(meta.cwd, current.workspace)) {
+          await bridge.setWorkspace(meta.cwd);
+          const workspace = await bridge.getWorkspace();
+          const projects = ensureProject(get().projects, workspace);
+          set({
+            workspace,
+            projects,
+            activeProjectId: projectId(workspace),
+            workspaceDiffs: [],
+            workspaceDiffReady: false,
+            projectPreview: { status: "idle" },
+            previewOpen: false,
+            previewFile: null,
+          });
+          // Defer inspector file work so the transcript paints first.
+          window.setTimeout(() => {
+            void get().refreshWorkspaceFiles();
+            void get().refreshWorkspaceDiffs();
+          }, 0);
+        }
+
+        const state = get();
+        const has = state.sessions[id];
+        const composer = normalizeComposer(state.sessionComposers[id], {
+          model: state.model || state.models[0]?.id || MODELS[0]?.id || "grok-build",
+          effort: state.effort || "high",
+          mode: state.mode || "agent",
+          permissionMode: state.permissionMode || "default",
+        });
+        const sessionComposers = { ...state.sessionComposers, [id]: composer };
+        persistSessionComposers(sessionComposers);
+        bridge.setPermissionMode(composer.permissionMode);
+        // Paint session chrome immediately; load transcript after.
+        set({
+          activeId: id,
+          view: "session",
           model: composer.model,
           effort: composer.effort,
           mode: composer.mode,
           permissionMode: composer.permissionMode,
-        } : {}),
-      });
-      if (!has) await bridge.loadSession(id);
+          sessionComposers,
+          startupError: null,
+        });
+        if (!has) await bridge.loadSession(id);
+      } catch (error) {
+        set({
+          startupError: error instanceof Error ? error.message : String(error),
+          view: "home",
+          activeId: null,
+        });
+      }
     },
 
     async newSession() {
@@ -1251,7 +1334,15 @@ export const useDesktop = create<DesktopState>((set, get) => {
                 type: "user",
                 id: uid(),
                 text: trimmed,
-                attachments: attachments.map(({ id, kind, name, mime, size }) => ({ id, kind, name, mime, size })),
+                attachments: attachments.map(({ id, kind, name, mime, size, data }) => ({
+                  id,
+                  kind,
+                  name,
+                  mime,
+                  size,
+                  // Keep image bytes for bubble thumbnails; omit heavy binary payloads.
+                  ...(kind === "image" && data ? { data } : {}),
+                })),
                 ts: Date.now(),
               },
             ],

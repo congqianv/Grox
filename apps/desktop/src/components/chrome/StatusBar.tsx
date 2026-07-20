@@ -70,9 +70,9 @@ export function StatusBar() {
             <Sep />
           </>
         )}
-        <span className="text-fg2">{model.replace(/-/g, "‑")}</span>
+        <span className="text-fg2">{(model || "—").replace(/-/g, "‑")}</span>
         <Sep />
-        <span className="text-mute">{language === "zh-CN" ? "强度" : "Effort"} {effort}</span>
+        <span className="text-mute">{language === "zh-CN" ? "强度" : "Effort"} {effort || "—"}</span>
       </div>
     </footer>
   );

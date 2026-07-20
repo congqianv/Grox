@@ -193,56 +193,133 @@ const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
   return previous.turn.blocks.every((block, index) => block === next.turn.blocks[index]);
 });
 
+/** Cap initial paint for very long restored transcripts; user can load older turns. */
+const INITIAL_TURN_WINDOW = 24;
+const STICK_BOTTOM_PX = 120;
+
 export function Timeline({ session }: { session: Session }) {
   const { language } = useI18n();
   const scrollRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
-  const lastSessionId = useRef(session.id);
+  /** Suppress onScroll while we programmatically pin to bottom. */
+  const pinningRef = useRef(false);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
+  const [showAll, setShowAll] = useState(false);
   const lastBlock = session.blocks.at(-1);
   const signature = `${session.id}:${session.blocks.length}:${lastBlock?.type === "assistant" || lastBlock?.type === "thinking" ? lastBlock.text.length : lastBlock?.id ?? ""}:${session.status}`;
+  const hasBlocks = session.blocks.length > 0;
+
+  // Reset window when switching sessions so we don't keep a previous "show all".
+  useEffect(() => {
+    setShowAll(false);
+    followRef.current = true;
+  }, [session.id]);
+
+  const visibleTurns = useMemo(() => {
+    if (showAll || turns.length <= INITIAL_TURN_WINDOW) return turns;
+    return turns.slice(turns.length - INITIAL_TURN_WINDOW);
+  }, [showAll, turns]);
+  const hiddenCount = turns.length - visibleTurns.length;
 
   const scrollToBottom = (force = false) => {
     const element = scrollRef.current;
-    if (!element) return;
-    if (force || followRef.current) element.scrollTop = element.scrollHeight;
+    if (!element) return false;
+    if (!force && !followRef.current) return false;
+    pinningRef.current = true;
+    element.scrollTop = element.scrollHeight;
+    // Release pin after the browser has applied scroll and fired any scroll events.
+    requestAnimationFrame(() => {
+      if (!scrollRef.current) {
+        pinningRef.current = false;
+        return;
+      }
+      if (force || followRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      }
+      requestAnimationFrame(() => {
+        pinningRef.current = false;
+      });
+    });
+    return true;
   };
 
-  // Opening / switching sessions always jumps to the latest turn.
+  // Stick to bottom when the transcript grows / session opens / window expands.
   useEffect(() => {
-    if (lastSessionId.current !== session.id) {
-      lastSessionId.current = session.id;
-      followRef.current = true;
-    }
+    if (!hasBlocks) return;
     followRef.current = true;
-    const frame = requestAnimationFrame(() => {
-      scrollToBottom(true);
-      // Second pass after layout of restored transcript cards.
-      requestAnimationFrame(() => scrollToBottom(true));
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [session.id]);
+    scrollToBottom(true);
+    const t1 = window.setTimeout(() => scrollToBottom(true), 32);
+    const t2 = window.setTimeout(() => scrollToBottom(true), 120);
+    return () => {
+      window.clearTimeout(t1);
+      window.clearTimeout(t2);
+    };
+  }, [session.id, signature, showAll, hiddenCount, hasBlocks]);
 
+  // Content height can change without signature updates (markdown, images, tool expand).
   useEffect(() => {
-    const frame = requestAnimationFrame(() => scrollToBottom());
-    return () => cancelAnimationFrame(frame);
-  }, [signature]);
+    if (!hasBlocks) return;
+    const content = contentRef.current;
+    if (!content || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (followRef.current) scrollToBottom(true);
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [session.id, hasBlocks]);
 
-  if (session.blocks.length === 0) return <div className="flex flex-1 flex-col items-center justify-center gap-4 pb-24"><BlackHole size={40} spin="slow" /><div className="text-center"><p className="text-[15px] text-mute">{language === "zh-CN" ? "准备好了。" : "Ready when you are."}</p><p className="mt-1.5 text-[13px] text-faint">{language === "zh-CN" ? "在下方输入你的第一个请求" : "Type your first message below"}</p></div></div>;
+  if (!hasBlocks) {
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center gap-4 pb-24">
+        <BlackHole size={40} spin="slow" />
+        <div className="text-center">
+          <p className="text-[15px] text-mute">{language === "zh-CN" ? "准备好了。" : "Ready when you are."}</p>
+          <p className="mt-1.5 text-[13px] text-faint">
+            {language === "zh-CN" ? "在下方输入你的第一个请求" : "Type your first message below"}
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
       ref={scrollRef}
       onScroll={() => {
+        if (pinningRef.current) return;
         const element = scrollRef.current;
-        if (element) followRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+        if (!element) return;
+        followRef.current =
+          element.scrollHeight - element.scrollTop - element.clientHeight < STICK_BOTTOM_PX;
       }}
       className="flex-1 overflow-y-auto"
     >
-      <div className="mx-auto max-w-[860px] px-8 py-8">
-        {turns.map((turn, index) => (
-          <MemoTurnGroup key={turn.id} turn={turn} sessionId={session.id} status={session.status} active={index === turns.length - 1} />
-        ))}
+      <div ref={contentRef} className="mx-auto max-w-[860px] px-8 py-8">
+        {hiddenCount > 0 && (
+          <button
+            type="button"
+            onClick={() => {
+              followRef.current = false;
+              setShowAll(true);
+            }}
+            className="mb-6 flex w-full items-center justify-center gap-2 rounded-md border border-line bg-raise/60 py-2 text-[12px] text-mute transition-colors hover:bg-high hover:text-fg2"
+          >
+            {language === "zh-CN" ? `显示更早的 ${hiddenCount} 轮对话` : `Show ${hiddenCount} earlier turns`}
+          </button>
+        )}
+        {visibleTurns.map((turn, index) => {
+          const absoluteIndex = hiddenCount + index;
+          return (
+            <MemoTurnGroup
+              key={turn.id}
+              turn={turn}
+              sessionId={session.id}
+              status={session.status}
+              active={absoluteIndex === turns.length - 1}
+            />
+          );
+        })}
         <div className="h-2" />
       </div>
     </div>

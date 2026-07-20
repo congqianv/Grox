@@ -5,7 +5,7 @@
    ───────────────────────────────────────────────────────────────────────── */
 
 import { useEffect, useRef, useState } from "react";
-import { useDesktop } from "../../state/store";
+import { useDesktop, type QueuedPrompt } from "../../state/store";
 import {
   EFFORTS,
   type PromptAttachment,
@@ -27,6 +27,10 @@ interface SlashCmd {
   run: () => void;
 }
 
+/** Stable empty refs — `?? []` inside Zustand selectors re-renders forever. */
+const EMPTY_QUEUE: QueuedPrompt[] = [];
+const EMPTY_ATTACHMENTS: PromptAttachment[] = [];
+
 export function Composer() {
   const { language } = useI18n();
   const [slashIdx, setSlashIdx] = useState(0);
@@ -39,10 +43,13 @@ export function Composer() {
   const removeQueuedPrompt = useDesktop((s) => s.removeQueuedPrompt);
   const clearPromptQueue = useDesktop((s) => s.clearPromptQueue);
   const activeId = useDesktop((s) => s.activeId);
-  const composer = useDesktop((s) => s.activeId ? s.sessionComposers[s.activeId] : undefined);
-  const queue = useDesktop((s) => (s.activeId ? s.promptQueues[s.activeId] ?? [] : []));
+  const composer = useDesktop((s) => (s.activeId ? s.sessionComposers[s.activeId] : undefined));
+  const queue = useDesktop((s) => {
+    if (!s.activeId) return EMPTY_QUEUE;
+    return s.promptQueues[s.activeId] ?? EMPTY_QUEUE;
+  });
   const text = composer?.text ?? "";
-  const attachments = composer?.attachments ?? [];
+  const attachments = composer?.attachments ?? EMPTY_ATTACHMENTS;
   const setText = useDesktop((s) => s.setDraft);
   const setAttachments = useDesktop((s) => s.setComposerAttachments);
   const stop = useDesktop((s) => s.stop);
@@ -80,15 +87,16 @@ export function Composer() {
       id: "/model",
       hint: "cycle model",
       run: () => {
-        const i = models.findIndex((m) => m.id === model);
-        setModel(models[(i + 1 + models.length) % models.length].id);
+        if (models.length === 0) return;
+        const i = Math.max(0, models.findIndex((m) => m.id === model));
+        setModel(models[(i + 1) % models.length].id);
       },
     },
     {
       id: "/effort",
       hint: "cycle reasoning effort",
       run: () => {
-        const i = EFFORTS.indexOf(effort);
+        const i = Math.max(0, EFFORTS.indexOf(effort));
         setEffort(EFFORTS[(i + 1) % EFFORTS.length]);
       },
     },
@@ -183,10 +191,10 @@ export function Composer() {
   const currentModel = models.find((m) => m.id === model);
 
   return (
-    <div className="shrink-0 px-6 pb-5 pt-2">
+    <div className="relative z-30 shrink-0 px-6 pb-5 pt-2">
       <div className="relative mx-auto max-w-[760px]">
         {slashOpen && matches.length > 0 && (
-          <div className="absolute bottom-full left-0 z-40 mb-2 w-full overflow-hidden rounded-lg border border-line2 bg-raise py-1 shadow-[var(--shadow-float)] animate-fade-up">
+          <div className="absolute bottom-full left-0 z-50 mb-2 w-full overflow-hidden rounded-lg border border-line2 bg-raise py-1 shadow-[var(--shadow-float)] animate-fade-up">
             {matches.map((c, i) => (
               <button
                 key={c.id}
@@ -242,7 +250,8 @@ export function Composer() {
           </div>
         )}
 
-        <div className="surface overflow-hidden transition-shadow">
+        {/* overflow-visible: chip/options menus open below the toolbar and must not be clipped */}
+        <div className="surface overflow-visible transition-shadow">
           <input
             ref={fileRef}
             type="file"

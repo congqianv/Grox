@@ -1,6 +1,6 @@
 /* App shell — window chrome, three-column deck, overlays, keymap. */
 
-import { useEffect } from "react";
+import { Component, useEffect, type ErrorInfo, type ReactNode } from "react";
 import { useDesktop } from "./state/store";
 import { TitleBar } from "./components/chrome/TitleBar";
 import { Sidebar } from "./components/chrome/Sidebar";
@@ -19,14 +19,53 @@ import { useI18n } from "./lib/i18n";
 import { AccountSetup } from "./components/settings/AccountSetup";
 import { UpdateNotice } from "./components/update/UpdateNotice";
 
+class SessionErrorBoundary extends Component<
+  { children: ReactNode; onReset: () => void; language: string },
+  { error: string | null }
+> {
+  state = { error: null as string | null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error: error?.message || String(error) };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("Session view crashed:", error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.error) {
+      const zh = this.props.language === "zh-CN";
+      return (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 px-8 text-center">
+          <p className="text-[14px] font-medium text-fg">{zh ? "打开会话时出错" : "Failed to open session"}</p>
+          <p className="max-w-md text-[12.5px] text-mute">{this.state.error}</p>
+          <button
+            className="mt-2 rounded-md border border-line2 bg-raise px-3 py-1.5 text-[12.5px] text-fg2 hover:bg-high"
+            onClick={() => {
+              this.setState({ error: null });
+              this.props.onReset();
+            }}
+          >
+            {zh ? "返回首页" : "Back to home"}
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
   const { language } = useI18n();
   const ready = useDesktop((s) => s.ready);
   const view = useDesktop((s) => s.view);
   const activeId = useDesktop((s) => s.activeId);
   const session = useDesktop((s) => (s.activeId ? s.sessions[s.activeId] : null));
+  const startupError = useDesktop((s) => s.startupError);
   const inspectorOpen = useDesktop((s) => s.inspectorOpen);
   const previewOpen = useDesktop((s) => s.previewOpen);
+  const goHome = useDesktop((s) => s.goHome);
   const sidebarWidth = usePreferences((s) => s.sidebarWidth);
   const setSidebarWidth = usePreferences((s) => s.setSidebarWidth);
 
@@ -76,20 +115,29 @@ export default function App() {
       <div className="flex min-h-0 flex-1">
         <Sidebar />
         <ResizeHandle side="right" value={sidebarWidth} onChange={setSidebarWidth} />
-        <main className="flex min-w-0 flex-1 flex-col bg-base">
-          {inSession && session ? (
-            <>
-              <Timeline session={session} />
-              <Composer />
-            </>
-          ) : inSession && !session ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-3">
-              <BlackHole size={28} spin />
-              <span className="text-[13px] text-mute">{language === "zh-CN" ? "正在恢复任务…" : "Restoring session…"}</span>
+        {/* z-10: composer popovers open below the toolbar and must stack above StatusBar */}
+        <main className="relative z-10 flex min-w-0 flex-1 flex-col bg-base">
+          {startupError && !inSession && (
+            <div className="border-b border-red/20 bg-red/5 px-4 py-2 text-[12.5px] text-red">
+              {startupError}
             </div>
-          ) : (
-            <Home />
           )}
+          <SessionErrorBoundary language={language} onReset={goHome}>
+            {inSession && session ? (
+              <>
+                <Timeline session={session} />
+                <Composer />
+              </>
+            ) : inSession && !session ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-3">
+                <BlackHole size={28} spin />
+                <span className="text-[13px] text-mute">{language === "zh-CN" ? "正在恢复任务…" : "Restoring session…"}</span>
+                {startupError && <p className="max-w-md px-6 text-center text-[12px] text-red">{startupError}</p>}
+              </div>
+            ) : (
+              <Home />
+            )}
+          </SessionErrorBoundary>
         </main>
         {inspectorOpen && inSession && session && <Inspector />}
         {previewOpen && <PreviewPane />}
