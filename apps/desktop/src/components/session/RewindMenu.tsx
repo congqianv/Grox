@@ -161,13 +161,13 @@ export function RewindMenu({
     <div ref={rootRef} className="relative">
       <button
         onClick={() => open ? close() : void showPoints()}
-        className={`flex h-7 items-center justify-center gap-1.5 rounded-[5px] border transition-colors ${variant === "request" ? "border-transparent px-1.5 text-[9px] text-acc hover:text-fg" : "border-line2 bg-high/45 px-2 text-[9.5px] font-medium text-mute hover:border-gold/35 hover:bg-high hover:text-gold"} ${open ? "border-gold/35 bg-high text-gold" : ""}`}
+        className={`flex h-7 items-center justify-center gap-1.5 rounded-md border transition-colors ${variant === "request" ? "border-transparent px-1.5 text-[11px] leading-none text-mute hover:text-fg" : "border-line2 bg-high/45 px-2.5 text-[12px] font-medium leading-none text-mute hover:border-gold/30 hover:bg-high hover:text-gold"} ${open ? "border-gold/30 bg-high text-gold" : ""}`}
         title={language === "zh-CN" ? "选择历史节点回退并编辑" : "Choose a checkpoint to rewind and edit"}
         aria-haspopup="dialog"
         aria-expanded={open}
       >
         <Icon name="refresh" size={11} />
-        <span>{variant === "request" ? (language === "zh-CN" ? "撤回编辑" : "REWIND & EDIT") : (language === "zh-CN" ? "历史回退" : "HISTORY")}</span>
+        <span>{variant === "request" ? (language === "zh-CN" ? "撤回编辑" : "Rewind & edit") : (language === "zh-CN" ? "历史回退" : "History")}</span>
       </button>
 
       {open && (
@@ -176,7 +176,7 @@ export function RewindMenu({
             ref={dialogRef}
             role="dialog"
             aria-label={language === "zh-CN" ? "对话回退" : "Rewind conversation"}
-            className={`${variant === "request" ? "relative" : "absolute bottom-full right-0 mb-2"} z-50 flex max-h-[min(460px,calc(100vh-120px))] w-[min(520px,calc(100vw-32px))] flex-col overflow-hidden rounded-[8px] border border-line2 bg-raise shadow-[0_14px_44px_rgba(0,0,0,0.62)] animate-fade-up`}
+            className={`${variant === "request" ? "relative" : "absolute bottom-full right-0 mb-2"} z-50 flex max-h-[min(460px,calc(100vh-120px))] w-[min(520px,calc(100vw-32px))] flex-col overflow-hidden rounded-lg border border-line2 bg-raise shadow-[var(--shadow-float)] animate-fade-up`}
           >
           <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3">
             {busy ? <BlackHole size={13} spin /> : <Icon name="branch" size={12} className="text-gold" />}

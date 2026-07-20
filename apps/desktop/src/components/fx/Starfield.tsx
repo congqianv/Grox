@@ -64,8 +64,11 @@ export function Starfield({ density = 110, className = "" }: { density?: number;
           s.x = Math.random() * w;
         }
         const tw = s.twinkle ? Math.sin(t / 1400 + s.phase) * s.twinkle : 0;
-        const alpha = Math.max(0.03, s.base + tw * 0.4);
-        ctx.fillStyle = `rgba(232,232,232,${alpha.toFixed(3)})`;
+        const light = document.documentElement.dataset.theme === "light";
+        const alpha = Math.max(light ? 0.02 : 0.03, (s.base + tw * 0.4) * (light ? 0.28 : 1));
+        ctx.fillStyle = light
+          ? `rgba(120,120,130,${alpha.toFixed(3)})`
+          : `rgba(232,232,232,${alpha.toFixed(3)})`;
         ctx.fillRect(s.x, s.y, s.r, s.r);
       }
     };

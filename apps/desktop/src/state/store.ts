@@ -66,6 +66,14 @@ export interface SessionComposerState {
   permissionMode: PermissionMode;
 }
 
+/** Follow-up prompts waiting for the active turn to finish (CLI-style queue). */
+export interface QueuedPrompt {
+  id: string;
+  text: string;
+  attachments: PromptAttachment[];
+  createdAt: number;
+}
+
 interface DesktopState {
   ready: boolean;
   startupError: string | null;
@@ -106,6 +114,7 @@ interface DesktopState {
   mode: AgentMode;
   permissionMode: PermissionMode;
   sessionComposers: Record<string, SessionComposerState>;
+  promptQueues: Record<string, QueuedPrompt[]>;
 
   inspectorOpen: boolean;
   inspectorTab: InspectorTab;
@@ -153,7 +162,9 @@ interface DesktopState {
   openPreview(path: string): Promise<void>;
   closePreview(): void;
 
-  sendPrompt(text: string, attachments?: PromptAttachment[]): void;
+  sendPrompt(text: string, attachments?: PromptAttachment[], sessionId?: string): void;
+  removeQueuedPrompt(sessionId: string, queueId: string): void;
+  clearPromptQueue(sessionId?: string): void;
   stop(): void;
   compact(): void;
   listRewindPoints(): Promise<RewindPoint[]>;
@@ -604,6 +615,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         break;
       case "status":
         withSession(e.sessionId, (s) => ({ ...s, status: e.status }));
+        if (e.status === "idle") {
+          // Drain CLI-style follow-up queue once the active turn settles.
+          window.setTimeout(() => drainPromptQueue(e.sessionId), 0);
+        }
         break;
       case "usage":
         withSession(e.sessionId, (s) => ({ ...s, usage: e.usage }), false);
@@ -617,8 +632,25 @@ export const useDesktop = create<DesktopState>((set, get) => {
             { type: "system", id: uid(), text: e.message, ts: Date.now(), kind: "error" },
           ],
         }));
+        window.setTimeout(() => drainPromptQueue(e.sessionId), 0);
         break;
     }
+  };
+
+  /** Pop and send the next queued follow-up when the session is idle. */
+  const drainPromptQueue = (sessionId: string) => {
+    const state = get();
+    const session = state.sessions[sessionId];
+    const queue = state.promptQueues[sessionId] ?? [];
+    if (!session || session.status !== "idle" || queue.length === 0) return;
+    const [next, ...rest] = queue;
+    set({
+      promptQueues: {
+        ...state.promptQueues,
+        [sessionId]: rest,
+      },
+    });
+    get().sendPrompt(next.text, next.attachments, sessionId);
   };
 
   return {
@@ -665,6 +697,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           ? "bypass"
           : "default",
     sessionComposers: loadSessionComposers(),
+    promptQueues: {},
 
     inspectorOpen: true,
     inspectorTab: "files",
@@ -1151,10 +1184,15 @@ export const useDesktop = create<DesktopState>((set, get) => {
       });
     },
 
-    sendPrompt(text, attachments = []) {
-      const { activeId, sessions, model, effort, mode, permissionMode, sessionComposers } = get();
-      const session = activeId ? sessions[activeId] : null;
-      if (!session || session.status !== "idle") return;
+    sendPrompt(text, attachments = [], sessionId) {
+      const { activeId, sessions, model, effort, mode, permissionMode, sessionComposers, promptQueues } = get();
+      const targetId = sessionId ?? activeId;
+      const session = targetId ? sessions[targetId] : null;
+      if (!session) return;
+
+      const trimmed = text.trim();
+      if (!trimmed && attachments.length === 0) return;
+
       const composer = sessionComposers[session.id] ?? {
         text: "",
         attachments: [],
@@ -1164,8 +1202,29 @@ export const useDesktop = create<DesktopState>((set, get) => {
         permissionMode,
       };
 
-      const trimmed = text.trim();
-      if (!trimmed && attachments.length === 0) return;
+      // Busy turn → enqueue follow-up (Grok Build CLI-style queue).
+      if (session.status !== "idle") {
+        const entry: QueuedPrompt = {
+          id: uid(),
+          text: trimmed,
+          attachments: [...attachments],
+          createdAt: Date.now(),
+        };
+        const nextComposers = {
+          ...sessionComposers,
+          [session.id]: { ...composer, text: "", attachments: [] },
+        };
+        persistSessionComposers(nextComposers);
+        set({
+          promptQueues: {
+            ...promptQueues,
+            [session.id]: [...(promptQueues[session.id] ?? []), entry],
+          },
+          sessionComposers: nextComposers,
+        });
+        return;
+      }
+
       const titleText = trimmed || attachments.map((attachment) => attachment.name).join(", ");
       const nextIndex = get().sessionIndex.map((m) =>
         m.id === session.id && m.title === "Untitled mission"
@@ -1185,6 +1244,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           [session.id]: {
             ...session,
             title: session.title === "Untitled mission" ? titleText.slice(0, 56) : session.title,
+            status: "running",
             blocks: [
               ...session.blocks,
               {
@@ -1207,6 +1267,27 @@ export const useDesktop = create<DesktopState>((set, get) => {
         effort: composer.effort,
         mode: composer.mode,
         attachments,
+      });
+    },
+
+    removeQueuedPrompt(sessionId, queueId) {
+      const queue = get().promptQueues[sessionId] ?? [];
+      set({
+        promptQueues: {
+          ...get().promptQueues,
+          [sessionId]: queue.filter((item) => item.id !== queueId),
+        },
+      });
+    },
+
+    clearPromptQueue(sessionId) {
+      const id = sessionId ?? get().activeId;
+      if (!id) return;
+      set({
+        promptQueues: {
+          ...get().promptQueues,
+          [id]: [],
+        },
       });
     },
 

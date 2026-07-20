@@ -118,29 +118,29 @@ export function CommandPalette() {
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-void/70 backdrop-blur-[2px]"
+      className="fixed inset-0 z-50 bg-void/50 backdrop-blur-[3px]"
       onMouseDown={() => setOpen(false)}
     >
       <div
-        className="mx-auto mt-[15vh] w-[540px] overflow-hidden rounded-[8px] border border-line3 bg-raise shadow-[0_24px_64px_rgba(0,0,0,0.6)] animate-fade-up"
+        className="mx-auto mt-[15vh] w-[540px] overflow-hidden rounded-lg border border-line2 bg-raise shadow-[var(--shadow-float)] animate-fade-up"
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center gap-2.5 border-b border-line2 px-3.5">
-          <Icon name="search" size={13} className="text-dim" />
+        <div className="flex items-center gap-2.5 border-b border-line px-4">
+          <Icon name="search" size={14} className="text-dim" />
           <input
             ref={inputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={onKey}
-            placeholder={language === "zh-CN" ? "输入命令或搜索任务…" : "Type a command or search missions…"}
-            className="h-11 flex-1 bg-transparent font-mono text-[12px] text-fg placeholder:text-faint focus:outline-none"
+            placeholder={language === "zh-CN" ? "输入命令或搜索任务…" : "Type a command or search…"}
+            className="h-12 flex-1 bg-transparent text-[14px] text-fg placeholder:text-faint focus:outline-none"
           />
-          <kbd className="lbl !text-[9.5px] !text-faint">ESC</kbd>
+          <kbd className="rounded-md bg-high px-1.5 py-0.5 text-[11px] text-faint">Esc</kbd>
         </div>
         <div className="max-h-[320px] overflow-y-auto py-1.5">
           {items.length === 0 && (
-            <p className="px-4 py-6 text-center font-mono text-[11px] text-dim">
-              {language === "zh-CN" ? "没有匹配结果。" : "No matches in this sector."}
+            <p className="px-4 py-6 text-center text-[13px] text-dim">
+              {language === "zh-CN" ? "没有匹配结果。" : "No matches."}
             </p>
           )}
           {items.map((item, i) => (
@@ -148,15 +148,15 @@ export function CommandPalette() {
               key={item.id}
               onMouseEnter={() => setIdx(i)}
               onClick={item.run}
-              className={`flex w-full items-center gap-3 px-3.5 py-2 text-left ${
-                i === idx ? "bg-high" : ""
+              className={`flex w-full items-center gap-3 px-4 py-2.5 text-left ${
+                i === idx ? "bg-high" : "hover:bg-high/50"
               }`}
             >
-              <Icon name={item.icon} size={13} className={i === idx ? "text-acc" : "text-dim"} />
-              <span className={`flex-1 truncate text-[12px] ${i === idx ? "text-fg" : "text-fg2"}`}>
+              <Icon name={item.icon} size={14} className={i === idx ? "text-acc" : "text-dim"} />
+              <span className={`flex-1 truncate text-[13px] ${i === idx ? "text-fg" : "text-fg2"}`}>
                 {item.label}
               </span>
-              {item.hint && <span className="tnum text-[10px] text-faint">{item.hint}</span>}
+              {item.hint && <span className="tnum text-[11px] text-faint">{item.hint}</span>}
             </button>
           ))}
         </div>

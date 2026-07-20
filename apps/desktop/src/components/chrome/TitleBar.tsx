@@ -32,37 +32,33 @@ export function TitleBar() {
   return (
     <header
       data-tauri-drag-region
-      className="relative flex h-10 shrink-0 items-center overflow-hidden border-b border-line bg-void pl-[78px] pr-2 select-none"
+      className="relative flex h-10 shrink-0 items-center overflow-hidden border-b border-line bg-panel pl-[78px] pr-2 select-none"
     >
-      {/* center — mission breadcrumb */}
       <div
         data-tauri-drag-region
         className="pointer-events-none flex min-w-0 flex-1 items-center justify-center px-3"
       >
-        <div className="flex min-w-0 max-w-full items-center gap-2 overflow-hidden whitespace-nowrap text-[11px]">
+        <div className="flex min-w-0 max-w-full items-center gap-2 overflow-hidden whitespace-nowrap text-[12.5px]">
           {activeId && meta ? (
             <>
-              <span className="lbl max-w-[35%] shrink-0 truncate">{baseName(meta.cwd)}</span>
+              <span className="max-w-[35%] shrink-0 truncate text-dim">{baseName(meta.cwd)}</span>
               <span className="shrink-0 text-faint">/</span>
-              <span className="min-w-0 truncate text-fg2">{meta.title}</span>
+              <span className="min-w-0 truncate font-medium text-fg2">{meta.title}</span>
             </>
           ) : (
-            <span className="lbl" style={{ letterSpacing: "0.3em" }}>
-              GROX DESKTOP
-            </span>
+            <span className="text-[13px] font-medium tracking-tight text-mute">Grox</span>
           )}
         </div>
       </div>
 
-      {/* right cluster */}
-      <div className="flex shrink-0 items-center gap-1">
-        <span className={`chip mr-1 ${bridgeKind === "mock" ? "" : "!text-acc !border-acc-dim"}`}>
+      <div className="flex shrink-0 items-center gap-1.5">
+        <span className={`chip mr-0.5 ${bridgeKind === "mock" ? "" : "!bg-acc-wash !text-fg2"}`}>
           <span
             className={`inline-block h-1.5 w-1.5 rounded-full ${
-              bridgeKind === "mock" ? "bg-dim" : "bg-acc animate-pulse-dot"
+              bridgeKind === "mock" ? "bg-dim" : "bg-green animate-pulse-dot"
             }`}
           />
-          {bridgeKind === "mock" ? "MOCK LINK" : "ACP LINK"}
+          {bridgeKind === "mock" ? (language === "zh-CN" ? "模拟" : "Mock") : "ACP"}
         </span>
 
         <button
@@ -70,12 +66,12 @@ export function TitleBar() {
           onClick={() => setPaletteOpen(true)}
           title={language === "zh-CN" ? "命令面板" : "Command palette"}
         >
-          <Icon name="command" size={11} />
+          <Icon name="command" size={12} />
           <span>⌘K</span>
         </button>
 
         <button
-          className={`chip ${inspectorOpen ? "!text-fg2 !border-line3" : ""}`}
+          className={`chip ${inspectorOpen ? "!bg-high !text-fg" : ""}`}
           onClick={toggleInspector}
           title={language === "zh-CN" ? "显示/隐藏检查器" : "Toggle inspector"}
         >

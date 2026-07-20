@@ -197,19 +197,54 @@ export function Timeline({ session }: { session: Session }) {
   const { language } = useI18n();
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
+  const lastSessionId = useRef(session.id);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
   const lastBlock = session.blocks.at(-1);
-  const signature = `${session.blocks.length}:${lastBlock?.type === "assistant" || lastBlock?.type === "thinking" ? lastBlock.text.length : lastBlock?.id ?? ""}:${session.status}`;
+  const signature = `${session.id}:${session.blocks.length}:${lastBlock?.type === "assistant" || lastBlock?.type === "thinking" ? lastBlock.text.length : lastBlock?.id ?? ""}:${session.status}`;
+
+  const scrollToBottom = (force = false) => {
+    const element = scrollRef.current;
+    if (!element) return;
+    if (force || followRef.current) element.scrollTop = element.scrollHeight;
+  };
+
+  // Opening / switching sessions always jumps to the latest turn.
+  useEffect(() => {
+    if (lastSessionId.current !== session.id) {
+      lastSessionId.current = session.id;
+      followRef.current = true;
+    }
+    followRef.current = true;
+    const frame = requestAnimationFrame(() => {
+      scrollToBottom(true);
+      // Second pass after layout of restored transcript cards.
+      requestAnimationFrame(() => scrollToBottom(true));
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [session.id]);
 
   useEffect(() => {
-    const frame = requestAnimationFrame(() => {
-      const element = scrollRef.current;
-      if (element && followRef.current) element.scrollTop = element.scrollHeight;
-    });
+    const frame = requestAnimationFrame(() => scrollToBottom());
     return () => cancelAnimationFrame(frame);
   }, [signature]);
 
-  if (session.blocks.length === 0) return <div className="flex flex-1 flex-col items-center justify-center gap-4 pb-24"><BlackHole size={44} spin="slow" /><div className="text-center"><p className="text-[14px] text-mute">{language === "zh-CN" ? "任务通道已打开。" : "Mission channel open."}</p><p className="lbl mt-1.5 !text-[10px]">{language === "zh-CN" ? "输入你的第一个请求" : "TRANSMIT YOUR FIRST DIRECTIVE"}</p></div></div>;
+  if (session.blocks.length === 0) return <div className="flex flex-1 flex-col items-center justify-center gap-4 pb-24"><BlackHole size={40} spin="slow" /><div className="text-center"><p className="text-[15px] text-mute">{language === "zh-CN" ? "准备好了。" : "Ready when you are."}</p><p className="mt-1.5 text-[13px] text-faint">{language === "zh-CN" ? "在下方输入你的第一个请求" : "Type your first message below"}</p></div></div>;
 
-  return <div ref={scrollRef} onScroll={() => { const element = scrollRef.current; if (element) followRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80; }} className="flex-1 overflow-y-auto"><div className="mx-auto max-w-[860px] px-8 py-8">{turns.map((turn, index) => <MemoTurnGroup key={turn.id} turn={turn} sessionId={session.id} status={session.status} active={index === turns.length - 1} />)}<div className="h-2" /></div></div>;
+  return (
+    <div
+      ref={scrollRef}
+      onScroll={() => {
+        const element = scrollRef.current;
+        if (element) followRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+      }}
+      className="flex-1 overflow-y-auto"
+    >
+      <div className="mx-auto max-w-[860px] px-8 py-8">
+        {turns.map((turn, index) => (
+          <MemoTurnGroup key={turn.id} turn={turn} sessionId={session.id} status={session.status} active={index === turns.length - 1} />
+        ))}
+        <div className="h-2" />
+      </div>
+    </div>
+  );
 }

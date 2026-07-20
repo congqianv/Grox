@@ -46,12 +46,12 @@ export function ChipSelect({
   return (
     <div ref={ref} className="relative min-w-0">
       <button disabled={disabled} className="chip max-w-[220px] min-w-0 disabled:cursor-wait disabled:opacity-60" onClick={() => setOpen((v) => !v)}>
-        <span className="min-w-0 truncate">{label}</span>
+        <span className="min-w-0 truncate leading-none">{label}</span>
         <Icon name="chevronDown" size={9} className="text-faint" />
       </button>
       {open && (
         <div
-          className="absolute bottom-full left-0 z-40 mb-1.5 max-h-[min(360px,60vh)] overflow-y-auto overflow-x-hidden rounded-[6px] border border-line2 bg-raise py-1 shadow-[0_8px_28px_rgba(0,0,0,0.55)] animate-fade-up"
+          className="absolute bottom-full left-0 z-40 mb-1.5 max-h-[min(360px,60vh)] overflow-y-auto overflow-x-hidden rounded-lg border border-line2 bg-raise py-1 shadow-[var(--shadow-float)] animate-fade-up"
           style={{ width: `min(${width}px, calc(100vw - 32px))` }}
         >
           {items.map((it) => (
@@ -67,10 +67,10 @@ export function ChipSelect({
               }`}
             >
               <span
-                className={`h-1 w-1 shrink-0 rounded-full ${it.id === activeId ? "bg-acc" : "bg-transparent"}`}
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${it.id === activeId ? "bg-acc" : "bg-transparent"}`}
               />
-              <span className="truncate font-mono text-[11px] text-fg2">{it.label}</span>
-              <span className="truncate text-right text-[10px] text-faint">{it.hint ?? ""}</span>
+              <span className="truncate text-[12.5px] leading-none text-fg2">{it.label}</span>
+              <span className="truncate text-right text-[11px] leading-none text-faint">{it.hint ?? ""}</span>
             </button>
           ))}
         </div>

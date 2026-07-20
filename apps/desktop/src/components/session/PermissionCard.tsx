@@ -40,29 +40,29 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
 
   return (
     <div
-      className={`mb-5 animate-fade-up rounded-[6px] border p-4 transition-opacity ${
-        resolved ? "border-line2 bg-raise opacity-60" : "border-focus bg-raise"
+      className={`mb-5 animate-fade-up rounded-lg border p-4 transition-opacity ${
+        resolved ? "border-line2 bg-raise opacity-60" : "border-gold/30 bg-raise"
       }`}
     >
       <div className="flex items-center gap-2">
         <Icon name="bolt" size={13} className={resolved ? "text-dim" : "text-gold"} />
-        <span className={`lbl ${resolved ? "" : "!text-gold"}`}>
+        <span className={`text-[12.5px] font-medium ${resolved ? "text-mute" : "text-gold"}`}>
           {resolved
             ? resolved === "deny"
-              ? language === "zh-CN" ? "已由用户拒绝" : "DENIED · BY OPERATOR"
+              ? language === "zh-CN" ? "已由用户拒绝" : "Denied"
               : language === "zh-CN"
                 ? `已批准 · ${resolved === "allow_always" ? "始终" : "本次"}`
-                : `APPROVED · ${resolved === "allow_always" ? "ALWAYS" : "ONCE"}`
-            : language === "zh-CN" ? "需要用户批准" : "APPROVAL REQUIRED"}
+                : `Approved · ${resolved === "allow_always" ? "always" : "once"}`
+            : language === "zh-CN" ? "需要批准" : "Approval required"}
         </span>
-        {!resolved && <span className="h-1 w-1 animate-pulse-dot rounded-full bg-gold" />}
+        {!resolved && <span className="h-1.5 w-1.5 animate-pulse-dot rounded-full bg-gold" />}
       </div>
 
-      <p className="mt-2 text-[12px] text-fg2">{block.req.description}</p>
+      <p className="mt-2 text-[13px] text-fg2">{block.req.description}</p>
 
       {block.req.payload && (
-        <div className="mt-2.5 rounded-[5px] border border-line2 bg-void px-3 py-2">
-          <code className="font-mono text-[11px] text-fg2 select-text">{block.req.payload}</code>
+        <div className="mt-2.5 rounded-xl border border-line2 bg-void px-3.5 py-2.5">
+          <code className="font-mono text-[12px] text-fg2 select-text">{block.req.payload}</code>
         </div>
       )}
 
@@ -73,17 +73,17 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
               opt === "allow_once"
                 ? "bg-acc text-base hover:bg-acc-deep font-medium"
                 : opt === "allow_always"
-                  ? "border border-acc-dim text-acc hover:bg-acc-wash"
-                  : "border border-line3 text-mute hover:border-red hover:text-red";
+                  ? "border border-line3 text-fg2 hover:bg-high"
+                  : "border border-line2 text-mute hover:border-red hover:text-red";
             return (
               <button
                 key={opt}
                 onClick={() => resolvePermission(block.id, opt)}
-                className={`flex h-7 items-center gap-2 rounded-[4px] px-3 text-[11.5px] transition-colors ${styles}`}
+                className={`flex h-8 items-center gap-2 rounded-md px-3 text-[12.5px] leading-none transition-colors ${styles}`}
               >
                 {optionLabels[opt]}
                 <kbd
-                  className={`font-mono text-[9.5px] ${opt === "allow_once" ? "text-base/70" : "text-faint"}`}
+                  className={`text-[11px] ${opt === "allow_once" ? "text-base/70" : "text-faint"}`}
                 >
                   {i + 1}
                 </kbd>

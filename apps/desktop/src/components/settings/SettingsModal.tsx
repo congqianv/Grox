@@ -35,18 +35,18 @@ export function SettingsModal() {
   ];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-void/75 p-5 backdrop-blur-[3px]" onMouseDown={() => setOpen(false)}>
-      <div className="flex h-[min(760px,88vh)] w-[min(1040px,92vw)] overflow-hidden rounded-[9px] border border-line3 bg-panel shadow-2xl animate-fade-up" onMouseDown={(event) => event.stopPropagation()}>
-        <nav className="flex w-[190px] shrink-0 flex-col border-r border-line bg-void py-3">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-void/55 p-5 backdrop-blur-[4px]" onMouseDown={() => setOpen(false)}>
+      <div className="flex h-[min(760px,88vh)] w-[min(1040px,92vw)] overflow-hidden rounded-lg border border-line2 bg-panel shadow-[var(--shadow-float)] animate-fade-up" onMouseDown={(event) => event.stopPropagation()}>
+        <nav className="flex w-[200px] shrink-0 flex-col border-r border-line bg-base py-3">
           <div className="px-4 pb-3"><Wordmark size={11} withMark={false} /></div>
           {sections.map((item) => (
-            <button key={item.id} onClick={() => setSection(item.id)} className={`flex items-center gap-2 px-4 py-2 text-left font-mono text-[10px] transition-colors ${section === item.id ? "bg-high text-acc" : "text-dim hover:text-fg2"}`}>
-              <Icon name={item.icon} size={11} />
+            <button key={item.id} onClick={() => setSection(item.id)} className={`mx-2 flex items-center gap-2 rounded-md px-3 py-2 text-left text-[12.5px] leading-none transition-colors ${section === item.id ? "bg-high font-medium text-fg" : "text-dim hover:bg-high/60 hover:text-fg2"}`}>
+              <Icon name={item.icon} size={12} />
               <span className="truncate">{item.label}</span>
             </button>
           ))}
           <div className="flex-1" />
-          <button onClick={() => setOpen(false)} className="mx-3 flex h-8 items-center justify-center rounded-[4px] border border-line2 text-[10px] text-mute hover:border-line3 hover:text-fg">{language === "zh-CN" ? "关闭" : "Close"}</button>
+          <button onClick={() => setOpen(false)} className="mx-3 flex h-8 items-center justify-center rounded-md border border-line2 text-[12.5px] leading-none text-mute transition-colors hover:bg-high hover:text-fg">{language === "zh-CN" ? "关闭" : "Close"}</button>
         </nav>
         <div className="min-w-0 flex-1 overflow-y-auto p-6">
           {section === "general" && <General />}
@@ -62,23 +62,23 @@ export function SettingsModal() {
 }
 
 function Heading({ title, description }: { title: string; description?: string }) {
-  return <div className="mb-5"><h2 className="text-[15px] font-medium text-fg">{title}</h2>{description && <p className="mt-1 text-[10.5px] leading-relaxed text-dim">{description}</p>}</div>;
+  return <div className="mb-5"><h2 className="text-[16px] font-medium tracking-tight text-fg">{title}</h2>{description && <p className="mt-1.5 text-[12.5px] leading-relaxed text-dim">{description}</p>}</div>;
 }
 
 function Row({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
-  return <div className="flex items-center justify-between border-b border-line py-3"><div className="min-w-0 pr-4"><p className="text-[11.5px] text-fg2">{label}</p>{hint && <p className="mt-0.5 text-[10px] text-dim">{hint}</p>}</div><div className="shrink-0">{children}</div></div>;
+  return <div className="flex items-center justify-between border-b border-line py-3.5"><div className="min-w-0 pr-4"><p className="text-[13px] text-fg2">{label}</p>{hint && <p className="mt-0.5 text-[12px] text-dim">{hint}</p>}</div><div className="shrink-0">{children}</div></div>;
 }
 
 function Toggle({ on, onChange, disabled = false }: { on: boolean; onChange(value: boolean): void; disabled?: boolean }) {
-  return <button disabled={disabled} onClick={() => onChange(!on)} className={`relative h-[18px] w-8 rounded-full border transition-colors disabled:opacity-40 ${on ? "border-acc-dim bg-acc-wash" : "border-line3 bg-high"}`}><span className={`absolute top-[2px] h-[12px] w-[12px] rounded-full transition-all ${on ? "left-[16px] bg-acc" : "left-[2px] bg-dim"}`} /></button>;
+  return <button disabled={disabled} onClick={() => onChange(!on)} className={`relative h-[20px] w-9 rounded-full border transition-colors disabled:opacity-40 ${on ? "border-acc bg-acc" : "border-line3 bg-high"}`}><span className={`absolute top-[2px] h-[14px] w-[14px] rounded-full transition-all ${on ? "left-[18px] bg-base" : "left-[2px] bg-dim"}`} /></button>;
 }
 
 function ActionButton({ children, onClick, tone = "normal", disabled = false }: { children: React.ReactNode; onClick(): void; tone?: "normal" | "danger" | "accent"; disabled?: boolean }) {
-  return <button disabled={disabled} onClick={onClick} className={`h-8 rounded-[4px] border px-3 font-mono text-[9.5px] disabled:opacity-40 ${tone === "danger" ? "border-red/30 text-red hover:bg-red/5" : tone === "accent" ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-fg2 hover:border-line3 hover:text-fg"}`}>{children}</button>;
+  return <button disabled={disabled} onClick={onClick} className={`flex h-8 items-center rounded-md border px-3 text-[12px] leading-none disabled:opacity-40 ${tone === "danger" ? "border-red/30 text-red hover:bg-red/5" : tone === "accent" ? "border-transparent bg-acc text-base hover:bg-acc-deep" : "border-line2 text-fg2 hover:bg-high hover:text-fg"}`}>{children}</button>;
 }
 
 function Input({ value, onChange, placeholder, type = "text" }: { value: string; onChange(value: string): void; placeholder?: string; type?: string }) {
-  return <input type={type} value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} className="h-8 w-full min-w-0 rounded-[4px] border border-line2 bg-void px-2.5 font-mono text-[10px] text-fg outline-none placeholder:text-faint focus:border-acc-dim" />;
+  return <input type={type} value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} className="h-8 w-full min-w-0 rounded-md border border-line2 bg-raise px-2.5 text-[12.5px] text-fg outline-none placeholder:text-faint focus:border-line3" />;
 }
 
 function General() {

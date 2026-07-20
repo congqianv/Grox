@@ -23,60 +23,56 @@ export function StatusBar() {
       : 0;
 
   return (
-    <footer className="flex h-7 shrink-0 items-center justify-between border-t border-line bg-panel px-3 font-mono text-[10.5px] tracking-[0.06em] text-dim select-none">
-      {/* left — link state */}
+    <footer className="flex h-7 shrink-0 items-center justify-between border-t border-line bg-panel px-3 text-[11.5px] leading-none text-dim select-none">
       <div className="flex items-center gap-2">
-        <BlackHole size={13} spin={status === "running"} />
+        <BlackHole size={12} spin={status === "running"} />
         <span
           className={
             status === "running"
-              ? "text-acc"
+              ? "font-medium leading-none text-fg2"
               : status === "awaiting_permission"
-                ? "text-gold"
-                : "text-mute"
+                ? "font-medium leading-none text-gold"
+                : "leading-none text-mute"
           }
         >
           {language === "zh-CN"
             ? status === "running" ? "处理中" : status === "awaiting_permission" ? "等待批准" : status === "awaiting_input" ? "等待输入" : "就绪"
-            : status === "running" ? "WORKING" : status === "awaiting_permission" ? "AWAITING APPROVAL" : status === "awaiting_input" ? "AWAITING INPUT" : "READY"}
+            : status === "running" ? "Working" : status === "awaiting_permission" ? "Awaiting approval" : status === "awaiting_input" ? "Awaiting input" : "Ready"}
         </span>
         {activeId && (
           <>
             <Sep />
-            <span className="tnum text-faint">SID {activeId.slice(0, 8)}</span>
+            <span className="tnum text-faint">{activeId.slice(0, 8)}</span>
           </>
         )}
       </div>
 
-      {/* right — instruments */}
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-2.5">
         {usage && usage.contextUsed > 0 && (
           <>
             <span className="flex items-center gap-1.5">
-              <span>CTX</span>
-              <span className="relative h-[3px] w-14 overflow-hidden rounded-full bg-high">
+              <span className="text-faint">{language === "zh-CN" ? "上下文" : "Context"}</span>
+              <span className="relative h-1 w-14 overflow-hidden rounded-full bg-high">
                 <span
-                  className={`absolute inset-y-0 left-0 ${ctxPct > 80 ? "bg-gold" : "bg-acc"}`}
+                  className={`absolute inset-y-0 left-0 rounded-full ${ctxPct > 80 ? "bg-gold" : "bg-acc"}`}
                   style={{ width: `${ctxPct}%` }}
                 />
               </span>
               <span className={`tnum ${ctxPct > 80 ? "text-gold" : "text-fg2"}`}>{ctxPct}%</span>
             </span>
             <Sep />
-            <span className="tnum">
+            <span className="tnum text-mute">
               <span className="text-faint">↑</span> {fmtTokens(usage.inputTokens)}
               <span className="text-faint"> ↓</span> {fmtTokens(usage.outputTokens)}
             </span>
             <Sep />
             <span className="tnum text-fg2">{fmtCost(usage.costUSD)}</span>
             <Sep />
-            <span className="tnum">{usage.turns} TRN</span>
-            <Sep />
           </>
         )}
-        <span className="text-fg2">{model.toUpperCase().replace(/-/g, "‑")}</span>
+        <span className="text-fg2">{model.replace(/-/g, "‑")}</span>
         <Sep />
-        <span>{language === "zh-CN" ? "强度" : "EFFORT"} {effort.toUpperCase()}</span>
+        <span className="text-mute">{language === "zh-CN" ? "强度" : "Effort"} {effort}</span>
       </div>
     </footer>
   );

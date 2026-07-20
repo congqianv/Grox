@@ -63,7 +63,7 @@ export default function App() {
     return (
       <div className="flex h-screen flex-col items-center justify-center gap-4 bg-base">
         <BlackHole size={38} spin />
-        <span className="lbl">{language === "zh-CN" ? "正在连接 GROK" : "ESTABLISHING LINK"}</span>
+        <span className="text-[13px] text-mute">{language === "zh-CN" ? "正在连接 Grok…" : "Connecting to Grok…"}</span>
       </div>
     );
   }
@@ -85,7 +85,7 @@ export default function App() {
           ) : inSession && !session ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-3">
               <BlackHole size={28} spin />
-              <span className="lbl !text-[10px]">{language === "zh-CN" ? "正在恢复任务" : "RESTORING MISSION"}</span>
+              <span className="text-[13px] text-mute">{language === "zh-CN" ? "正在恢复任务…" : "Restoring session…"}</span>
             </div>
           ) : (
             <Home />

@@ -36,7 +36,11 @@ export function Composer() {
   const fileRef = useRef<HTMLInputElement>(null);
 
   const sendPrompt = useDesktop((s) => s.sendPrompt);
+  const removeQueuedPrompt = useDesktop((s) => s.removeQueuedPrompt);
+  const clearPromptQueue = useDesktop((s) => s.clearPromptQueue);
+  const activeId = useDesktop((s) => s.activeId);
   const composer = useDesktop((s) => s.activeId ? s.sessionComposers[s.activeId] : undefined);
+  const queue = useDesktop((s) => (s.activeId ? s.promptQueues[s.activeId] ?? [] : []));
   const text = composer?.text ?? "";
   const attachments = composer?.attachments ?? [];
   const setText = useDesktop((s) => s.setDraft);
@@ -129,7 +133,7 @@ export function Composer() {
 
   const send = () => {
     const t = text.trim();
-    if ((!t && attachments.length === 0) || running || readingFiles) return;
+    if ((!t && attachments.length === 0) || readingFiles) return;
     sendPrompt(t, attachments);
     setText("");
     setAttachments([]);
@@ -179,11 +183,10 @@ export function Composer() {
   const currentModel = models.find((m) => m.id === model);
 
   return (
-    <div className="shrink-0 px-6 pb-4 pt-1">
+    <div className="shrink-0 px-6 pb-5 pt-2">
       <div className="relative mx-auto max-w-[760px]">
-        {/* slash menu */}
         {slashOpen && matches.length > 0 && (
-          <div className="absolute bottom-full left-0 z-40 mb-2 w-full overflow-hidden rounded-[6px] border border-line2 bg-raise py-1 shadow-[0_8px_28px_rgba(0,0,0,0.55)] animate-fade-up">
+          <div className="absolute bottom-full left-0 z-40 mb-2 w-full overflow-hidden rounded-lg border border-line2 bg-raise py-1 shadow-[var(--shadow-float)] animate-fade-up">
             {matches.map((c, i) => (
               <button
                 key={c.id}
@@ -193,17 +196,53 @@ export function Composer() {
                   setText("");
                 }}
                 className={`flex w-full items-center gap-3 px-3 py-1.5 text-left ${
-                  i === slashIdx ? "bg-high" : ""
+                  i === slashIdx ? "bg-high" : "hover:bg-high/60"
                 }`}
               >
-                <span className="w-20 shrink-0 font-mono text-[11px] text-acc">{c.id}</span>
-                <span className="text-[11px] text-mute">{c.hint}</span>
+                <span className="w-20 shrink-0 font-mono text-[12px] leading-none text-acc">{c.id}</span>
+                <span className="text-[12.5px] leading-none text-mute">{c.hint}</span>
               </button>
             ))}
           </div>
         )}
 
-        <div className="rounded-[8px] border border-line2 bg-raise transition-colors focus-within:border-acc-dim">
+        {queue.length > 0 && (
+          <div className="mb-2 overflow-hidden rounded-lg border border-line2 bg-raise">
+            <div className="flex h-8 items-center justify-between border-b border-line px-3">
+              <span className="text-[12px] font-medium text-mute">
+                {language === "zh-CN" ? `队列 ${queue.length}` : `Queued ${queue.length}`}
+              </span>
+              <button
+                onClick={() => activeId && clearPromptQueue(activeId)}
+                className="text-[11.5px] text-faint transition-colors hover:text-fg"
+              >
+                {language === "zh-CN" ? "清空" : "Clear"}
+              </button>
+            </div>
+            <div className="max-h-28 overflow-y-auto py-1">
+              {queue.map((item, index) => (
+                <div key={item.id} className="flex items-center gap-2 px-3 py-1.5">
+                  <span className="tnum w-4 shrink-0 text-[11px] text-faint">{index + 1}</span>
+                  <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg2">
+                    {item.text || item.attachments.map((a) => a.name).join(", ")}
+                  </span>
+                  {item.attachments.length > 0 && (
+                    <span className="shrink-0 text-[11px] text-faint">{item.attachments.length}</span>
+                  )}
+                  <button
+                    onClick={() => activeId && removeQueuedPrompt(activeId, item.id)}
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-faint hover:bg-high hover:text-fg"
+                    title={language === "zh-CN" ? "移除" : "Remove"}
+                  >
+                    <Icon name="x" size={10} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="surface overflow-hidden transition-shadow">
           <input
             ref={fileRef}
             type="file"
@@ -215,16 +254,19 @@ export function Composer() {
             }}
           />
           {attachments.length > 0 && (
-            <div className="flex flex-wrap gap-1.5 border-b border-line px-3 py-2.5">
+            <div className="flex flex-wrap gap-1.5 border-b border-line px-3 py-2">
               {attachments.map((attachment) => (
-                <div key={attachment.id} className="group flex h-9 max-w-[220px] items-center gap-2 rounded-[5px] border border-line2 bg-high/70 pl-1.5 pr-1">
+                <div key={attachment.id} className="group flex h-8 max-w-[220px] items-center gap-2 rounded-md bg-high pl-1.5 pr-1">
                   {attachment.kind === "image" && attachment.data ? (
-                    <img src={`data:${attachment.mime};base64,${attachment.data}`} alt="" className="h-6 w-6 rounded-[3px] object-cover" />
+                    <img src={`data:${attachment.mime};base64,${attachment.data}`} alt="" className="h-5 w-5 rounded object-cover" />
                   ) : (
-                    <span className="flex h-6 w-6 items-center justify-center rounded-[3px] bg-raise text-dim"><Icon name="file" size={11} /></span>
+                    <span className="flex h-5 w-5 items-center justify-center rounded bg-raise text-dim"><Icon name="file" size={11} /></span>
                   )}
-                  <div className="min-w-0 flex-1"><p className="truncate font-mono text-[9.5px] text-fg2">{attachment.name}</p><p className="font-mono text-[8.5px] text-faint">{attachment.size < 1024 * 1024 ? `${Math.max(1, Math.round(attachment.size / 1024))} KB` : `${(attachment.size / 1024 / 1024).toFixed(1)} MB`}</p></div>
-                  <button onClick={() => setAttachments(attachments.filter((item) => item.id !== attachment.id))} className="flex h-6 w-6 items-center justify-center rounded-[3px] text-faint hover:bg-raise hover:text-fg" title={language === "zh-CN" ? "移除附件" : "Remove attachment"}><Icon name="x" size={9} /></button>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-[11.5px] leading-none text-fg2">{attachment.name}</p>
+                    <p className="mt-0.5 text-[10px] leading-none text-faint">{attachment.size < 1024 * 1024 ? `${Math.max(1, Math.round(attachment.size / 1024))} KB` : `${(attachment.size / 1024 / 1024).toFixed(1)} MB`}</p>
+                  </div>
+                  <button onClick={() => setAttachments(attachments.filter((item) => item.id !== attachment.id))} className="flex h-6 w-6 items-center justify-center rounded-md text-faint hover:bg-raise hover:text-fg" title={language === "zh-CN" ? "移除附件" : "Remove attachment"}><Icon name="x" size={9} /></button>
                 </div>
               ))}
             </div>
@@ -238,19 +280,18 @@ export function Composer() {
             rows={1}
             placeholder={
               running
-                ? (language === "zh-CN" ? "Grok 正在处理 — 可以准备下一条请求…" : "Grok is working — queue the next directive…")
-                : (language === "zh-CN" ? "发送给 Grok…" : "Transmit to Grok…")
+                ? (language === "zh-CN" ? "Grok 正在处理 — 回车加入队列…" : "Grok is working — Enter to queue…")
+                : (language === "zh-CN" ? "发送给 Grok…" : "Message Grok…")
             }
-            className="block w-full resize-none bg-transparent px-4 pb-1 pt-3 text-[14px] leading-relaxed text-fg placeholder:text-faint focus:outline-none"
+            className="block w-full resize-none bg-transparent px-4 pb-1 pt-3 text-[14.5px] leading-relaxed text-fg placeholder:text-faint focus:outline-none"
           />
 
-          {/* control strip */}
           <div className="flex flex-wrap items-center gap-1.5 px-2.5 pb-2.5 pt-1">
             <ProviderSwitcher />
 
             <ChipSelect
               label={
-                <span className="text-fg2">{currentModel?.label ?? model.toUpperCase()}</span>
+                <span className="text-fg2">{currentModel?.label ?? model}</span>
               }
               items={models.map((m) => ({ id: m.id, label: m.label, hint: m.tagline }))}
               activeId={model}
@@ -262,12 +303,12 @@ export function Composer() {
 
             <button
               onClick={() => fileRef.current?.click()}
-              disabled={running || readingFiles || attachments.length >= MAX_ATTACHMENTS}
+              disabled={readingFiles || attachments.length >= MAX_ATTACHMENTS}
               title={language === "zh-CN" ? "上传文件；也可直接粘贴剪贴板图片" : "Upload files; clipboard images can also be pasted"}
-              className="flex h-7 items-center gap-1.5 rounded-[5px] border border-line2 px-2 font-mono text-[9.5px] text-dim transition-colors hover:border-line3 hover:text-fg2 disabled:opacity-40"
+              className="flex h-7 items-center gap-1.5 rounded-md px-2.5 text-[12px] leading-none text-dim transition-colors hover:bg-high hover:text-fg2 disabled:opacity-40"
             >
-              <Icon name="clip" size={11} />
-              {readingFiles ? (language === "zh-CN" ? "读取中" : "READING") : (language === "zh-CN" ? "附件" : "ATTACH")}
+              <Icon name="clip" size={12} />
+              {readingFiles ? (language === "zh-CN" ? "读取中" : "Reading") : (language === "zh-CN" ? "附件" : "Attach")}
             </button>
 
             <div className="flex-1" />
@@ -276,40 +317,46 @@ export function Composer() {
               <RewindMenu onComplete={() => taRef.current?.focus()} />
             )}
 
-            {running ? (
+            {running && (
               <button
                 onClick={stop}
-                title="Abort turn"
-                className="flex h-7 w-7 items-center justify-center rounded-[5px] border border-red/50 text-red transition-colors hover:bg-red/10"
+                title={language === "zh-CN" ? "停止" : "Stop"}
+                className="flex h-7 w-7 items-center justify-center rounded-md border border-red/30 text-red transition-colors hover:bg-red/10"
               >
                 <Icon name="stop" size={11} />
               </button>
-            ) : (
-              <button
-                onClick={send}
-                disabled={(!text.trim() && attachments.length === 0) || readingFiles}
-                title="Transmit"
-                className={`flex h-7 w-7 items-center justify-center rounded-[5px] transition-colors ${
-                  text.trim() || attachments.length > 0
-                    ? "bg-acc text-base hover:bg-acc-deep"
-                    : "bg-high text-faint"
-                }`}
-              >
-                <Icon name="arrowUp" size={13} strokeWidth={2} />
-              </button>
             )}
+
+            <button
+              onClick={send}
+              disabled={(!text.trim() && attachments.length === 0) || readingFiles}
+              title={running ? (language === "zh-CN" ? "加入队列" : "Queue") : (language === "zh-CN" ? "发送" : "Send")}
+              className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+                text.trim() || attachments.length > 0
+                  ? "bg-acc text-base hover:bg-acc-deep"
+                  : "bg-high text-faint"
+              }`}
+            >
+              <Icon name="arrowUp" size={13} strokeWidth={2} />
+            </button>
           </div>
-          {attachmentError && <p className="border-t border-red/20 px-3 py-1.5 text-[9.5px] text-red">{attachmentError}</p>}
+          {attachmentError && <p className="border-t border-red/15 px-3 py-1.5 text-[12px] text-red">{attachmentError}</p>}
         </div>
 
-        <div className="mt-1.5 flex items-center justify-between px-1">
-          <span className="lbl !text-[9.5px]">
-            {language === "zh-CN" ? "⏎ 发送 · ⇧⏎ 换行 · 粘贴图片 · / 命令" : "⏎ SEND · ⇧⏎ NEWLINE · PASTE IMAGE · / COMMANDS"}
-          </span>
-          <span className="lbl !text-[9.5px]">
+        <div className="mt-2 flex items-center justify-between px-1.5">
+          <span className="text-[11.5px] text-faint">
             {language === "zh-CN"
-              ? mode === "plan" ? "计划模式 · 批准前只读" : mode === "ask" ? "问答模式 · 不使用工具" : "AGENT 模式 · 完整工具权限"
-              : mode === "plan" ? "PLAN MODE · READ-ONLY UNTIL APPROVED" : mode === "ask" ? "ASK MODE · NO TOOLS" : "AGENT MODE · FULL TOOL ACCESS"}
+              ? running
+                ? "⏎ 加入队列 · ⇧⏎ 换行 · 粘贴图片 · / 命令"
+                : "⏎ 发送 · ⇧⏎ 换行 · 粘贴图片 · / 命令"
+              : running
+                ? "⏎ queue · ⇧⏎ newline · paste image · / commands"
+                : "⏎ send · ⇧⏎ newline · paste image · / commands"}
+          </span>
+          <span className="text-[11.5px] text-faint">
+            {language === "zh-CN"
+              ? mode === "plan" ? "计划模式 · 批准前只读" : mode === "ask" ? "问答模式 · 不使用工具" : "Agent 模式 · 完整工具权限"
+              : mode === "plan" ? "Plan · read-only until approved" : mode === "ask" ? "Ask · no tools" : "Agent · full tool access"}
           </span>
         </div>
       </div>

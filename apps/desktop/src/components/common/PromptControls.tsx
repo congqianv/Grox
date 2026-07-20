@@ -16,8 +16,8 @@ export function ProviderSwitcher() {
   const activeProfile = profiles.find((profile) => profile.id === activeProfileId);
   const activeId = activeProfileId ?? provider.kind;
   const label = switching
-    ? (language === "zh-CN" ? "切换中" : "SWITCHING")
-    : activeProfile?.name ?? (provider.kind === "oauth" ? "GROK OAUTH" : provider.kind === "official" ? "XAI API" : "OPENAI API");
+    ? (language === "zh-CN" ? "切换中" : "Switching")
+    : activeProfile?.name ?? (provider.kind === "oauth" ? "Grok OAuth" : provider.kind === "official" ? "xAI API" : "OpenAI API");
   const items = [
     { id: "oauth", label: "Grok OAuth", hint: language === "zh-CN" ? "官方账户" : "Official account" },
     ...(provider.kind === "official" && !activeProfileId
@@ -82,23 +82,23 @@ export function PromptOptionsMenu({
   return (
     <div ref={ref} className="relative">
       <button onClick={() => setOpen((value) => !value)} className="chip max-w-[190px]" title={language === "zh-CN" ? "模式、权限与思考强度" : "Mode, access and reasoning effort"}>
-        <Icon name="gear" size={10} />
-        <span className="truncate">{mode.toUpperCase()} · {effort.toUpperCase()}</span>
-        <Icon name="chevronDown" size={8} className="text-faint" />
+        <Icon name="gear" size={11} />
+        <span className="truncate capitalize">{mode} · {effort}</span>
+        <Icon name="chevronDown" size={9} className="text-faint" />
       </button>
       {open && (
-        <div className="absolute bottom-full left-0 z-40 mb-1.5 w-[min(360px,calc(100vw-32px))] rounded-[7px] border border-line2 bg-raise p-3 shadow-[0_8px_28px_rgba(0,0,0,0.55)] animate-fade-up">
-          <OptionRow label={language === "zh-CN" ? "工作模式" : "MODE"} values={[
-            ["agent", language === "zh-CN" ? "执行" : "AGENT"],
-            ["plan", language === "zh-CN" ? "计划" : "PLAN"],
-            ["ask", language === "zh-CN" ? "问答" : "ASK"],
+        <div className="absolute bottom-full left-0 z-40 mb-1.5 w-[min(360px,calc(100vw-32px))] rounded-lg border border-line2 bg-raise p-3 shadow-[var(--shadow-float)] animate-fade-up">
+          <OptionRow label={language === "zh-CN" ? "工作模式" : "Mode"} values={[
+            ["agent", language === "zh-CN" ? "执行" : "Agent"],
+            ["plan", language === "zh-CN" ? "计划" : "Plan"],
+            ["ask", language === "zh-CN" ? "问答" : "Ask"],
           ]} active={mode} onSelect={(value) => onMode(value as AgentMode)} />
-          <OptionRow label={language === "zh-CN" ? "工具权限" : "ACCESS"} values={[
-            ["default", language === "zh-CN" ? "按需确认" : "DEFAULT"],
-            ["auto", language === "zh-CN" ? "自动策略" : "AUTO"],
+          <OptionRow label={language === "zh-CN" ? "工具权限" : "Access"} values={[
+            ["default", language === "zh-CN" ? "按需确认" : "Default"],
+            ["auto", language === "zh-CN" ? "自动策略" : "Auto"],
             ["bypass", "YOLO"],
           ]} active={permissionMode} onSelect={(value) => onPermission(value as PermissionMode)} />
-          <OptionRow label={language === "zh-CN" ? "思考强度" : "EFFORT"} values={EFFORTS.map((value) => [value, value.toUpperCase()])} active={effort} onSelect={(value) => onEffort(value as Effort)} last />
+          <OptionRow label={language === "zh-CN" ? "思考强度" : "Effort"} values={EFFORTS.map((value) => [value, value])} active={effort} onSelect={(value) => onEffort(value as Effort)} last />
         </div>
       )}
     </div>
@@ -108,10 +108,10 @@ export function PromptOptionsMenu({
 function OptionRow({ label, values, active, onSelect, last = false }: { label: string; values: readonly (readonly [string, string])[]; active: string; onSelect(value: string): void; last?: boolean }) {
   return (
     <div className={last ? "" : "mb-3 border-b border-line pb-3"}>
-      <p className="lbl mb-1.5 !text-[9px]">{label}</p>
+      <p className="mb-1.5 text-[11.5px] font-medium text-mute">{label}</p>
       <div className="grid grid-cols-4 gap-1">
         {values.map(([value, text]) => (
-          <button key={value} onClick={() => onSelect(value)} className={`min-w-0 truncate rounded-[4px] border px-2 py-1.5 font-mono text-[9.5px] ${active === value ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim hover:text-fg2"}`} title={text}>
+          <button key={value} onClick={() => onSelect(value)} className={`flex h-7 min-w-0 items-center justify-center truncate rounded-md border px-2 text-[11.5px] leading-none transition-colors ${active === value ? "border-transparent bg-acc text-base" : "border-line2 text-dim hover:bg-high hover:text-fg2"}`} title={text}>
             {text}
           </button>
         ))}
