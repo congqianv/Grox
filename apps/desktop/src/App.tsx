@@ -17,7 +17,6 @@ import { ResizeHandle } from "./components/common/ResizeHandle";
 import { usePreferences } from "./state/preferences";
 import { useI18n } from "./lib/i18n";
 import { AccountSetup } from "./components/settings/AccountSetup";
-import { UpdateNotice } from "./components/update/UpdateNotice";
 
 class SessionErrorBoundary extends Component<
   { children: ReactNode; onReset: () => void; language: string },
@@ -146,7 +145,6 @@ export default function App() {
       <CommandPalette />
       <SettingsModal />
       <AccountSetup />
-      <UpdateNotice />
     </div>
   );
 }

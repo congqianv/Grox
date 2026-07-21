@@ -21,7 +21,7 @@ Grox 是以 [xai-org/grok-build](https://github.com/xai-org/grok-build) 为核�
 - 配置同步：账户模块内的 `config.toml`、`system-prompt.md` 与项目 `AGENTS.md` 支持双向编辑和外部变更热同步，不暴露原始环境变量编辑栏
 - 动态模型：OAuth 实时跟随 Grok 模型目录；官方及兼容 API 可拉取模型列表并持久选择常驻模型
 - 桌面安全：Markdown 清洗、CSP、HTTP(S) 外链校验、无控制台子进程
-- 发布链：Windows/macOS 图标、按目标三元组打包的 Grok sidecar 与应用内更新提醒
+- 发布链：Windows/macOS 图标、按目标三元组打包的 Grok sidecar（bundled 模式）
 - 离线 Mock：浏览器开发时可完整演示主要界面状态
 
 ## 架构

@@ -31,7 +31,6 @@ use tokio::{
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GROX_BUILD_COMMIT: &str = env!("GROX_BUILD_COMMIT");
 const GROK_UPSTREAM_PROVENANCE: &str = include_str!("../../../../.grox/upstream.json");
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/dandandujie/Grox/releases/latest";
 const GROK_INSTALL_PS1_URL: &str = "https://x.ai/cli/install.ps1";
 const GROK_INSTALL_SH_URL: &str = "https://x.ai/cli/install.sh";
 const GROX_PRIVACY_ENV: [(&str, &str); 12] = [
@@ -128,26 +127,6 @@ struct GrokRuntimeInfo {
     version: Option<String>,
     grox_commit: &'static str,
     upstream_commit: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GitHubRelease {
-    tag_name: String,
-    name: Option<String>,
-    body: Option<String>,
-    html_url: String,
-    published_at: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateInfo {
-    current_version: String,
-    latest_version: String,
-    title: String,
-    notes: String,
-    release_url: String,
-    published_at: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1897,58 +1876,6 @@ async fn acp_kill(
     Ok(())
 }
 
-fn release_version(value: &str) -> Result<semver::Version, String> {
-    semver::Version::parse(value.trim().trim_start_matches(['v', 'V']))
-        .map_err(|error| format!("无法解析版本号 {value:?}：{error}"))
-}
-
-fn update_available(current: &str, latest: &str) -> Result<bool, String> {
-    Ok(release_version(latest)? > release_version(current)?)
-}
-
-#[tauri::command]
-async fn check_for_update() -> Result<Option<UpdateInfo>, String> {
-    let client = reqwest::Client::builder()
-        .user_agent(format!("Grox/{CLIENT_VERSION}"))
-        .timeout(std::time::Duration::from_secs(12))
-        .build()
-        .map_err(|error| format!("无法创建更新检查客户端：{error}"))?;
-    let release = client
-        .get(LATEST_RELEASE_URL)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|error| format!("无法检查更新：{error}"))?
-        .error_for_status()
-        .map_err(|error| format!("更新服务返回错误：{error}"))?
-        .json::<GitHubRelease>()
-        .await
-        .map_err(|error| format!("无法读取更新信息：{error}"))?;
-
-    if !update_available(CLIENT_VERSION, &release.tag_name)? {
-        return Ok(None);
-    }
-
-    let latest_version = release.tag_name.trim().trim_start_matches(['v', 'V']);
-    let notes = release
-        .body
-        .unwrap_or_default()
-        .chars()
-        .take(12_000)
-        .collect::<String>();
-    Ok(Some(UpdateInfo {
-        current_version: CLIENT_VERSION.to_string(),
-        latest_version: latest_version.to_string(),
-        title: release
-            .name
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| format!("Grox {latest_version}")),
-        notes,
-        release_url: release.html_url,
-        published_at: release.published_at,
-    }))
-}
-
 fn main() {
     tauri::Builder::default()
         .manage(Arc::new(AcpState::default()))
@@ -2003,7 +1930,6 @@ fn main() {
             grok_runtime_info,
             set_grok_runtime_preference,
             install_official_grok_cli,
-            check_for_update,
             open_external,
             start_project_preview,
             acp_spawn,
@@ -2100,11 +2026,4 @@ mod tests {
         assert_eq!(values.get("OTEL_LOGS_EXPORTER"), Some(&"none"));
     }
 
-    #[test]
-    fn compares_release_versions_without_treating_prefix_as_part_of_version() {
-        assert!(update_available("0.1.0", "v0.2.0").unwrap());
-        assert!(!update_available("0.2.0", "V0.2.0").unwrap());
-        assert!(!update_available("0.3.0", "v0.2.9").unwrap());
-        assert!(update_available("0.2.0-beta.1", "v0.2.0").unwrap());
-    }
 }
