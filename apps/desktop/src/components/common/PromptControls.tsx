@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { EFFORTS, type AgentMode, type Effort, type PermissionMode } from "../../bridge/types";
 import { useI18n } from "../../lib/i18n";
 import { useDesktop } from "../../state/store";
 import { Icon } from "../fx/Icon";
 import { ChipSelect } from "./ChipSelect";
+import { FloatingMenu } from "./FloatingMenu";
 
 export function ProviderSwitcher() {
   const { language } = useI18n();
@@ -63,56 +64,90 @@ export function PromptOptionsMenu({
 }) {
   const { language } = useI18n();
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const close = (event: PointerEvent) => {
-      if (ref.current && !ref.current.contains(event.target as Node)) setOpen(false);
-    };
-    const key = (event: KeyboardEvent) => event.key === "Escape" && setOpen(false);
-    document.addEventListener("pointerdown", close);
-    document.addEventListener("keydown", key);
-    return () => {
-      document.removeEventListener("pointerdown", close);
-      document.removeEventListener("keydown", key);
-    };
-  }, [open]);
+  const anchorRef = useRef<HTMLDivElement>(null);
 
   return (
-    <div ref={ref} className="relative">
-      <button onClick={() => setOpen((value) => !value)} className="chip max-w-[190px]" title={language === "zh-CN" ? "模式、权限与思考强度" : "Mode, access and reasoning effort"}>
+    <div ref={anchorRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className="chip max-w-[190px]"
+        title={language === "zh-CN" ? "模式、权限与思考强度" : "Mode, access and reasoning effort"}
+      >
         <Icon name="gear" size={11} />
         <span className="truncate capitalize">{mode} · {effort}</span>
         <Icon name="chevronDown" size={9} className="text-faint" />
       </button>
-      {open && (
-        // Open downward so the panel never covers the textarea above the toolbar.
-        <div className="absolute left-0 top-full z-50 mt-1.5 w-[min(360px,calc(100vw-32px))] rounded-lg border border-line2 bg-raise p-3 shadow-[var(--shadow-float)] animate-fade-up">
-          <OptionRow label={language === "zh-CN" ? "工作模式" : "Mode"} values={[
+      <FloatingMenu
+        open={open}
+        onClose={() => setOpen(false)}
+        anchorRef={anchorRef}
+        prefer="up"
+        estimatedHeight={220}
+        width={360}
+        className="p-3"
+      >
+        <OptionRow
+          label={language === "zh-CN" ? "工作模式" : "Mode"}
+          values={[
             ["agent", language === "zh-CN" ? "执行" : "Agent"],
             ["plan", language === "zh-CN" ? "计划" : "Plan"],
             ["ask", language === "zh-CN" ? "问答" : "Ask"],
-          ]} active={mode} onSelect={(value) => onMode(value as AgentMode)} />
-          <OptionRow label={language === "zh-CN" ? "工具权限" : "Access"} values={[
+          ]}
+          active={mode}
+          onSelect={(value) => onMode(value as AgentMode)}
+        />
+        <OptionRow
+          label={language === "zh-CN" ? "工具权限" : "Access"}
+          values={[
             ["default", language === "zh-CN" ? "按需确认" : "Default"],
             ["auto", language === "zh-CN" ? "自动策略" : "Auto"],
             ["bypass", "YOLO"],
-          ]} active={permissionMode} onSelect={(value) => onPermission(value as PermissionMode)} />
-          <OptionRow label={language === "zh-CN" ? "思考强度" : "Effort"} values={EFFORTS.map((value) => [value, value])} active={effort} onSelect={(value) => onEffort(value as Effort)} last />
-        </div>
-      )}
+          ]}
+          active={permissionMode}
+          onSelect={(value) => onPermission(value as PermissionMode)}
+        />
+        <OptionRow
+          label={language === "zh-CN" ? "思考强度" : "Effort"}
+          values={EFFORTS.map((value) => [value, value])}
+          active={effort}
+          onSelect={(value) => onEffort(value as Effort)}
+          last
+        />
+      </FloatingMenu>
     </div>
   );
 }
 
-function OptionRow({ label, values, active, onSelect, last = false }: { label: string; values: readonly (readonly [string, string])[]; active: string; onSelect(value: string): void; last?: boolean }) {
+function OptionRow({
+  label,
+  values,
+  active,
+  onSelect,
+  last = false,
+}: {
+  label: string;
+  values: readonly (readonly [string, string])[];
+  active: string;
+  onSelect(value: string): void;
+  last?: boolean;
+}) {
   return (
     <div className={last ? "" : "mb-3 border-b border-line pb-3"}>
       <p className="mb-1.5 text-[11.5px] font-medium text-mute">{label}</p>
       <div className="grid grid-cols-4 gap-1">
         {values.map(([value, text]) => (
-          <button key={value} onClick={() => onSelect(value)} className={`flex h-7 min-w-0 items-center justify-center truncate rounded-md border px-2 text-[11.5px] leading-none transition-colors ${active === value ? "border-transparent bg-acc text-base" : "border-line2 text-dim hover:bg-high hover:text-fg2"}`} title={text}>
+          <button
+            key={value}
+            type="button"
+            onClick={() => onSelect(value)}
+            className={`flex h-7 min-w-0 items-center justify-center truncate rounded-md border px-2 text-[11.5px] leading-none transition-colors ${
+              active === value
+                ? "border-transparent bg-acc text-base"
+                : "border-line2 text-dim hover:bg-high hover:text-fg2"
+            }`}
+            title={text}
+          >
             {text}
           </button>
         ))}
