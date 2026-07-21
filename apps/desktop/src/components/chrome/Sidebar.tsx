@@ -3,13 +3,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { useDesktop, type ProjectMeta } from "../../state/store";
 import { usePreferences } from "../../state/preferences";
 import { useI18n } from "../../lib/i18n";
-import { fmtRelTime, fmtTokens } from "../../lib/format";
 import { Wordmark } from "../fx/Wordmark";
 import { Icon } from "../fx/Icon";
 import type { Session, SessionMeta } from "../../bridge/types";
 import { BlackHole } from "../fx/BlackHole";
 
 const EMPTY_SESSIONS: SessionMeta[] = [];
+/** Max tasks shown under a project before "Show more". Matches the flat list reference. */
+const TASK_PREVIEW = 5;
 
 export function Sidebar() {
   const { t, language } = useI18n();
@@ -34,9 +35,11 @@ export function Sidebar() {
   const historyError = useDesktop((state) => state.historyError);
   const [accountOpen, setAccountOpen] = useState(false);
   const accountRef = useRef<HTMLDivElement>(null);
+  // Default: all active projects expanded (flat list like the reference UI).
   const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(
     () => new Set(activeProjectId ? [activeProjectId] : []),
   );
+  const expandedSeeded = useRef(false);
 
   useEffect(() => {
     if (!activeProjectId) return;
@@ -47,6 +50,27 @@ export function Sidebar() {
       return next;
     });
   }, [activeProjectId]);
+
+  useEffect(() => {
+    if (projects.length === 0) return;
+    if (!expandedSeeded.current) {
+      expandedSeeded.current = true;
+      setExpandedProjectIds(new Set(projects.filter((p) => !p.archived).map((p) => p.id)));
+      return;
+    }
+    // Newly imported projects open expanded once; never re-open ones the user collapsed.
+    setExpandedProjectIds((current) => {
+      let changed = false;
+      const next = new Set(current);
+      for (const project of projects) {
+        if (!project.archived && !next.has(project.id)) {
+          next.add(project.id);
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [projects]);
 
   useEffect(() => {
     if (!accountOpen) return;
@@ -125,10 +149,9 @@ export function Sidebar() {
         </button>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
+      <div className="min-h-0 flex-1 overflow-y-auto px-2.5 pb-3">
         <SectionTitle
           label={t("projects")}
-          count={projects.length}
           action={
             foldableIds.length > 0 ? (
               <button
@@ -138,12 +161,11 @@ export function Sidebar() {
                 className="flex h-6 items-center gap-1 rounded-md px-1.5 text-[11px] text-faint transition-colors hover:bg-high hover:text-fg2"
               >
                 <Icon name={allExpanded ? "collapseAll" : "expandAll"} size={11} />
-                <span className="hidden min-[220px]:inline">{allExpanded ? t("collapseAll") : t("expandAll")}</span>
               </button>
             ) : null
           }
         />
-        <div className="space-y-1.5">
+        <div className="space-y-3">
           {activeProjects.map((project) => (
             <ProjectGroup
               key={project.id}
@@ -274,43 +296,54 @@ function ProjectGroup({
   onToggle(): void;
 }) {
   const { t } = useI18n();
+  const [showAll, setShowAll] = useState(false);
   const visible = sessions.filter((session) => !session.archived);
   const archived = sessions.filter((session) => session.archived);
+  const clipped = !showAll && visible.length > TASK_PREVIEW;
+  const shown = clipped ? visible.slice(0, TASK_PREVIEW) : visible;
+
   return (
-    <div
-      className={`rounded-lg transition-colors ${
-        expanded
-          ? "border border-line2/80 bg-raise/40 pb-1.5 pt-0.5"
-          : "border border-transparent"
-      }`}
-    >
+    <div className="min-w-0">
       <ProjectRow
         project={project}
         active={active}
         expanded={expanded}
-        count={visible.length}
         onToggle={onToggle}
       />
       {expanded && (
-        <div className="relative ml-3.5 mt-1 space-y-0.5 border-l border-line3/50 pl-3">
-          <p className="mb-0.5 px-1 text-[9.5px] font-semibold uppercase tracking-[0.1em] text-faint">
-            {t("sessions")}
-          </p>
+        <div className="mt-0.5 space-y-0.5 pl-7">
           {visible.length === 0 && archived.length === 0 ? (
-            <p className="px-2 py-1.5 text-[11px] text-faint">{t("noMission")}</p>
+            <p className="px-2 py-1 text-[12.5px] text-faint">{t("noTasks")}</p>
           ) : (
             <>
-              {visible.map((meta) => (
+              {shown.map((meta) => (
                 <MissionRow
                   key={meta.id}
                   meta={meta}
                   running={loadedSessions[meta.id]?.status === "running"}
                   awaiting={["awaiting_permission", "awaiting_input"].includes(loadedSessions[meta.id]?.status ?? "")}
                   active={meta.id === activeId}
-                  tokens={(loadedSessions[meta.id]?.usage.inputTokens ?? 0) + (loadedSessions[meta.id]?.usage.outputTokens ?? 0)}
                   onOpen={() => onOpenSession(meta.id)}
                 />
               ))}
+              {clipped && (
+                <button
+                  type="button"
+                  onClick={() => setShowAll(true)}
+                  className="block w-full px-2 py-1 text-left text-[12.5px] text-faint transition-colors hover:text-mute"
+                >
+                  {t("showMore")}
+                </button>
+              )}
+              {showAll && visible.length > TASK_PREVIEW && (
+                <button
+                  type="button"
+                  onClick={() => setShowAll(false)}
+                  className="block w-full px-2 py-1 text-left text-[12.5px] text-faint transition-colors hover:text-mute"
+                >
+                  {t("showLess")}
+                </button>
+              )}
               {archived.length > 0 && (
                 <ArchiveGroup label={t("archived")}>
                   {archived.map((meta) => (
@@ -320,7 +353,6 @@ function ProjectGroup({
                       running={false}
                       awaiting={false}
                       active={meta.id === activeId}
-                      tokens={(loadedSessions[meta.id]?.usage.inputTokens ?? 0) + (loadedSessions[meta.id]?.usage.outputTokens ?? 0)}
                       onOpen={() => onOpenSession(meta.id)}
                     />
                   ))}
@@ -336,37 +368,32 @@ function ProjectGroup({
 
 function SectionTitle({
   label,
-  count,
   action,
 }: {
   label: string;
-  count: number;
   action?: React.ReactNode;
 }) {
   return (
-    <div className="mb-1 flex h-7 items-center justify-between gap-1 px-1.5">
-      <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-mute">{label}</span>
-      <div className="flex items-center gap-1">
-        {action}
-        <span className="tnum text-[11px] text-faint">{count}</span>
-      </div>
+    <div className="mb-2 flex h-7 items-center justify-between gap-1 px-2">
+      <span className="text-[12.5px] font-normal text-faint">{label}</span>
+      {action}
     </div>
   );
 }
 
 function ArchiveGroup({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <details className="group/archive mt-1">
-      <summary className="flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1.5 text-[12px] text-faint transition-colors hover:bg-high hover:text-mute">
+    <details className="group/archive mt-0.5">
+      <summary className="flex cursor-pointer items-center gap-1.5 rounded-lg px-2 py-1.5 text-[12.5px] text-faint transition-colors hover:bg-high/60 hover:text-mute">
         <Icon name="chevronRight" size={9} className="transition-transform group-open/archive:rotate-90" />
         {label}
       </summary>
-      {children}
+      <div className="space-y-0.5">{children}</div>
     </details>
   );
 }
 
-function ProjectRow({ project, active, expanded, count, onToggle }: { project: ProjectMeta; active: boolean; expanded: boolean; count: number; onToggle(): void }) {
+function ProjectRow({ project, active, expanded, onToggle }: { project: ProjectMeta; active: boolean; expanded: boolean; onToggle(): void }) {
   const { t } = useI18n();
   const openProject = useDesktop((state) => state.openProject);
   const renameProject = useDesktop((state) => state.renameProject);
@@ -384,28 +411,26 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
 
   return (
     <div
-      className={`group relative flex h-9 items-center gap-1 rounded-md px-1.5 ${
+      className={`group relative flex h-9 items-center gap-2 rounded-xl px-2 ${
         active
           ? "bg-high text-fg"
-          : "text-fg2 hover:bg-high/45"
+          : "text-fg2 hover:bg-high/50"
       }`}
       title={project.path}
     >
       <button
-        onClick={onToggle}
-        className="flex h-7 w-6 shrink-0 items-center justify-center text-faint hover:text-fg"
-        title={expanded ? t("collapse") : t("expand")}
+        onClick={() => {
+          if (!expanded) onToggle();
+          void openProject(project.id);
+        }}
+        onDoubleClick={onToggle}
+        className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
       >
-        <Icon name="chevronRight" size={11} className={`transition-transform ${expanded ? "rotate-90" : ""}`} />
-      </button>
-      <button onClick={() => void openProject(project.id)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
-        <span
-          className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] ${
-            active ? "bg-acc text-base" : "bg-high text-mute ring-1 ring-line2"
-          }`}
-        >
-          <Icon name={project.pinned ? "pin" : expanded ? "folderOpen" : "folder"} size={12} />
-        </span>
+        <Icon
+          name={project.pinned ? "pin" : "folder"}
+          size={15}
+          className={`shrink-0 ${active ? "text-fg2" : "text-dim"}`}
+        />
         {editing ? (
           <input
             autoFocus
@@ -414,17 +439,12 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
             onBlur={commit}
             onKeyDown={(event) => event.key === "Enter" && commit()}
             onClick={(event) => event.stopPropagation()}
-            className="min-w-0 flex-1 rounded border border-line2 bg-raise px-1.5 text-[12.5px] outline-none"
+            className="min-w-0 flex-1 rounded border border-line2 bg-raise px-1.5 text-[13px] outline-none"
           />
         ) : (
-          <span className="truncate text-[13px] font-semibold leading-none tracking-tight">{project.name}</span>
+          <span className="truncate text-[13px] font-medium leading-none tracking-tight">{project.name}</span>
         )}
       </button>
-      {count > 0 && (
-        <span className="tnum shrink-0 rounded-full bg-void/60 px-1.5 py-0.5 text-[10px] font-medium text-dim ring-1 ring-line2">
-          {count}
-        </span>
-      )}
       {/* Always reserve width — toggling display causes hover layout jitter. */}
       <button
         onClick={() => setMenu((open) => !open)}
@@ -434,6 +454,7 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
       </button>
       {menu && (
         <ContextMenu close={() => setMenu(false)}>
+          <MenuButton icon={expanded ? "collapseAll" : "expandAll"} label={expanded ? t("collapse") : t("expand")} onClick={onToggle} />
           <MenuButton icon="pin" label={project.pinned ? t("unpin") : t("pin")} onClick={() => pinProject(project.id)} />
           <MenuButton icon="external" label={t("openExplorer")} onClick={() => void openExplorer(project.id)} />
           <MenuButton icon="edit" label={t("rename")} onClick={() => setEditing(true)} />
@@ -445,7 +466,7 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
   );
 }
 
-function MissionRow({ meta, running, awaiting, active, tokens, onOpen }: { meta: SessionMeta; running: boolean; awaiting: boolean; active: boolean; tokens: number; onOpen(): void }) {
+function MissionRow({ meta, running, awaiting, active, onOpen }: { meta: SessionMeta; running: boolean; awaiting: boolean; active: boolean; onOpen(): void }) {
   const { t } = useI18n();
   const renameSession = useDesktop((state) => state.renameSession);
   const deleteSession = useDesktop((state) => state.deleteSession);
@@ -462,25 +483,33 @@ function MissionRow({ meta, running, awaiting, active, tokens, onOpen }: { meta:
 
   return (
     <div
-      className={`group relative cursor-pointer rounded-md px-2 py-1.5 transition-colors ${
+      className={`group relative flex min-h-[30px] cursor-pointer items-center rounded-lg px-2 py-1 transition-colors ${
         active
-          ? "bg-base text-fg ring-1 ring-line2"
-          : "bg-transparent text-mute hover:bg-high/70"
+          ? "bg-high/80 text-fg"
+          : "bg-transparent text-fg2 hover:bg-high/45"
       }`}
       onClick={onOpen}
     >
-      <div className="flex min-w-0 items-center gap-2">
-        <span className={`flex h-4 w-4 shrink-0 items-center justify-center ${awaiting ? "opacity-90" : running ? "" : "opacity-50"}`}>
-          {running || awaiting ? (
-            <BlackHole size={11} spin={running ? true : "slow"} />
-          ) : (
-            <Icon name="chat" size={11} className={active ? "text-acc" : "text-faint"} />
-          )}
-        </span>
+      <div className="flex min-w-0 flex-1 items-center gap-2">
+        {(running || awaiting) && (
+          <span className="flex h-3.5 w-3.5 shrink-0 items-center justify-center">
+            <BlackHole size={10} spin={running ? true : "slow"} />
+          </span>
+        )}
         {editing ? (
-          <input autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => event.key === "Enter" && commit()} onClick={(event) => event.stopPropagation()} className="min-w-0 flex-1 rounded border border-line2 bg-raise px-1.5 text-[12.5px] text-fg outline-none" />
+          <input
+            autoFocus
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onBlur={commit}
+            onKeyDown={(event) => event.key === "Enter" && commit()}
+            onClick={(event) => event.stopPropagation()}
+            className="min-w-0 flex-1 rounded border border-line2 bg-raise px-1.5 text-[12.5px] text-fg outline-none"
+          />
         ) : (
-          <span className={`min-w-0 flex-1 truncate text-[12px] font-normal leading-snug ${active ? "font-medium text-fg" : "text-mute"}`}>{meta.title}</span>
+          <span className={`min-w-0 flex-1 truncate text-[12.5px] font-normal leading-snug ${active ? "text-fg" : "text-fg2"}`}>
+            {meta.title}
+          </span>
         )}
         {/* Fixed slot — never toggle display or text reflow/jitter on hover. */}
         <button
@@ -489,10 +518,6 @@ function MissionRow({ meta, running, awaiting, active, tokens, onOpen }: { meta:
         >
           <Icon name="more" size={12} />
         </button>
-      </div>
-      <div className="mt-0.5 flex min-w-0 items-center justify-between gap-2 pl-6">
-        <span className="min-w-0 truncate text-[10px] text-faint">{fmtRelTime(meta.updatedAt)}</span>
-        {tokens > 0 && <span className="tnum shrink-0 text-[10px] text-faint">{fmtTokens(tokens)}</span>}
       </div>
       {menu && (
         <ContextMenu close={() => setMenu(false)}>
