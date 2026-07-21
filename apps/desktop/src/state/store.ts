@@ -65,6 +65,23 @@ export interface AppUpdateInfo {
   checkedAt: number;
 }
 
+/** Live progress while downloading / installing an in-app update. */
+export interface AppUpdateProgress {
+  stage: "downloading" | "extracting" | "installing" | "restarting" | "error" | string;
+  percent: number;
+  downloaded: number;
+  total?: number | null;
+  message: string;
+}
+
+export type AppUpdateInstallPhase =
+  | "idle"
+  | "downloading"
+  | "extracting"
+  | "installing"
+  | "restarting"
+  | "error";
+
 interface SessionFlags {
   pinned?: boolean;
   archived?: boolean;
@@ -143,11 +160,16 @@ interface DesktopState {
   appUpdateChecking: boolean;
   appUpdateError: string | null;
   appUpdateDismissedVersion: string | null;
+  appUpdateInstalling: boolean;
+  appUpdateInstallPhase: AppUpdateInstallPhase;
+  appUpdateProgress: AppUpdateProgress | null;
 
   init(): Promise<void>;
   checkAppUpdate(opts?: { force?: boolean }): Promise<AppUpdateInfo | null>;
   dismissAppUpdate(): void;
   openAppUpdateDownload(): Promise<void>;
+  /** macOS: download + replace .app + relaunch. Other platforms open the download page. */
+  installAppUpdate(): Promise<void>;
   goHome(): void;
   openSession(id: string): Promise<void>;
   newSession(): Promise<void>;
@@ -861,6 +883,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
     appUpdateChecking: false,
     appUpdateError: null,
     appUpdateDismissedVersion: localStorage.getItem("grox.appUpdateDismissed"),
+    appUpdateInstalling: false,
+    appUpdateInstallPhase: "idle",
+    appUpdateProgress: null,
 
     async init() {
       if (bridgeSubscribed) return;
@@ -983,6 +1008,110 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const info = get().appUpdate;
       const url = info?.downloadUrl || info?.releaseUrl || "https://github.com/congqianv/Grox/releases";
       await invoke("open_external", { url });
+    },
+
+    async installAppUpdate() {
+      if (bridge.kind !== "acp") {
+        await get().openAppUpdateDownload();
+        return;
+      }
+      const info = get().appUpdate;
+      if (!info?.updateAvailable) {
+        set({ appUpdateError: "当前没有可用更新" });
+        return;
+      }
+      const downloadUrl = info.downloadUrl;
+      if (!downloadUrl) {
+        // No platform asset — fall back to the release page.
+        await get().openAppUpdateDownload();
+        return;
+      }
+      if (get().appUpdateInstalling) return;
+
+      set({
+        appUpdateInstalling: true,
+        appUpdateInstallPhase: "downloading",
+        appUpdateProgress: {
+          stage: "downloading",
+          percent: 0,
+          downloaded: 0,
+          total: null,
+          message: "正在准备更新…",
+        },
+        appUpdateError: null,
+      });
+
+      let unlisten: (() => void) | undefined;
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        unlisten = await listen<AppUpdateProgress>("app-update-progress", (event) => {
+          const progress = event.payload;
+          const stage = (progress.stage || "downloading") as AppUpdateInstallPhase;
+          set({
+            appUpdateProgress: progress,
+            appUpdateInstallPhase:
+              stage === "error" ? "error" : (["downloading", "extracting", "installing", "restarting"].includes(stage) ? stage : "downloading"),
+            appUpdateError: stage === "error" ? progress.message : null,
+          });
+        });
+
+        const result = await invoke<{
+          installed: boolean;
+          restarted: boolean;
+          message: string;
+          openUrl?: string | null;
+        }>("install_app_update", {
+          downloadUrl,
+          assetName: info.assetName ?? null,
+        });
+
+        if (result.openUrl && !result.installed) {
+          await invoke("open_external", { url: result.openUrl });
+          set({
+            appUpdateInstalling: false,
+            appUpdateInstallPhase: "idle",
+            appUpdateProgress: null,
+          });
+          return;
+        }
+
+        if (result.restarted) {
+          set({
+            appUpdateInstallPhase: "restarting",
+            appUpdateProgress: {
+              stage: "restarting",
+              percent: 100,
+              downloaded: 0,
+              total: null,
+              message: result.message || "更新完成，正在重启…",
+            },
+          });
+          // Process will exit shortly; keep the installing flag true.
+          return;
+        }
+
+        set({
+          appUpdateInstalling: false,
+          appUpdateInstallPhase: "idle",
+          appUpdateProgress: null,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        set({
+          appUpdateInstalling: false,
+          appUpdateInstallPhase: "error",
+          appUpdateError: message,
+          appUpdateProgress: {
+            stage: "error",
+            percent: 0,
+            downloaded: 0,
+            total: null,
+            message,
+          },
+        });
+      } finally {
+        unlisten?.();
+      }
     },
 
     async openSession(id) {

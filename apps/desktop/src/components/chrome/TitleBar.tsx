@@ -35,7 +35,9 @@ export function TitleBar() {
   const setSettingsOpen = useDesktop((s) => s.setSettingsOpen);
   const appUpdate = useDesktop((s) => s.appUpdate);
   const dismissed = useDesktop((s) => s.appUpdateDismissedVersion);
-  const openAppUpdateDownload = useDesktop((s) => s.openAppUpdateDownload);
+  const installAppUpdate = useDesktop((s) => s.installAppUpdate);
+  const appUpdateInstalling = useDesktop((s) => s.appUpdateInstalling);
+  const appUpdateProgress = useDesktop((s) => s.appUpdateProgress);
   const dismissAppUpdate = useDesktop((s) => s.dismissAppUpdate);
   const showUpdate =
     Boolean(appUpdate?.updateAvailable)
@@ -88,29 +90,44 @@ export function TitleBar() {
           <div className="mr-0.5 flex items-center gap-1 rounded-md border border-acc-dim/50 bg-acc-wash px-1.5 py-0.5">
             <button
               type="button"
-              className="flex items-center gap-1 text-[11px] font-medium text-acc hover:text-fg"
-              onClick={() => void openAppUpdateDownload()}
-              title={zh ? `下载 v${appUpdate.latestVersion}` : `Download v${appUpdate.latestVersion}`}
+              disabled={appUpdateInstalling}
+              className="flex items-center gap-1 text-[11px] font-medium text-acc hover:text-fg disabled:opacity-60"
+              onClick={() => void installAppUpdate()}
+              title={
+                appUpdateInstalling
+                  ? (appUpdateProgress?.message || (zh ? "正在更新…" : "Updating…"))
+                  : (zh ? `立即更新到 v${appUpdate.latestVersion}` : `Update to v${appUpdate.latestVersion}`)
+              }
             >
-              <Icon name="bolt" size={11} />
-              <span>{zh ? `新版本 v${appUpdate.latestVersion}` : `Update v${appUpdate.latestVersion}`}</span>
+              <Icon name="bolt" size={11} className={appUpdateInstalling ? "animate-orbit" : ""} />
+              <span>
+                {appUpdateInstalling
+                  ? (appUpdateProgress?.stage === "downloading" && appUpdateProgress.percent > 0
+                    ? (zh ? `下载中 ${appUpdateProgress.percent}%` : `Downloading ${appUpdateProgress.percent}%`)
+                    : (zh ? "正在更新…" : "Updating…"))
+                  : (zh ? `更新 v${appUpdate.latestVersion}` : `Update v${appUpdate.latestVersion}`)}
+              </span>
             </button>
-            <button
-              type="button"
-              className="px-0.5 text-[10px] text-dim hover:text-fg"
-              onClick={() => setSettingsOpen(true)}
-              title={zh ? "打开设置" : "Open settings"}
-            >
-              ·
-            </button>
-            <button
-              type="button"
-              className="px-0.5 text-[11px] text-faint hover:text-fg"
-              onClick={() => dismissAppUpdate()}
-              title={zh ? "稍后提醒" : "Dismiss"}
-            >
-              ×
-            </button>
+            {!appUpdateInstalling && (
+              <>
+                <button
+                  type="button"
+                  className="px-0.5 text-[10px] text-dim hover:text-fg"
+                  onClick={() => setSettingsOpen(true)}
+                  title={zh ? "打开设置" : "Open settings"}
+                >
+                  ·
+                </button>
+                <button
+                  type="button"
+                  className="px-0.5 text-[11px] text-faint hover:text-fg"
+                  onClick={() => dismissAppUpdate()}
+                  title={zh ? "稍后提醒" : "Dismiss"}
+                >
+                  ×
+                </button>
+              </>
+            )}
           </div>
         )}
 

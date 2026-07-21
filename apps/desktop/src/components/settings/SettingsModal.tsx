@@ -98,7 +98,10 @@ function General() {
   const appUpdate = useDesktop((state) => state.appUpdate);
   const appUpdateChecking = useDesktop((state) => state.appUpdateChecking);
   const appUpdateError = useDesktop((state) => state.appUpdateError);
+  const appUpdateInstalling = useDesktop((state) => state.appUpdateInstalling);
+  const appUpdateProgress = useDesktop((state) => state.appUpdateProgress);
   const checkAppUpdate = useDesktop((state) => state.checkAppUpdate);
+  const installAppUpdate = useDesktop((state) => state.installAppUpdate);
   const openAppUpdateDownload = useDesktop((state) => state.openAppUpdateDownload);
   const [runtimeError, setRuntimeError] = useState("");
   const runtimeSource = runtime?.source === "system"
@@ -108,13 +111,15 @@ function General() {
       : runtime?.source === "override"
         ? (zh ? "自定义路径" : "Custom path")
         : (zh ? "正在检测" : "Detecting");
-  const updateHint = appUpdate
-    ? appUpdate.updateAvailable
-      ? (zh
-        ? `发现新版本 v${appUpdate.latestVersion}${appUpdate.assetName ? ` · ${appUpdate.assetName}` : ""}`
-        : `Update available: v${appUpdate.latestVersion}${appUpdate.assetName ? ` · ${appUpdate.assetName}` : ""}`)
-      : (zh ? `已是最新（v${appUpdate.latestVersion}）` : `Up to date (v${appUpdate.latestVersion})`)
-    : (zh ? "从 GitHub Releases 检查桌面端新版本" : "Check GitHub Releases for desktop updates");
+  const updateHint = appUpdateInstalling && appUpdateProgress
+    ? appUpdateProgress.message
+    : appUpdate
+      ? appUpdate.updateAvailable
+        ? (zh
+          ? `发现新版本 v${appUpdate.latestVersion}${appUpdate.assetName ? ` · ${appUpdate.assetName}` : ""} · 可应用内升级`
+          : `Update available: v${appUpdate.latestVersion}${appUpdate.assetName ? ` · ${appUpdate.assetName}` : ""} · in-app install`)
+        : (zh ? `已是最新（v${appUpdate.latestVersion}）` : `Up to date (v${appUpdate.latestVersion})`)
+      : (zh ? "从 GitHub Releases 检查桌面端新版本；macOS 支持应用内升级" : "Check GitHub Releases; macOS supports in-app install");
   return <div>
     <Heading title="Agent" description={zh ? "Grok Build ACP 运行时和默认执行策略；模型与接入服务在账户模块管理。" : "Grok Build ACP runtime and execution defaults. Models and providers live under Account."} />
     <Row label={zh ? "当前项目" : "Current project"} hint={workspace}><span className="chip">{bridgeKind.toUpperCase()}</span></Row>
@@ -122,14 +127,23 @@ function General() {
       label={zh ? "应用版本" : "App version"}
       hint={updateHint}
     >
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-end gap-2">
         <span className="chip">v{appUpdate?.currentVersion ?? appVersion}</span>
-        <ActionButton disabled={appUpdateChecking || bridgeKind !== "acp"} onClick={() => void checkAppUpdate({ force: true })}>
+        <ActionButton disabled={appUpdateChecking || appUpdateInstalling || bridgeKind !== "acp"} onClick={() => void checkAppUpdate({ force: true })}>
           {appUpdateChecking ? (zh ? "检查中" : "Checking") : (zh ? "检查更新" : "Check for updates")}
         </ActionButton>
         {appUpdate?.updateAvailable && (
-          <ActionButton tone="accent" onClick={() => void openAppUpdateDownload()}>
-            {zh ? "下载更新" : "Download"}
+          <ActionButton tone="accent" disabled={appUpdateInstalling || bridgeKind !== "acp"} onClick={() => void installAppUpdate()}>
+            {appUpdateInstalling
+              ? (appUpdateProgress?.stage === "downloading" && appUpdateProgress.percent > 0
+                ? (zh ? `下载中 ${appUpdateProgress.percent}%` : `Downloading ${appUpdateProgress.percent}%`)
+                : (zh ? "正在安装…" : "Installing…"))
+              : (zh ? "立即更新" : "Update now")}
+          </ActionButton>
+        )}
+        {appUpdate?.updateAvailable && !appUpdateInstalling && (
+          <ActionButton onClick={() => void openAppUpdateDownload()}>
+            {zh ? "仅下载" : "Download only"}
           </ActionButton>
         )}
         {!appUpdate?.updateAvailable && (
@@ -139,6 +153,28 @@ function General() {
         )}
       </div>
     </Row>
+    {appUpdateInstalling && appUpdateProgress && (
+      <div className="mb-4 overflow-hidden rounded-[4px] border border-line2 bg-raise">
+        <div className="flex items-center justify-between px-3 py-2 text-[10.5px] text-dim">
+          <span>{appUpdateProgress.message}</span>
+          {appUpdateProgress.stage === "downloading" && appUpdateProgress.percent > 0 && (
+            <span className="tnum font-mono text-faint">{appUpdateProgress.percent}%</span>
+          )}
+        </div>
+        <div className="h-1 bg-high">
+          <div
+            className="h-full bg-acc transition-[width] duration-200"
+            style={{
+              width: `${
+                appUpdateProgress.stage === "downloading"
+                  ? Math.max(appUpdateProgress.percent, 4)
+                  : 100
+              }%`,
+            }}
+          />
+        </div>
+      </div>
+    )}
     {appUpdateError && <p className="mb-4 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{appUpdateError}</p>}
     {appUpdate?.updateAvailable && appUpdate.body && (
       <div className="mb-4 max-h-28 overflow-y-auto rounded-[4px] border border-line2 bg-raise px-3 py-2 text-[11px] leading-relaxed text-dim whitespace-pre-wrap">

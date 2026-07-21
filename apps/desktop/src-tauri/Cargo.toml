@@ -1,6 +1,6 @@
 [package]
 name = "grox-desktop"
-version = "0.2.2"
+version = "0.2.3"
 description = "Grox desktop agent powered by Grok Build"
 edition = "2021"
 rust-version = "1.77"
@@ -21,4 +21,5 @@ tokio = { version = "1", features = ["io-util", "process", "sync", "time"] }
 url = "2"
 base64 = "0.22"
 rfd = "0.15"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"

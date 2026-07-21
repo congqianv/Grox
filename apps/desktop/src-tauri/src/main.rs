@@ -13,13 +13,15 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+#[cfg(target_os = "macos")]
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tokio::{
@@ -1266,8 +1268,8 @@ fn cmp_versions(left: &str, right: &str) -> std::cmp::Ordering {
 }
 
 /// Pick the best download asset for the running desktop target.
+/// On macOS prefer `.app.tar.gz` so the app can self-replace without opening a DMG.
 fn pick_release_asset(assets: &[GithubReleaseAsset]) -> Option<&GithubReleaseAsset> {
-    let names: Vec<&str> = assets.iter().map(|a| a.name.as_str()).collect();
     let prefer = |candidates: &[&str]| -> Option<&GithubReleaseAsset> {
         for needle in candidates {
             if let Some(asset) = assets.iter().find(|a| {
@@ -1282,30 +1284,463 @@ fn pick_release_asset(assets: &[GithubReleaseAsset]) -> Option<&GithubReleaseAss
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        let _ = names;
-        return prefer(&["aarch64.dmg", "aarch64.app.tar.gz", "aarch64"]);
+        return prefer(&["aarch64.app.tar.gz", "aarch64.dmg", "aarch64"]);
     }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        let _ = names;
         // Prefer Intel-specific x64 assets; avoid matching aarch64 by accident.
         if let Some(asset) = assets.iter().find(|a| {
             let n = a.name.to_ascii_lowercase();
-            n.contains("x64.dmg") || n.contains("x64.app.tar.gz") || n.contains("_x64.")
+            n.contains("x64.app.tar.gz")
         }) {
             return Some(asset);
         }
-        return prefer(&["x64.dmg", "x64.app.tar.gz"]);
+        if let Some(asset) = assets.iter().find(|a| {
+            let n = a.name.to_ascii_lowercase();
+            n.contains("x64.dmg") || n.contains("_x64.")
+        }) {
+            return Some(asset);
+        }
+        return prefer(&["x64.app.tar.gz", "x64.dmg"]);
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = names;
         return prefer(&["x64-setup.exe", "x64_en-us.msi", "setup.exe", ".msi", ".exe"]);
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = names;
         prefer(&[".AppImage", ".deb", ".rpm", ".tar.gz"])
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateProgress {
+    stage: String,
+    percent: u8,
+    downloaded: u64,
+    total: Option<u64>,
+    message: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateInstallResult {
+    installed: bool,
+    restarted: bool,
+    message: String,
+    open_url: Option<String>,
+}
+
+static APP_UPDATE_BUSY: AtomicBool = AtomicBool::new(false);
+
+fn emit_update_progress(app: &tauri::AppHandle, progress: AppUpdateProgress) {
+    let _ = app.emit("app-update-progress", progress);
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_current_app_bundle() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|error| format!("无法定位当前程序：{error}"))?;
+    let mut cursor = exe.as_path();
+    while let Some(parent) = cursor.parent() {
+        if parent
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+        {
+            return Ok(parent.to_path_buf());
+        }
+        cursor = parent;
+    }
+    Err("当前不在 .app 包内运行，无法应用内升级（请使用发布版安装包）".into())
+}
+
+#[cfg(target_os = "macos")]
+fn find_app_bundle(root: &Path) -> Result<PathBuf, String> {
+    if root
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+    {
+        return Ok(root.to_path_buf());
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir).map_err(|error| format!("读取解压目录失败：{error}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("读取解压目录失败：{error}"))?;
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+            {
+                return Ok(path);
+            }
+            if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Err("安装包中未找到 .app 应用包".into())
+}
+
+#[cfg(target_os = "macos")]
+async fn download_to_file(
+    app: &tauri::AppHandle,
+    url: &str,
+    dest: &Path,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .user_agent(format!("Grox-Desktop/{CLIENT_VERSION}"))
+        .build()
+        .map_err(|error| format!("无法创建下载客户端：{error}"))?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("下载更新失败：{error}"))?
+        .error_for_status()
+        .map_err(|error| format!("下载更新失败：{error}"))?;
+
+    let total = response.content_length();
+    let mut stream = response.bytes_stream();
+    let mut file = fs::File::create(dest).map_err(|error| format!("无法写入临时文件：{error}"))?;
+    let mut downloaded: u64 = 0;
+    let mut last_emit = 0u8;
+
+    emit_update_progress(
+        app,
+        AppUpdateProgress {
+            stage: "downloading".into(),
+            percent: 0,
+            downloaded: 0,
+            total,
+            message: "正在下载更新…".into(),
+        },
+    );
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("下载中断：{error}"))?;
+        file.write_all(&chunk)
+            .map_err(|error| format!("写入临时文件失败：{error}"))?;
+        downloaded += chunk.len() as u64;
+        let percent = match total {
+            Some(t) if t > 0 => ((downloaded * 100) / t).min(100) as u8,
+            _ => 0,
+        };
+        if percent >= last_emit.saturating_add(2) || percent == 100 {
+            last_emit = percent;
+            emit_update_progress(
+                app,
+                AppUpdateProgress {
+                    stage: "downloading".into(),
+                    percent,
+                    downloaded,
+                    total,
+                    message: format!("正在下载更新… {percent}%"),
+                },
+            );
+        }
+    }
+
+    file.sync_all()
+        .map_err(|error| format!("同步临时文件失败：{error}"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn extract_app_tar_gz(archive: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(dest_dir).map_err(|error| format!("无法创建解压目录：{error}"))?;
+    let status = std::process::Command::new("tar")
+        .args(["-xzf"])
+        .arg(archive)
+        .arg("-C")
+        .arg(dest_dir)
+        .status()
+        .map_err(|error| format!("解压失败：{error}"))?;
+    if !status.success() {
+        return Err(format!("tar 解压失败，退出码 {status}"));
+    }
+    find_app_bundle(dest_dir)
+}
+
+#[cfg(target_os = "macos")]
+fn extract_app_from_dmg(dmg: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(dest_dir).map_err(|error| format!("无法创建解压目录：{error}"))?;
+    let mount_root = dest_dir.join("mount");
+    fs::create_dir_all(&mount_root).map_err(|error| format!("无法创建挂载目录：{error}"))?;
+
+    let attach = std::process::Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-readonly", "-mountpoint"])
+        .arg(&mount_root)
+        .arg(dmg)
+        .output()
+        .map_err(|error| format!("挂载 DMG 失败：{error}"))?;
+    if !attach.status.success() {
+        let stderr = String::from_utf8_lossy(&attach.stderr);
+        return Err(format!("挂载 DMG 失败：{stderr}"));
+    }
+
+    let result = (|| -> Result<PathBuf, String> {
+        let source = find_app_bundle(&mount_root)?;
+        let target = dest_dir.join(
+            source
+                .file_name()
+                .ok_or("DMG 中的应用包名称无效")?,
+        );
+        let status = std::process::Command::new("cp")
+            .args(["-R"])
+            .arg(&source)
+            .arg(&target)
+            .status()
+            .map_err(|error| format!("复制应用包失败：{error}"))?;
+        if !status.success() {
+            return Err("复制 DMG 中的应用包失败".into());
+        }
+        Ok(target)
+    })();
+
+    let _ = std::process::Command::new("hdiutil")
+        .args(["detach"])
+        .arg(&mount_root)
+        .arg("-force")
+        .status();
+
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn replace_app_bundle(current_app: &Path, new_app: &Path) -> Result<(), String> {
+    if !new_app.exists() {
+        return Err("新版本应用包不存在".into());
+    }
+    let parent = current_app
+        .parent()
+        .ok_or("无法确定当前应用安装目录")?;
+    let stamp = now_unix_secs();
+    let backup = parent.join(format!(".Grox.app.bak-{stamp}"));
+    let staging = parent.join(format!(".Grox.app.new-{stamp}"));
+
+    // Copy into the same directory first so the final rename stays atomic on the volume.
+    if staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    let copy = std::process::Command::new("cp")
+        .args(["-R"])
+        .arg(new_app)
+        .arg(&staging)
+        .status()
+        .map_err(|error| format!("准备新版本失败：{error}"))?;
+    if !copy.success() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err("准备新版本失败（可能没有写入 /Applications 的权限）".into());
+    }
+
+    // Clear quarantine on the staged bundle before swap.
+    let _ = std::process::Command::new("xattr")
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(&staging)
+        .status();
+
+    if backup.exists() {
+        let _ = fs::remove_dir_all(&backup);
+    }
+    fs::rename(current_app, &backup).map_err(|error| {
+        let _ = fs::remove_dir_all(&staging);
+        format!("无法备份当前版本：{error}")
+    })?;
+
+    if let Err(error) = fs::rename(&staging, current_app) {
+        // Best-effort rollback.
+        let _ = fs::rename(&backup, current_app);
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!("替换应用失败：{error}"));
+    }
+
+    // Cleanup backup in the background; ignore failures (file may still be busy briefly).
+    let _ = fs::remove_dir_all(&backup);
+    let _ = std::process::Command::new("xattr")
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(current_app)
+        .status();
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn relaunch_app(app_bundle: &Path) -> Result<(), String> {
+    // Delay relaunch so the current process can exit cleanly first.
+    let script = format!(
+        "sleep 1; open -n {}",
+        shell_quote(&app_bundle.display().to_string())
+    );
+    std::process::Command::new("/bin/sh")
+        .args(["-c", &script])
+        .spawn()
+        .map_err(|error| format!("无法重新启动应用：{error}"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[tauri::command]
+async fn install_app_update(
+    app: tauri::AppHandle,
+    download_url: String,
+    asset_name: Option<String>,
+) -> Result<AppUpdateInstallResult, String> {
+    if !APP_UPDATE_BUSY
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        return Err("已有更新正在进行".into());
+    }
+
+    let result = install_app_update_inner(&app, download_url, asset_name).await;
+    APP_UPDATE_BUSY.store(false, Ordering::SeqCst);
+
+    match result {
+        Ok(value) => {
+            if value.restarted {
+                // Give the frontend a moment to show the final state, then exit.
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    handle.exit(0);
+                });
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            emit_update_progress(
+                &app,
+                AppUpdateProgress {
+                    stage: "error".into(),
+                    percent: 0,
+                    downloaded: 0,
+                    total: None,
+                    message: error.clone(),
+                },
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn install_app_update_inner(
+    app: &tauri::AppHandle,
+    download_url: String,
+    asset_name: Option<String>,
+) -> Result<AppUpdateInstallResult, String> {
+    let parsed = url::Url::parse(&download_url).map_err(|error| format!("无效下载链接：{error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("只允许从 HTTP(S) 下载更新".into());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, asset_name);
+        return Ok(AppUpdateInstallResult {
+            installed: false,
+            restarted: false,
+            message: "当前平台暂不支持应用内升级，将打开下载页".into(),
+            open_url: Some(download_url),
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let current_app = match resolve_current_app_bundle() {
+            Ok(path) => path,
+            Err(message) => {
+                return Ok(AppUpdateInstallResult {
+                    installed: false,
+                    restarted: false,
+                    message: format!("{message}，将打开下载页"),
+                    open_url: Some(download_url),
+                });
+            }
+        };
+        let name = asset_name
+            .as_deref()
+            .or_else(|| Path::new(parsed.path()).file_name().and_then(|s| s.to_str()))
+            .unwrap_or("Grox.update")
+            .to_string();
+        let lower = name.to_ascii_lowercase();
+        let can_self_install = lower.ends_with(".app.tar.gz")
+            || lower.ends_with(".tar.gz")
+            || lower.ends_with(".dmg");
+        if !can_self_install {
+            return Ok(AppUpdateInstallResult {
+                installed: false,
+                restarted: false,
+                message: "该安装包格式不支持应用内升级，将打开下载页".into(),
+                open_url: Some(download_url),
+            });
+        }
+
+        let work_dir = std::env::temp_dir().join(format!("grox-update-{}", now_unix_secs()));
+        fs::create_dir_all(&work_dir).map_err(|error| format!("无法创建临时目录：{error}"))?;
+        let archive_path = work_dir.join(&name);
+
+        download_to_file(app, &download_url, &archive_path).await?;
+
+        emit_update_progress(
+            app,
+            AppUpdateProgress {
+                stage: "extracting".into(),
+                percent: 100,
+                downloaded: 0,
+                total: None,
+                message: "正在解压安装包…".into(),
+            },
+        );
+
+        let extract_dir = work_dir.join("extract");
+        let new_app = if lower.ends_with(".dmg") {
+            extract_app_from_dmg(&archive_path, &extract_dir)?
+        } else {
+            extract_app_tar_gz(&archive_path, &extract_dir)?
+        };
+
+        emit_update_progress(
+            app,
+            AppUpdateProgress {
+                stage: "installing".into(),
+                percent: 100,
+                downloaded: 0,
+                total: None,
+                message: "正在替换应用…".into(),
+            },
+        );
+
+        replace_app_bundle(&current_app, &new_app)?;
+
+        emit_update_progress(
+            app,
+            AppUpdateProgress {
+                stage: "restarting".into(),
+                percent: 100,
+                downloaded: 0,
+                total: None,
+                message: "更新完成，正在重启…".into(),
+            },
+        );
+
+        relaunch_app(&current_app)?;
+        let _ = fs::remove_dir_all(&work_dir);
+
+        Ok(AppUpdateInstallResult {
+            installed: true,
+            restarted: true,
+            message: "更新已安装，应用即将重启".into(),
+            open_url: None,
+        })
     }
 }
 
@@ -2303,6 +2738,7 @@ fn main() {
             install_official_grok_cli,
             open_external,
             check_app_update,
+            install_app_update,
             start_project_preview,
             acp_spawn,
             acp_send,
