@@ -57,14 +57,14 @@ export function Sidebar() {
     return () => document.removeEventListener("pointerdown", close);
   }, [accountOpen]);
 
-  // Stable order: pin first, then insertion time (createdAt). Never re-rank by
-  // lastOpenedAt — switching projects used to reshuffle the whole list.
+  // Stable order: pin first, then newest import (createdAt desc). Never re-rank
+  // by lastOpenedAt — switching projects used to reshuffle the whole list.
   const orderedProjects = useMemo(
     () =>
       [...projects].sort(
         (a, b) =>
           Number(b.pinned) - Number(a.pinned)
-          || a.createdAt - b.createdAt
+          || b.createdAt - a.createdAt
           || a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
       ),
     [projects],

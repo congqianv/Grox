@@ -33,6 +33,11 @@ const GROX_BUILD_COMMIT: &str = env!("GROX_BUILD_COMMIT");
 const GROK_UPSTREAM_PROVENANCE: &str = include_str!("../../../../.grox/upstream.json");
 const GROK_INSTALL_PS1_URL: &str = "https://x.ai/cli/install.ps1";
 const GROK_INSTALL_SH_URL: &str = "https://x.ai/cli/install.sh";
+/// Public GitHub repo used for desktop release checks / download links.
+const GROX_GITHUB_REPO: &str = "congqianv/Grox";
+const GROX_RELEASES_LATEST_API: &str =
+    "https://api.github.com/repos/congqianv/Grox/releases/latest";
+const GROX_RELEASES_PAGE: &str = "https://github.com/congqianv/Grox/releases";
 const GROX_PRIVACY_ENV: [(&str, &str); 12] = [
     ("GROX_PRIVACY_MODE", "1"),
     // Legacy fallbacks also protect users who point GROK_DESKTOP_CLI at an
@@ -84,6 +89,22 @@ struct AcpExitPayload {
 struct DesktopEnvironment {
     default_workspace: String,
     grok_command: String,
+    app_version: String,
+    github_repo: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateInfo {
+    current_version: String,
+    latest_version: String,
+    update_available: bool,
+    release_url: String,
+    download_url: Option<String>,
+    asset_name: Option<String>,
+    published_at: Option<String>,
+    body: Option<String>,
+    checked_at: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -1175,7 +1196,193 @@ fn desktop_environment(app: tauri::AppHandle) -> DesktopEnvironment {
     DesktopEnvironment {
         default_workspace: path_for_webview(&default_workspace()),
         grok_command: path_for_webview(Path::new(&runtime.path)),
+        app_version: CLIENT_VERSION.to_string(),
+        github_repo: GROX_GITHUB_REPO.to_string(),
     }
+}
+
+#[derive(Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+    body: Option<String>,
+    published_at: Option<String>,
+    draft: Option<bool>,
+    prerelease: Option<bool>,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Strip optional leading `v` and normalize for comparison.
+fn normalize_version(raw: &str) -> String {
+    raw.trim().trim_start_matches(['v', 'V']).to_string()
+}
+
+/// Compare dotted semver-ish strings. Returns `Ordering` for left vs right.
+fn cmp_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let parse = |s: &str| -> Vec<u64> {
+        let core = s.split(['-', '+']).next().unwrap_or(s);
+        core.split('.')
+            .map(|part| {
+                part.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse::<u64>()
+                    .unwrap_or(0)
+            })
+            .collect()
+    };
+    let a = parse(left);
+    let b = parse(right);
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let av = a.get(i).copied().unwrap_or(0);
+        let bv = b.get(i).copied().unwrap_or(0);
+        match av.cmp(&bv) {
+            std::cmp::Ordering::Equal => {},
+            other => return other,
+        }
+    }
+    // Prefer a release without pre-release suffix when numeric parts match.
+    let a_pre = left.contains('-');
+    let b_pre = right.contains('-');
+    match (a_pre, b_pre) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Pick the best download asset for the running desktop target.
+fn pick_release_asset(assets: &[GithubReleaseAsset]) -> Option<&GithubReleaseAsset> {
+    let names: Vec<&str> = assets.iter().map(|a| a.name.as_str()).collect();
+    let prefer = |candidates: &[&str]| -> Option<&GithubReleaseAsset> {
+        for needle in candidates {
+            if let Some(asset) = assets.iter().find(|a| {
+                let n = a.name.to_ascii_lowercase();
+                n.contains(&needle.to_ascii_lowercase())
+            }) {
+                return Some(asset);
+            }
+        }
+        None
+    };
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let _ = names;
+        return prefer(&["aarch64.dmg", "aarch64.app.tar.gz", "aarch64"]);
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        let _ = names;
+        // Prefer Intel-specific x64 assets; avoid matching aarch64 by accident.
+        if let Some(asset) = assets.iter().find(|a| {
+            let n = a.name.to_ascii_lowercase();
+            n.contains("x64.dmg") || n.contains("x64.app.tar.gz") || n.contains("_x64.")
+        }) {
+            return Some(asset);
+        }
+        return prefer(&["x64.dmg", "x64.app.tar.gz"]);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = names;
+        return prefer(&["x64-setup.exe", "x64_en-us.msi", "setup.exe", ".msi", ".exe"]);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = names;
+        prefer(&[".AppImage", ".deb", ".rpm", ".tar.gz"])
+    }
+}
+
+#[tauri::command]
+async fn check_app_update() -> Result<AppUpdateInfo, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(format!("Grox-Desktop/{CLIENT_VERSION}"))
+        .build()
+        .map_err(|error| format!("无法创建 HTTP 客户端：{error}"))?;
+
+    let response = client
+        .get(GROX_RELEASES_LATEST_API)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .map_err(|error| format!("检查更新失败：{error}"))?;
+
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(AppUpdateInfo {
+            current_version: CLIENT_VERSION.to_string(),
+            latest_version: CLIENT_VERSION.to_string(),
+            update_available: false,
+            release_url: GROX_RELEASES_PAGE.to_string(),
+            download_url: None,
+            asset_name: None,
+            published_at: None,
+            body: None,
+            checked_at: now_unix_secs(),
+        });
+    }
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "GitHub 返回 {status}{}",
+            if body.is_empty() {
+                String::new()
+            } else {
+                format!("：{}", body.chars().take(200).collect::<String>())
+            }
+        ));
+    }
+
+    let release: GithubRelease = response
+        .json()
+        .await
+        .map_err(|error| format!("解析发布信息失败：{error}"))?;
+
+    if release.draft.unwrap_or(false) {
+        return Err("最新发布仍是草稿，暂不可用".into());
+    }
+
+    let latest = normalize_version(&release.tag_name);
+    let current = normalize_version(CLIENT_VERSION);
+    let update_available = cmp_versions(&latest, &current) == std::cmp::Ordering::Greater
+        && !release.prerelease.unwrap_or(false);
+
+    let asset = pick_release_asset(&release.assets);
+
+    Ok(AppUpdateInfo {
+        current_version: current,
+        latest_version: latest,
+        update_available,
+        release_url: if release.html_url.is_empty() {
+            GROX_RELEASES_PAGE.to_string()
+        } else {
+            release.html_url
+        },
+        download_url: asset.map(|a| a.browser_download_url.clone()),
+        asset_name: asset.map(|a| a.name.clone()),
+        published_at: release.published_at,
+        body: release.body,
+        checked_at: now_unix_secs(),
+    })
 }
 
 #[tauri::command]
@@ -2095,6 +2302,7 @@ fn main() {
             set_grok_runtime_preference,
             install_official_grok_cli,
             open_external,
+            check_app_update,
             start_project_preview,
             acp_spawn,
             acp_send,

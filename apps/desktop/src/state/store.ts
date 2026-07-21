@@ -52,6 +52,19 @@ export interface ProjectMeta {
   lastOpenedAt: number;
 }
 
+/** Result of checking GitHub Releases for a newer desktop build. */
+export interface AppUpdateInfo {
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+  releaseUrl: string;
+  downloadUrl?: string | null;
+  assetName?: string | null;
+  publishedAt?: string | null;
+  body?: string | null;
+  checkedAt: number;
+}
+
 interface SessionFlags {
   pinned?: boolean;
   archived?: boolean;
@@ -125,7 +138,16 @@ interface DesktopState {
   historyError: string | null;
   historySyncedAt: number;
 
+  appVersion: string;
+  appUpdate: AppUpdateInfo | null;
+  appUpdateChecking: boolean;
+  appUpdateError: string | null;
+  appUpdateDismissedVersion: string | null;
+
   init(): Promise<void>;
+  checkAppUpdate(opts?: { force?: boolean }): Promise<AppUpdateInfo | null>;
+  dismissAppUpdate(): void;
+  openAppUpdateDownload(): Promise<void>;
   goHome(): void;
   openSession(id: string): Promise<void>;
   newSession(): Promise<void>;
@@ -362,8 +384,9 @@ function ensureProject(projects: ProjectMeta[], path: string, opts?: { force?: b
     localStorage.setItem("grox.projects", JSON.stringify(next));
     return next;
   }
+  // Prepend so newly imported projects sit at the front of the list
+  // (sidebar also sorts by createdAt descending; pin still wins).
   const next = [
-    ...projects,
     {
       id,
       path,
@@ -373,6 +396,7 @@ function ensureProject(projects: ProjectMeta[], path: string, opts?: { force?: b
       createdAt: now,
       lastOpenedAt: now,
     },
+    ...projects,
   ];
   localStorage.setItem("grox.projects", JSON.stringify(next));
   return next;
@@ -832,6 +856,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
     historyError: null,
     historySyncedAt: 0,
 
+    appVersion: "0.2.0",
+    appUpdate: null,
+    appUpdateChecking: false,
+    appUpdateError: null,
+    appUpdateDismissedVersion: localStorage.getItem("grox.appUpdateDismissed"),
+
     async init() {
       if (bridgeSubscribed) return;
       bridgeSubscribed = true;
@@ -875,6 +905,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
         }, 750);
         if (!auth.required) void get().refreshAccount();
         void get().refreshProviderProfiles();
+        // Background update check against GitHub Releases (non-blocking).
+        if (bridge.kind === "acp") {
+          window.setTimeout(() => {
+            void get().checkAppUpdate();
+          }, 2_500);
+        }
         window.setTimeout(() => {
           if (!get().auth.inProgress && get().historySyncedAt === 0) void get().refreshHistory();
         }, 500);
@@ -908,6 +944,46 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     goHome: () => set({ view: "home", activeId: null }),
+
+    async checkAppUpdate(opts) {
+      if (bridge.kind !== "acp") return null;
+      // Throttle automatic checks to once per 6 hours unless forced.
+      const prev = get().appUpdate;
+      if (!opts?.force && prev && Date.now() - prev.checkedAt * 1000 < 6 * 60 * 60 * 1000) {
+        return prev;
+      }
+      set({ appUpdateChecking: true, appUpdateError: null });
+      try {
+        const info = await invoke<AppUpdateInfo>("check_app_update");
+        set({
+          appUpdate: info,
+          appVersion: info.currentVersion || get().appVersion,
+          appUpdateChecking: false,
+          appUpdateError: null,
+        });
+        return info;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        set({ appUpdateChecking: false, appUpdateError: message });
+        return null;
+      }
+    },
+
+    dismissAppUpdate() {
+      const latest = get().appUpdate?.latestVersion;
+      if (latest) {
+        localStorage.setItem("grox.appUpdateDismissed", latest);
+        set({ appUpdateDismissedVersion: latest });
+      } else {
+        set({ appUpdate: null });
+      }
+    },
+
+    async openAppUpdateDownload() {
+      const info = get().appUpdate;
+      const url = info?.downloadUrl || info?.releaseUrl || "https://github.com/congqianv/Grox/releases";
+      await invoke("open_external", { url });
+    },
 
     async openSession(id) {
       try {

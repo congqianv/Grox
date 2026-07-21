@@ -94,6 +94,12 @@ function General() {
   const runtimeBusy = useDesktop((state) => state.runtimeBusy);
   const refreshRuntime = useDesktop((state) => state.refreshRuntime);
   const installOfficialRuntime = useDesktop((state) => state.installOfficialRuntime);
+  const appVersion = useDesktop((state) => state.appVersion);
+  const appUpdate = useDesktop((state) => state.appUpdate);
+  const appUpdateChecking = useDesktop((state) => state.appUpdateChecking);
+  const appUpdateError = useDesktop((state) => state.appUpdateError);
+  const checkAppUpdate = useDesktop((state) => state.checkAppUpdate);
+  const openAppUpdateDownload = useDesktop((state) => state.openAppUpdateDownload);
   const [runtimeError, setRuntimeError] = useState("");
   const runtimeSource = runtime?.source === "system"
     ? (zh ? "本机 CLI" : "System CLI")
@@ -102,9 +108,43 @@ function General() {
       : runtime?.source === "override"
         ? (zh ? "自定义路径" : "Custom path")
         : (zh ? "正在检测" : "Detecting");
+  const updateHint = appUpdate
+    ? appUpdate.updateAvailable
+      ? (zh
+        ? `发现新版本 v${appUpdate.latestVersion}${appUpdate.assetName ? ` · ${appUpdate.assetName}` : ""}`
+        : `Update available: v${appUpdate.latestVersion}${appUpdate.assetName ? ` · ${appUpdate.assetName}` : ""}`)
+      : (zh ? `已是最新（v${appUpdate.latestVersion}）` : `Up to date (v${appUpdate.latestVersion})`)
+    : (zh ? "从 GitHub Releases 检查桌面端新版本" : "Check GitHub Releases for desktop updates");
   return <div>
     <Heading title="Agent" description={zh ? "Grok Build ACP 运行时和默认执行策略；模型与接入服务在账户模块管理。" : "Grok Build ACP runtime and execution defaults. Models and providers live under Account."} />
     <Row label={zh ? "当前项目" : "Current project"} hint={workspace}><span className="chip">{bridgeKind.toUpperCase()}</span></Row>
+    <Row
+      label={zh ? "应用版本" : "App version"}
+      hint={updateHint}
+    >
+      <div className="flex items-center gap-2">
+        <span className="chip">v{appUpdate?.currentVersion ?? appVersion}</span>
+        <ActionButton disabled={appUpdateChecking || bridgeKind !== "acp"} onClick={() => void checkAppUpdate({ force: true })}>
+          {appUpdateChecking ? (zh ? "检查中" : "Checking") : (zh ? "检查更新" : "Check for updates")}
+        </ActionButton>
+        {appUpdate?.updateAvailable && (
+          <ActionButton tone="accent" onClick={() => void openAppUpdateDownload()}>
+            {zh ? "下载更新" : "Download"}
+          </ActionButton>
+        )}
+        {!appUpdate?.updateAvailable && (
+          <ActionButton onClick={() => void invoke("open_external", { url: "https://github.com/congqianv/Grox/releases" })}>
+            {zh ? "发布页" : "Releases"}
+          </ActionButton>
+        )}
+      </div>
+    </Row>
+    {appUpdateError && <p className="mb-4 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{appUpdateError}</p>}
+    {appUpdate?.updateAvailable && appUpdate.body && (
+      <div className="mb-4 max-h-28 overflow-y-auto rounded-[4px] border border-line2 bg-raise px-3 py-2 text-[11px] leading-relaxed text-dim whitespace-pre-wrap">
+        {appUpdate.body.trim().slice(0, 1200)}
+      </div>
+    )}
     <Row label={zh ? "Grok Build 运行时" : "Grok Build runtime"} hint={runtime?.path}><div className="flex items-center gap-2"><span className="chip">{runtimeSource}</span><ActionButton disabled={runtimeBusy} onClick={() => void refreshRuntime()}>{zh ? "重新检测" : "Detect"}</ActionButton>{runtime && runtime.source !== "override" && <ActionButton tone="accent" disabled={runtimeBusy} onClick={() => { setRuntimeError(""); void installOfficialRuntime().catch((cause) => setRuntimeError(cause instanceof Error ? cause.message : String(cause))); }}>{runtimeBusy ? (zh ? "安装中" : "Installing") : runtime.systemPath ? (zh ? "更新官方 CLI" : "Update official CLI") : (zh ? "安装官方 CLI" : "Install official CLI")}</ActionButton>}</div></Row>
     {runtime && <Row label={zh ? "版本来源" : "Version provenance"} hint={zh ? "同时追踪官方基线与 Grox 自身补丁，便于升级和回归。" : "Tracks the official baseline and Grox patch revision independently."}><div className="max-w-[440px] space-y-1 text-right font-mono text-[9px] text-dim"><p className="truncate" title={runtime.version}>{runtime.version ?? (zh ? "无法读取 CLI 版本" : "CLI version unavailable")}</p><p className="truncate" title={runtime.upstreamCommit}>{zh ? "官方" : "UPSTREAM"} · {runtime.upstreamCommit?.slice(0, 12) ?? "unknown"}　{zh ? "Grox" : "GROX"} · {runtime.groxCommit}</p></div></Row>}
     {runtimeError && <p className="mb-4 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{runtimeError}</p>}

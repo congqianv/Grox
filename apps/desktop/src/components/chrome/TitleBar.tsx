@@ -25,12 +25,22 @@ async function windowCtl(action: "min" | "max" | "close") {
 
 export function TitleBar() {
   const { language } = useI18n();
+  const zh = language === "zh-CN";
   const activeId = useDesktop((s) => s.activeId);
   const meta = useDesktop((s) => s.sessionIndex.find((m) => m.id === s.activeId));
   const bridgeKind = useDesktop((s) => s.bridgeKind);
   const toggleInspector = useDesktop((s) => s.toggleInspector);
   const inspectorOpen = useDesktop((s) => s.inspectorOpen);
   const setPaletteOpen = useDesktop((s) => s.setPaletteOpen);
+  const setSettingsOpen = useDesktop((s) => s.setSettingsOpen);
+  const appUpdate = useDesktop((s) => s.appUpdate);
+  const dismissed = useDesktop((s) => s.appUpdateDismissedVersion);
+  const openAppUpdateDownload = useDesktop((s) => s.openAppUpdateDownload);
+  const dismissAppUpdate = useDesktop((s) => s.dismissAppUpdate);
+  const showUpdate =
+    Boolean(appUpdate?.updateAvailable)
+    && appUpdate?.latestVersion
+    && appUpdate.latestVersion !== dismissed;
   const [maximized, setMaximized] = useState(false);
   // macOS uses native traffic lights from Overlay title bar — do not draw fakes.
   const showCustomWindowButtons = !isMac();
@@ -74,19 +84,49 @@ export function TitleBar() {
       </div>
 
       <div className="relative z-20 flex shrink-0 items-center gap-1.5">
+        {showUpdate && appUpdate && (
+          <div className="mr-0.5 flex items-center gap-1 rounded-md border border-acc-dim/50 bg-acc-wash px-1.5 py-0.5">
+            <button
+              type="button"
+              className="flex items-center gap-1 text-[11px] font-medium text-acc hover:text-fg"
+              onClick={() => void openAppUpdateDownload()}
+              title={zh ? `下载 v${appUpdate.latestVersion}` : `Download v${appUpdate.latestVersion}`}
+            >
+              <Icon name="bolt" size={11} />
+              <span>{zh ? `新版本 v${appUpdate.latestVersion}` : `Update v${appUpdate.latestVersion}`}</span>
+            </button>
+            <button
+              type="button"
+              className="px-0.5 text-[10px] text-dim hover:text-fg"
+              onClick={() => setSettingsOpen(true)}
+              title={zh ? "打开设置" : "Open settings"}
+            >
+              ·
+            </button>
+            <button
+              type="button"
+              className="px-0.5 text-[11px] text-faint hover:text-fg"
+              onClick={() => dismissAppUpdate()}
+              title={zh ? "稍后提醒" : "Dismiss"}
+            >
+              ×
+            </button>
+          </div>
+        )}
+
         <span className={`chip mr-0.5 ${bridgeKind === "mock" ? "" : "!bg-acc-wash !text-fg2"}`}>
           <span
             className={`inline-block h-1.5 w-1.5 rounded-full ${
               bridgeKind === "mock" ? "bg-dim" : "bg-green animate-pulse-dot"
             }`}
           />
-          {bridgeKind === "mock" ? (language === "zh-CN" ? "模拟" : "Mock") : "ACP"}
+          {bridgeKind === "mock" ? (zh ? "模拟" : "Mock") : "ACP"}
         </span>
 
         <button
           className="chip"
           onClick={() => setPaletteOpen(true)}
-          title={language === "zh-CN" ? "命令面板" : "Command palette"}
+          title={zh ? "命令面板" : "Command palette"}
         >
           <Icon name="command" size={12} />
           <span>{isMac() ? "⌘K" : "Ctrl+K"}</span>
