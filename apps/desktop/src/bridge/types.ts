@@ -295,7 +295,7 @@ export interface RewindResult {
   error?: string;
 }
 
-export type PromptAttachmentKind = "image" | "text" | "binary";
+export type PromptAttachmentKind = "image" | "text" | "binary" | "path";
 
 export interface PromptAttachment {
   id: string;
@@ -307,6 +307,11 @@ export interface PromptAttachment {
   text?: string;
   /** Base64 payload for images and binary resources. */
   data?: string;
+  /**
+   * Workspace-relative or absolute filesystem path.
+   * Used for drag/drop path chips and @-mentions (agent reads from disk).
+   */
+  path?: string;
 }
 
 export interface PromptAttachmentSummary {
@@ -317,6 +322,8 @@ export interface PromptAttachmentSummary {
   size: number;
   /** Optional base64 image preview kept only for transcript thumbnails. */
   data?: string;
+  /** Path shown for path-reference attachments. */
+  path?: string;
 }
 
 export interface ConfigDocument {

@@ -105,7 +105,13 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
     const liveBlocks = turn.blocks.filter((block) => block !== user);
     return (
       <section className="timeline-turn mb-8">
-        {user && <UserMsg block={user} />}
+        {user && (
+          <UserMsg
+            block={user}
+            rewindPromptIndex={turn.promptIndex >= 0 ? turn.promptIndex : undefined}
+            canEdit={false}
+          />
+        )}
         <div className="process-live mb-5">
           <div className="mb-3 flex min-h-8 items-center gap-2">
             <BlackHole size={15} spin />
@@ -160,7 +166,13 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
 
   return (
     <section className="timeline-turn mb-8">
-      {user && <UserMsg block={user} rewindPromptIndex={turn.promptIndex >= 0 ? turn.promptIndex : undefined} />}
+      {user && (
+        <UserMsg
+          block={user}
+          rewindPromptIndex={turn.promptIndex >= 0 ? turn.promptIndex : undefined}
+          canEdit={status === "idle" && turn.promptIndex >= 0}
+        />
+      )}
       <div className="process-complete mb-5">
         <button className="process-summary" onClick={() => setProcessOpen((open) => !open)}>
           <Icon name={processOpen ? "chevronDown" : "chevronRight"} size={9} className="shrink-0 text-dim" />
@@ -187,7 +199,8 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
 
 const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
   if (previous.active !== next.active || previous.sessionId !== next.sessionId) return false;
-  if (next.active && previous.status !== next.status) return false;
+  // status gates canEdit / process chrome on every turn, not only the live one
+  if (previous.status !== next.status) return false;
   if (previous.turn.blocks.length !== next.turn.blocks.length) return false;
   if (previous.turn.promptIndex !== next.turn.promptIndex) return false;
   return previous.turn.blocks.every((block, index) => block === next.turn.blocks[index]);

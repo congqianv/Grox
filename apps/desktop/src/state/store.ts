@@ -170,6 +170,12 @@ interface DesktopState {
   listRewindPoints(): Promise<RewindPoint[]>;
   previewRewind(targetPromptIndex: number, mode: RewindMode): Promise<RewindResult>;
   executeRewind(point: RewindPoint, mode: RewindMode): Promise<RewindResult>;
+  /**
+   * Rewind to a user prompt (conversation only), put its text in the composer
+   * so the operator can edit and resend. Falls back to draft-only when no
+   * official checkpoint exists (e.g. mid-turn stop with no snapshot).
+   */
+  editUserPrompt(promptIndex: number): Promise<void>;
   resolvePermission(blockId: string, option: PermissionOption): void;
   resolveQuestion(blockId: string, response: QuestionResponse): void;
 
@@ -271,26 +277,103 @@ const projectId = (path: string) => path.replace(/[\\/]+$/, "").toLocaleLowerCas
 const projectName = (path: string) => path.replace(/[\\/]+$/, "").split(/[\\/]/).at(-1) || path;
 const samePath = (left: string, right: string) => projectId(left) === projectId(right);
 
-function ensureProject(projects: ProjectMeta[], path: string): ProjectMeta[] {
+const HIDDEN_PROJECTS_KEY = "grox.hiddenProjects";
+
+/** In-memory cache; seeded from disk (~/.grok) then localStorage on init. */
+let hiddenProjectIdsCache: Set<string> | null = null;
+let hiddenProjectsHydrated = false;
+
+function loadHiddenProjectIds(): Set<string> {
+  if (hiddenProjectIdsCache) return hiddenProjectIdsCache;
+  hiddenProjectIdsCache = new Set(loadJson<string[]>(HIDDEN_PROJECTS_KEY, []));
+  return hiddenProjectIdsCache;
+}
+
+function persistHiddenProjectIds(ids: Set<string>) {
+  hiddenProjectIdsCache = ids;
+  localStorage.setItem(HIDDEN_PROJECTS_KEY, JSON.stringify([...ids]));
+  // Best-effort disk write so reinstall / new WebView data does not resurrect projects.
+  if (bridge.kind === "acp") {
+    void invoke("write_hidden_projects", { ids: [...ids] }).catch(() => {
+      /* offline / older binary */
+    });
+  }
+}
+
+/** Merge disk-hidden ids into the in-memory set. Returns the merged set. */
+async function hydrateHiddenProjectsFromDisk(): Promise<Set<string>> {
+  const local = loadHiddenProjectIds();
+  if (hiddenProjectsHydrated || bridge.kind !== "acp") return local;
+  hiddenProjectsHydrated = true;
+  try {
+    const fromDisk = await invoke<string[]>("read_hidden_projects");
+    if (!Array.isArray(fromDisk) || fromDisk.length === 0) return local;
+    for (const id of fromDisk) {
+      if (typeof id === "string" && id.trim()) local.add(id);
+    }
+    // Keep localStorage in sync; disk is source of truth across reinstalls.
+    localStorage.setItem(HIDDEN_PROJECTS_KEY, JSON.stringify([...local]));
+    hiddenProjectIdsCache = local;
+  } catch {
+    /* command unavailable on older builds */
+  }
+  return local;
+}
+
+function filterHiddenProjects(projects: ProjectMeta[], hidden: Set<string>): ProjectMeta[] {
+  if (hidden.size === 0) return projects;
+  const next = projects.filter((project) => !hidden.has(project.id));
+  if (next.length !== projects.length) {
+    localStorage.setItem("grox.projects", JSON.stringify(next));
+  }
+  return next;
+}
+
+function hideProjectId(id: string) {
+  const hidden = loadHiddenProjectIds();
+  hidden.add(id);
+  persistHiddenProjectIds(hidden);
+}
+
+/** Explicit open / pick workspace un-hides a previously removed project. */
+function unhideProjectId(id: string) {
+  const hidden = loadHiddenProjectIds();
+  if (!hidden.has(id)) return;
+  hidden.delete(id);
+  persistHiddenProjectIds(hidden);
+}
+
+function ensureProject(projects: ProjectMeta[], path: string, opts?: { force?: boolean }): ProjectMeta[] {
   const id = projectId(path);
+  // User deliberately opened this workspace — allow it back into the list.
+  if (opts?.force) unhideProjectId(id);
+  else if (loadHiddenProjectIds().has(id)) {
+    // History import / passive discovery must not resurrect removed projects.
+    return projects;
+  }
   const now = Date.now();
   const current = projects.find((project) => project.id === id);
-  const next = current
-    ? projects.map((project) =>
-        project.id === id ? { ...project, path, lastOpenedAt: now } : project,
-      )
-    : [
-        ...projects,
-        {
-          id,
-          path,
-          name: projectName(path),
-          pinned: false,
-          archived: false,
-          createdAt: now,
-          lastOpenedAt: now,
-        },
-      ];
+  // Do not bump lastOpenedAt on every ensure — that re-sorts the sidebar and makes it jump.
+  if (current) {
+    if (current.path === path) return projects;
+    const next = projects.map((project) =>
+      project.id === id ? { ...project, path } : project,
+    );
+    localStorage.setItem("grox.projects", JSON.stringify(next));
+    return next;
+  }
+  const next = [
+    ...projects,
+    {
+      id,
+      path,
+      name: projectName(path),
+      pinned: false,
+      archived: false,
+      createdAt: now,
+      lastOpenedAt: now,
+    },
+  ];
   localStorage.setItem("grox.projects", JSON.stringify(next));
   return next;
 }
@@ -335,9 +418,10 @@ function mergeAllSessions(existing: SessionMeta[], incoming: SessionMeta[]): Ses
 function mergeDiscoveredProjects(projects: ProjectMeta[], sessions: SessionMeta[]): ProjectMeta[] {
   const next = [...projects];
   const known = new Set(next.map((project) => project.id));
+  const hidden = loadHiddenProjectIds();
   for (const session of sessions) {
     const id = projectId(session.cwd);
-    if (!session.cwd.trim() || known.has(id)) continue;
+    if (!session.cwd.trim() || known.has(id) || hidden.has(id)) continue;
     known.add(id);
     next.push({
       id,
@@ -545,7 +629,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
           decorateSessions([meta])[0],
           ...sessionIndex.filter((m) => m.id !== e.session.id),
         ];
-        const projects = ensureProject(get().projects, e.session.cwd);
+        // Active session implies the project is in use — restore if previously removed.
+        const projects = ensureProject(get().projects, e.session.cwd, { force: true });
         persistSessionCatalog(nextIndex);
         const state = get();
         const fallbackModel = state.models.some((item) => item.id === e.session.model)
@@ -760,7 +845,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
           accountSetupOpen: get().accountSetupOpen || Boolean(runtime?.selectionRequired),
         });
         const workspace = await bridge.getWorkspace();
-        const projects = ensureProject(get().projects, workspace);
+        const hidden = await hydrateHiddenProjectsFromDisk();
+        // Drop sidebar entries the user previously removed (disk + localStorage).
+        const pruned = filterHiddenProjects(get().projects, hidden);
+        // Startup workspace is intentional — force so a previously-removed folder can return if still default.
+        const projects = ensureProject(pruned, workspace, { force: true });
         const [auth, modelState, provider] = await Promise.all([
           bridge.getAuthState(),
           bridge.getModelState(),
@@ -834,7 +923,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (meta && !samePath(meta.cwd, current.workspace)) {
           await bridge.setWorkspace(meta.cwd);
           const workspace = await bridge.getWorkspace();
-          const projects = ensureProject(get().projects, workspace);
+          // Opening a session in this folder is intentional — restore if hidden.
+          const projects = ensureProject(get().projects, workspace, { force: true });
           set({
             workspace,
             projects,
@@ -936,6 +1026,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     removeProject(id) {
+      // Remember the removal so CLI history import / reinstall does not resurrect it.
+      // Sessions under ~/.grok/sessions are left intact — only the sidebar entry is hidden.
+      hideProjectId(id);
       const projects = get().projects.filter((project) => project.id !== id);
       localStorage.setItem("grox.projects", JSON.stringify(projects));
       set({ projects, ...(get().activeProjectId === id ? { activeProjectId: null } : {}) });
@@ -953,7 +1046,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const workspace = await bridge.getWorkspace();
       const fetchedSessions = await bridge.listSessions(workspace);
       const sessionIndex = mergeProjectSessions(get().sessionIndex, workspace, fetchedSessions);
-      const projects = ensureProject(get().projects, workspace);
+      // User picked / opened this folder — un-hide if they previously removed it.
+      const projects = ensureProject(get().projects, workspace, { force: true });
       set({
         workspace,
         projects,
@@ -1334,7 +1428,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
                 type: "user",
                 id: uid(),
                 text: trimmed,
-                attachments: attachments.map(({ id, kind, name, mime, size, data }) => ({
+                attachments: attachments.map(({ id, kind, name, mime, size, data, path }) => ({
                   id,
                   kind,
                   name,
@@ -1342,6 +1436,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
                   size,
                   // Keep image bytes for bubble thumbnails; omit heavy binary payloads.
                   ...(kind === "image" && data ? { data } : {}),
+                  ...(kind === "path" && path ? { path } : {}),
                 })),
                 ts: Date.now(),
               },
@@ -1416,6 +1511,42 @@ export const useDesktop = create<DesktopState>((set, get) => {
       await bridge.loadSession(activeId);
       if (mode !== "files_only") get().setDraft(result.prompt_text ?? point.prompt_preview ?? "");
       return result;
+    },
+
+    async editUserPrompt(promptIndex) {
+      const { activeId, sessions } = get();
+      if (!activeId) return;
+      const session = sessions[activeId];
+      if (!session) return;
+      if (session.status !== "idle") {
+        throw new Error("请先停止当前任务，再修改并重发");
+      }
+      const userBlocks = session.blocks.filter((block): block is Extract<typeof block, { type: "user" }> => block.type === "user");
+      const user = userBlocks[promptIndex];
+      if (!user) return;
+      const fallbackText = user.text ?? "";
+
+      try {
+        const points = await bridge.listRewindPoints(activeId);
+        const point = points.find((item) => item.prompt_index === promptIndex);
+        if (point) {
+          // Drop this turn and later ones from the agent transcript, keep workspace files.
+          await get().executeRewind(point, "conversation_only");
+          // Prefer original bubble text if rewind preview is truncated.
+          if (fallbackText.trim()) get().setDraft(fallbackText);
+          // Focus composer after rewind settles.
+          window.setTimeout(() => {
+            document.querySelector<HTMLTextAreaElement>("textarea")?.focus();
+          }, 50);
+          return;
+        }
+      } catch {
+        /* no official checkpoint — still offer the text for a fresh resend */
+      }
+      get().setDraft(fallbackText);
+      window.setTimeout(() => {
+        document.querySelector<HTMLTextAreaElement>("textarea")?.focus();
+      }, 50);
     },
 
     resolvePermission(blockId, option) {

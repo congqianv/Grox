@@ -7,6 +7,7 @@ import type { SessionBlock } from "../../bridge/types";
 import { fmtClock } from "../../lib/format";
 import { useI18n } from "../../lib/i18n";
 import { Markdown } from "../../lib/markdown";
+import { useDesktop } from "../../state/store";
 import { ImageLightbox } from "../common/ImageLightbox";
 import { BlackHole } from "../fx/BlackHole";
 import { Icon } from "../fx/Icon";
@@ -17,11 +18,23 @@ type AssistantBlock = Extract<SessionBlock, { type: "assistant" }>;
 type SystemBlock = Extract<SessionBlock, { type: "system" }>;
 
 /** Operator prompt — clean bubble; timestamp appears on hover outside the bubble. */
-export function UserMsg({ block, rewindPromptIndex }: { block: UserBlock; rewindPromptIndex?: number }) {
+export function UserMsg({
+  block,
+  rewindPromptIndex,
+  canEdit,
+}: {
+  block: UserBlock;
+  rewindPromptIndex?: number;
+  /** Session is idle and this turn can be edited & resent. */
+  canEdit?: boolean;
+}) {
   const { language } = useI18n();
   const zh = language === "zh-CN";
+  const editUserPrompt = useDesktop((state) => state.editUserPrompt);
   const [expanded, setExpanded] = useState(false);
   const [overflowing, setOverflowing] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [editError, setEditError] = useState("");
   const [preview, setPreview] = useState<{ src: string; alt: string } | null>(null);
   const textRef = useRef<HTMLParagraphElement>(null);
   useLayoutEffect(() => {
@@ -33,6 +46,22 @@ export function UserMsg({ block, rewindPromptIndex }: { block: UserBlock; rewind
     const next = element.scrollHeight > element.clientHeight + 1;
     setOverflowing((prev) => (prev === next ? prev : next));
   }, [block.text, expanded]);
+
+  const onEditResend = async () => {
+    if (rewindPromptIndex === undefined || editing) return;
+    setEditing(true);
+    setEditError("");
+    try {
+      await editUserPrompt(rewindPromptIndex);
+    } catch (cause) {
+      setEditError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setEditing(false);
+    }
+  };
+
+  const showActions = overflowing || expanded || rewindPromptIndex !== undefined || canEdit;
+
   return (
     <div className="group/user mb-5 flex animate-fade-up justify-end">
       <div className="relative w-fit max-w-[90%]">
@@ -68,27 +97,46 @@ export function UserMsg({ block, rewindPromptIndex }: { block: UserBlock; rewind
                 ) : (
                   <span
                     key={attachment.id}
-                    className="flex max-w-[220px] items-center gap-1.5 rounded-md bg-raise/80 px-2.5 py-1 text-[11px] text-mute"
+                    className="flex max-w-[280px] items-center gap-1.5 rounded-md bg-raise/80 px-2.5 py-1 text-[11px] text-mute"
+                    title={attachment.kind === "path" && attachment.path ? attachment.path : attachment.name}
                   >
                     <Icon
                       name={attachment.kind === "image" ? "square" : "file"}
                       size={9}
                       className={attachment.kind === "image" ? "text-acc" : "text-dim"}
                     />
-                    <span className="truncate">{attachment.name}</span>
-                    <span className="text-faint">
-                      {attachment.size < 1024 * 1024
-                        ? `${Math.max(1, Math.round(attachment.size / 1024))}K`
-                        : `${(attachment.size / 1024 / 1024).toFixed(1)}M`}
+                    <span className="truncate">
+                      {attachment.kind === "path" && attachment.path ? attachment.path : attachment.name}
                     </span>
+                    {attachment.kind === "path" ? (
+                      <span className="text-faint">{zh ? "路径" : "path"}</span>
+                    ) : (
+                      <span className="text-faint">
+                        {attachment.size < 1024 * 1024
+                          ? `${Math.max(1, Math.round(attachment.size / 1024))}K`
+                          : `${(attachment.size / 1024 / 1024).toFixed(1)}M`}
+                      </span>
+                    )}
                   </span>
                 ),
               )}
             </div>
           )}
-          {(overflowing || expanded || rewindPromptIndex !== undefined) && (
-            <div className="mt-2 flex items-center gap-2 text-[11px]">
+          {showActions && (
+            <div className="mt-2 flex flex-wrap items-center gap-1 text-[11px]">
               <span className="flex-1" />
+              {canEdit && rewindPromptIndex !== undefined && (
+                <button
+                  type="button"
+                  disabled={editing}
+                  onClick={() => void onEditResend()}
+                  className="flex h-7 items-center gap-1 rounded-md px-1.5 text-mute transition-colors hover:bg-raise hover:text-fg disabled:opacity-50"
+                  title={zh ? "撤回本轮回复，把原文放回输入框以便修改后重发" : "Rewind this turn and put the text back in the composer to edit & resend"}
+                >
+                  <Icon name="edit" size={10} />
+                  {editing ? (zh ? "处理中…" : "Working…") : (zh ? "修改并重发" : "Edit & resend")}
+                </button>
+              )}
               {rewindPromptIndex !== undefined && <RewindMenu targetPromptIndex={rewindPromptIndex} variant="request" />}
               {(overflowing || expanded) && (
                 <button onClick={() => setExpanded((value) => !value)} className="h-7 px-1.5 text-mute hover:text-fg">
@@ -97,6 +145,7 @@ export function UserMsg({ block, rewindPromptIndex }: { block: UserBlock; rewind
               )}
             </div>
           )}
+          {editError && <p className="mt-1.5 text-right text-[11px] text-red">{editError}</p>}
         </div>
         <span className="pointer-events-none absolute -bottom-4 right-0 tnum text-[10.5px] text-faint opacity-0 transition-opacity group-hover/user:opacity-100">
           {fmtClock(block.ts)}

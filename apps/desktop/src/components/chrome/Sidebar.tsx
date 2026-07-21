@@ -57,8 +57,16 @@ export function Sidebar() {
     return () => document.removeEventListener("pointerdown", close);
   }, [accountOpen]);
 
+  // Stable order: pin first, then insertion time (createdAt). Never re-rank by
+  // lastOpenedAt — switching projects used to reshuffle the whole list.
   const orderedProjects = useMemo(
-    () => [...projects].sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.lastOpenedAt - a.lastOpenedAt),
+    () =>
+      [...projects].sort(
+        (a, b) =>
+          Number(b.pinned) - Number(a.pinned)
+          || a.createdAt - b.createdAt
+          || a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+      ),
     [projects],
   );
   const orderedSessions = useMemo(
@@ -135,24 +143,26 @@ export function Sidebar() {
             ) : null
           }
         />
-        {activeProjects.map((project) => (
-          <ProjectGroup
-            key={project.id}
-            project={project}
-            active={project.id === activeProjectId}
-            expanded={expandedProjectIds.has(project.id)}
-            sessions={sessionsByProject.get(projectKey(project.path)) ?? EMPTY_SESSIONS}
-            activeId={activeId}
-            loadedSessions={sessions}
-            onOpenSession={(id) => void openSession(id)}
-            onToggle={() => setExpandedProjectIds((current) => {
-              const next = new Set(current);
-              if (next.has(project.id)) next.delete(project.id);
-              else next.add(project.id);
-              return next;
-            })}
-          />
-        ))}
+        <div className="space-y-1.5">
+          {activeProjects.map((project) => (
+            <ProjectGroup
+              key={project.id}
+              project={project}
+              active={project.id === activeProjectId}
+              expanded={expandedProjectIds.has(project.id)}
+              sessions={sessionsByProject.get(projectKey(project.path)) ?? EMPTY_SESSIONS}
+              activeId={activeId}
+              loadedSessions={sessions}
+              onOpenSession={(id) => void openSession(id)}
+              onToggle={() => setExpandedProjectIds((current) => {
+                const next = new Set(current);
+                if (next.has(project.id)) next.delete(project.id);
+                else next.add(project.id);
+                return next;
+              })}
+            />
+          ))}
+        </div>
         {archivedProjects.length > 0 && (
           <ArchiveGroup label={t("archived")}>
             {archivedProjects.map((project) => (
@@ -267,7 +277,13 @@ function ProjectGroup({
   const visible = sessions.filter((session) => !session.archived);
   const archived = sessions.filter((session) => session.archived);
   return (
-    <div className="mb-2">
+    <div
+      className={`rounded-lg transition-colors ${
+        expanded
+          ? "border border-line2/80 bg-raise/40 pb-1.5 pt-0.5"
+          : "border border-transparent"
+      }`}
+    >
       <ProjectRow
         project={project}
         active={active}
@@ -276,7 +292,10 @@ function ProjectGroup({
         onToggle={onToggle}
       />
       {expanded && (
-        <div className="relative ml-3 mt-0.5 space-y-0.5 border-l border-line2 pl-2.5">
+        <div className="relative ml-3.5 mt-1 space-y-0.5 border-l border-line3/50 pl-3">
+          <p className="mb-0.5 px-1 text-[9.5px] font-semibold uppercase tracking-[0.1em] text-faint">
+            {t("sessions")}
+          </p>
           {visible.length === 0 && archived.length === 0 ? (
             <p className="px-2 py-1.5 text-[11px] text-faint">{t("noMission")}</p>
           ) : (
@@ -365,11 +384,12 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
 
   return (
     <div
-      className={`group relative mb-px flex h-9 items-center gap-1 rounded-md border px-1 ${
+      className={`group relative flex h-9 items-center gap-1 rounded-md px-1.5 ${
         active
-          ? "border-line2 bg-raise text-fg shadow-[inset_0_0_0_1px_var(--color-line)]"
-          : "border-transparent text-fg2 hover:border-line hover:bg-high/50"
+          ? "bg-high text-fg"
+          : "text-fg2 hover:bg-high/45"
       }`}
+      title={project.path}
     >
       <button
         onClick={onToggle}
@@ -379,7 +399,11 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
         <Icon name="chevronRight" size={11} className={`transition-transform ${expanded ? "rotate-90" : ""}`} />
       </button>
       <button onClick={() => void openProject(project.id)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
-        <span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded ${active ? "bg-acc-wash text-acc" : "bg-high text-dim"}`}>
+        <span
+          className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] ${
+            active ? "bg-acc text-base" : "bg-high text-mute ring-1 ring-line2"
+          }`}
+        >
           <Icon name={project.pinned ? "pin" : expanded ? "folderOpen" : "folder"} size={12} />
         </span>
         {editing ? (
@@ -397,7 +421,7 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
         )}
       </button>
       {count > 0 && (
-        <span className="tnum shrink-0 rounded bg-high px-1.5 py-0.5 text-[10px] font-medium text-mute">
+        <span className="tnum shrink-0 rounded-full bg-void/60 px-1.5 py-0.5 text-[10px] font-medium text-dim ring-1 ring-line2">
           {count}
         </span>
       )}
@@ -438,15 +462,15 @@ function MissionRow({ meta, running, awaiting, active, tokens, onOpen }: { meta:
 
   return (
     <div
-      className={`group relative cursor-pointer rounded-lg px-2.5 py-1.5 transition-colors ${
+      className={`group relative cursor-pointer rounded-md px-2 py-1.5 transition-colors ${
         active
-          ? "bg-high text-fg shadow-[inset_0_0_0_1px_var(--color-line)]"
-          : "bg-transparent text-mute hover:bg-high/55"
+          ? "bg-base text-fg ring-1 ring-line2"
+          : "bg-transparent text-mute hover:bg-high/70"
       }`}
       onClick={onOpen}
     >
       <div className="flex min-w-0 items-center gap-2">
-        <span className={`flex h-4 w-4 shrink-0 items-center justify-center ${awaiting ? "opacity-90" : running ? "" : "opacity-55"}`}>
+        <span className={`flex h-4 w-4 shrink-0 items-center justify-center ${awaiting ? "opacity-90" : running ? "" : "opacity-50"}`}>
           {running || awaiting ? (
             <BlackHole size={11} spin={running ? true : "slow"} />
           ) : (
@@ -456,7 +480,7 @@ function MissionRow({ meta, running, awaiting, active, tokens, onOpen }: { meta:
         {editing ? (
           <input autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => event.key === "Enter" && commit()} onClick={(event) => event.stopPropagation()} className="min-w-0 flex-1 rounded border border-line2 bg-raise px-1.5 text-[12.5px] text-fg outline-none" />
         ) : (
-          <span className={`min-w-0 flex-1 truncate text-[12.5px] font-normal leading-snug ${active ? "font-medium text-fg" : "text-mute"}`}>{meta.title}</span>
+          <span className={`min-w-0 flex-1 truncate text-[12px] font-normal leading-snug ${active ? "font-medium text-fg" : "text-mute"}`}>{meta.title}</span>
         )}
         {/* Fixed slot — never toggle display or text reflow/jitter on hover. */}
         <button
@@ -467,8 +491,8 @@ function MissionRow({ meta, running, awaiting, active, tokens, onOpen }: { meta:
         </button>
       </div>
       <div className="mt-0.5 flex min-w-0 items-center justify-between gap-2 pl-6">
-        <span className="min-w-0 truncate text-[10.5px] text-faint">{fmtRelTime(meta.updatedAt)}</span>
-        {tokens > 0 && <span className="tnum shrink-0 text-[10.5px] text-faint">{fmtTokens(tokens)}</span>}
+        <span className="min-w-0 truncate text-[10px] text-faint">{fmtRelTime(meta.updatedAt)}</span>
+        {tokens > 0 && <span className="tnum shrink-0 text-[10px] text-faint">{fmtTokens(tokens)}</span>}
       </div>
       {menu && (
         <ContextMenu close={() => setMenu(false)}>

@@ -1265,6 +1265,43 @@ fn open_in_explorer(cwd: String, path: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// Paths the user removed from the desktop sidebar.
+/// Stored under ~/.grok so it survives app reinstall (WebView localStorage does not).
+fn hidden_projects_path() -> Result<PathBuf, String> {
+    Ok(grok_home()?.join("desktop-hidden-projects.json"))
+}
+
+#[tauri::command]
+fn read_hidden_projects() -> Result<Vec<String>, String> {
+    let path = hidden_projects_path()?;
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let raw = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&raw).map_err(|error| format!("无法解析隐藏项目列表：{error}"))
+}
+
+#[tauri::command]
+fn write_hidden_projects(ids: Vec<String>) -> Result<(), String> {
+    let path = hidden_projects_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建配置目录：{error}"))?;
+    }
+    let mut unique = ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    unique.sort();
+    unique.dedup();
+    let body = serde_json::to_string_pretty(&unique)
+        .map_err(|error| format!("无法序列化隐藏项目列表：{error}"))?;
+    atomic_write(&path, &body)
+}
+
 #[tauri::command]
 fn read_config_documents(cwd: String) -> Result<Vec<ConfigDocument>, String> {
     let cwd = checked_workspace(&cwd)?;
@@ -1876,12 +1913,137 @@ async fn acp_kill(
     Ok(())
 }
 
+/// Build the native menu. On macOS, remap ⌘W from "Close Window" to minimize —
+/// users expect the shell to stay in the Dock rather than quit the agent session.
+fn install_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+    let pkg = app.package_info();
+    let about = AboutMetadata {
+        name: Some(pkg.name.clone()),
+        version: Some(pkg.version.to_string()),
+        copyright: app.config().bundle.copyright.clone(),
+        authors: app.config().bundle.publisher.clone().map(|p| vec![p]),
+        ..Default::default()
+    };
+
+    // Custom File item: ⌘W / Ctrl+W minimizes instead of closing the window.
+    let minimize_on_w = MenuItem::with_id(
+        app,
+        "cmd-w-minimize",
+        "Minimize",
+        true,
+        Some("CmdOrCtrl+W"),
+    )?;
+
+    let window_menu = Submenu::with_id_and_items(
+        app,
+        tauri::menu::WINDOW_SUBMENU_ID,
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app, None)?,
+            &PredefinedMenuItem::maximize(app, None)?,
+            #[cfg(target_os = "macos")]
+            &PredefinedMenuItem::separator(app)?,
+            // Keep a way to fully close the window (no ⌘W accelerator).
+            &PredefinedMenuItem::close_window(app, Some("Close"))?,
+        ],
+    )?;
+
+    let help_menu = Submenu::with_id_and_items(
+        app,
+        tauri::menu::HELP_SUBMENU_ID,
+        "Help",
+        true,
+        &[
+            #[cfg(not(target_os = "macos"))]
+            &PredefinedMenuItem::about(app, None, Some(about))?,
+        ],
+    )?;
+
+    let menu = Menu::with_items(
+        app,
+        &[
+            #[cfg(target_os = "macos")]
+            &Submenu::with_items(
+                app,
+                pkg.name.clone(),
+                true,
+                &[
+                    &PredefinedMenuItem::about(app, None, Some(about))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::services(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::hide(app, None)?,
+                    &PredefinedMenuItem::hide_others(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::quit(app, None)?,
+                ],
+            )?,
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            )))]
+            &Submenu::with_items(
+                app,
+                "File",
+                true,
+                &[
+                    &minimize_on_w,
+                    #[cfg(not(target_os = "macos"))]
+                    &PredefinedMenuItem::quit(app, None)?,
+                ],
+            )?,
+            &Submenu::with_items(
+                app,
+                "Edit",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app, None)?,
+                    &PredefinedMenuItem::redo(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::cut(app, None)?,
+                    &PredefinedMenuItem::copy(app, None)?,
+                    &PredefinedMenuItem::paste(app, None)?,
+                    &PredefinedMenuItem::select_all(app, None)?,
+                ],
+            )?,
+            #[cfg(target_os = "macos")]
+            &Submenu::with_items(
+                app,
+                "View",
+                true,
+                &[&PredefinedMenuItem::fullscreen(app, None)?],
+            )?,
+            &window_menu,
+            &help_menu,
+        ],
+    )?;
+
+    app.set_menu(menu)?;
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(Arc::new(AcpState::default()))
         .manage(Arc::new(PreviewState::default()))
         .setup(|app| {
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
+            if let Err(error) = install_app_menu(app.handle()) {
+                eprintln!("failed to install app menu: {error}");
+            }
+            app.on_menu_event(|app, event| {
+                if event.id().as_ref() == "cmd-w-minimize" {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.minimize();
+                    }
+                }
+            });
             if let Some(window) = app.get_webview_window("main") {
                 window.set_icon(icon)?;
                 // Size against the monitor *work area* (excludes menu bar + Dock).
@@ -1920,6 +2082,8 @@ fn main() {
             open_in_explorer,
             read_config_documents,
             write_config_document,
+            read_hidden_projects,
+            write_hidden_projects,
             read_provider_status,
             configure_provider,
             list_provider_profiles,

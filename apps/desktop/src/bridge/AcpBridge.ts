@@ -223,13 +223,38 @@ function contentText(value: unknown): string {
 }
 
 function attachmentUri(attachment: PromptAttachment): string {
+  if (attachment.kind === "path" && attachment.path) {
+    const path = attachment.path.replace(/\\/g, "/");
+    // Absolute paths keep a real file:// URI; relative stay project-relative.
+    if (/^[a-zA-Z]:\//.test(path) || path.startsWith("/")) {
+      return `file://${encodeURI(path).replace(/#/g, "%23")}`;
+    }
+    return path;
+  }
   const safeName = attachment.name.replace(/[\\/#?]/g, "_") || "attachment";
   return `file://${safeName}`;
 }
 
 function promptContent(text: string, attachments: PromptAttachment[]): JsonObject[] {
-  const blocks: JsonObject[] = [{ type: "text", text }];
+  // Path chips become @mentions in the text so the agent expands file contents.
+  const pathMentions = attachments
+    .filter((item) => item.kind === "path" && item.path)
+    .map((item) => `@${item.path}`);
+  let message = text;
+  if (pathMentions.length > 0) {
+    const missing = pathMentions.filter((mention) => !message.includes(mention));
+    if (missing.length > 0) {
+      message = message.trim()
+        ? `${message.trim()}\n\n${missing.join(" ")}`
+        : missing.join(" ");
+    }
+  }
+
+  const blocks: JsonObject[] = [{ type: "text", text: message }];
   for (const attachment of attachments) {
+    // Path chips are already folded into @mentions in `message` above;
+    // the agent expands those via collect_file_references — no extra block.
+    if (attachment.kind === "path") continue;
     if (attachment.kind === "image" && attachment.data) {
       blocks.push({
         type: "image",
