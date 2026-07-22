@@ -135,31 +135,51 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
   }
 
   const unresolved = turn.blocks.filter((block) => (block.type === "permission" && !block.resolved) || (block.type === "question" && !block.response));
+  // Agent turns emit many assistant segments (narration between tools). The wire
+  // closes each segment before the next tool, so only showing assistants.at(-1)
+  // hides most of the answer inside the collapsed "Processed" fold.
   const assistants = turn.blocks.filter((block): block is Extract<SessionBlock, { type: "assistant" }> => block.type === "assistant");
-  const finalAssistant = assistants.at(-1);
-  const process = turn.blocks.filter((block) => block !== user && block !== finalAssistant && !unresolved.includes(block));
+  const process = turn.blocks.filter(
+    (block) => block !== user && block.type !== "assistant" && !unresolved.includes(block),
+  );
   const toolCount = process.filter((block) => block.type === "tool").length;
   const thoughts = process.filter((block): block is Extract<SessionBlock, { type: "thinking" }> => block.type === "thinking");
   const thoughtCount = thoughts.length;
   const elapsed = thoughts.reduce((sum, block) => sum + (block.elapsedMs ?? 0), 0);
-  const intermediateTextCount = process.filter((block) => block.type === "assistant").length;
-  const otherEventCount = process.length - toolCount - thoughtCount - intermediateTextCount;
+  const otherEventCount = process.length - toolCount - thoughtCount;
   const summaryParts = language === "zh-CN"
     ? [
         thoughtCount ? `${thoughtCount} 段思考` : "",
-        intermediateTextCount ? `${intermediateTextCount} 段文字` : "",
         toolCount ? `${toolCount} 个工具` : "",
         otherEventCount ? `${otherEventCount} 条运行事件` : "",
       ].filter(Boolean)
     : [
         thoughtCount ? `${thoughtCount} thoughts` : "",
-        intermediateTextCount ? `${intermediateTextCount} text segments` : "",
         toolCount ? `${toolCount} tools` : "",
         otherEventCount ? `${otherEventCount} runtime events` : "",
       ].filter(Boolean);
   const processSummary = summaryParts.length > 0
     ? summaryParts.join(" · ")
     : language === "zh-CN" ? "服务商未公开思考或工具过程" : "Provider did not expose reasoning or tool activity";
+
+  // Merge every assistant segment into one visible reply so intermediate
+  // progress notes are not mistaken for a truncated final answer.
+  const answerBlock = (() => {
+    if (assistants.length === 0) return null;
+    if (assistants.length === 1) return assistants[0];
+    const text = assistants
+      .map((block) => block.text.trim())
+      .filter(Boolean)
+      .join("\n\n");
+    const last = assistants[assistants.length - 1];
+    return {
+      type: "assistant" as const,
+      id: last.id,
+      text: text || last.text,
+      ts: last.ts,
+      streaming: false,
+    };
+  })();
 
   const finishedAt = Math.max(user?.ts ?? 0, ...turn.blocks.map((block) => block.type === "tool" ? block.call.endedAt ?? block.ts : block.ts));
   const turnElapsed = user && finishedAt > user.ts ? finishedAt - user.ts : 0;
@@ -192,7 +212,7 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
         {turnElapsed > 0 && <div className="turn-elapsed"><span>{language === "zh-CN" ? `已处理 ${turnElapsed < 1000 ? `${turnElapsed}ms` : `${(turnElapsed / 1000).toFixed(turnElapsed < 10_000 ? 1 : 0)}s`}` : `Processed in ${(turnElapsed / 1000).toFixed(1)}s`}</span><i /></div>}
       </div>
       {unresolved.map((block) => renderBlock(block, sessionId))}
-      {finalAssistant && <AssistantMsg block={finalAssistant} />}
+      {answerBlock && <AssistantMsg block={answerBlock} />}
     </section>
   );
 }
