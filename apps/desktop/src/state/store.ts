@@ -216,8 +216,9 @@ interface DesktopState {
   executeRewind(point: RewindPoint, mode: RewindMode): Promise<RewindResult>;
   /**
    * Rewind to a user prompt (conversation only), put its text in the composer
-   * so the operator can edit and resend. Falls back to draft-only when no
-   * official checkpoint exists (e.g. mid-turn stop with no snapshot).
+   * so the operator can edit and resend. Always removes that turn (and later
+   * ones) from the local transcript so resend does not leave a duplicate bubble.
+   * When no official checkpoint exists (e.g. mid-turn stop), truncates UI only.
    */
   editUserPrompt(promptIndex: number): Promise<void>;
   resolvePermission(blockId: string, option: PermissionOption): void;
@@ -1730,25 +1731,81 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const user = userBlocks[promptIndex];
       if (!user) return;
       const fallbackText = user.text ?? "";
+      // Restore attachments we still have payloads for (paths / image previews).
+      const fallbackAttachments: PromptAttachment[] = [];
+      for (const item of user.attachments ?? []) {
+        if (item.kind === "path" && item.path) {
+          fallbackAttachments.push({
+            id: item.id,
+            kind: "path",
+            name: item.name,
+            mime: item.mime,
+            size: item.size,
+            path: item.path,
+          });
+        } else if (item.kind === "image" && item.data) {
+          fallbackAttachments.push({
+            id: item.id,
+            kind: "image",
+            name: item.name,
+            mime: item.mime,
+            size: item.size,
+            data: item.data,
+          });
+        }
+      }
+
+      /** Drop this user turn and everything after it from the visible transcript. */
+      const dropLocalTurn = () => {
+        const current = get().sessions[activeId];
+        if (!current) return;
+        let seen = 0;
+        let cut = -1;
+        for (let i = 0; i < current.blocks.length; i++) {
+          if (current.blocks[i].type === "user") {
+            if (seen === promptIndex) {
+              cut = i;
+              break;
+            }
+            seen += 1;
+          }
+        }
+        if (cut < 0) return;
+        set({
+          sessions: {
+            ...get().sessions,
+            [activeId]: {
+              ...current,
+              blocks: current.blocks.slice(0, cut),
+              status: "idle",
+            },
+          },
+        });
+      };
 
       try {
         const points = await bridge.listRewindPoints(activeId);
-        const point = points.find((item) => item.prompt_index === promptIndex);
-        if (point) {
-          // Drop this turn and later ones from the agent transcript, keep workspace files.
-          await get().executeRewind(point, "conversation_only");
-          // Prefer original bubble text if rewind preview is truncated.
-          if (fallbackText.trim()) get().setDraft(fallbackText);
-          // Focus composer after rewind settles.
-          window.setTimeout(() => {
-            document.querySelector<HTMLTextAreaElement>("textarea")?.focus();
-          }, 50);
-          return;
-        }
+        const point =
+          points.find((item) => item.prompt_index === promptIndex) ??
+          // No listed checkpoint (common after mid-turn cancel) — still ask the
+          // agent to truncate by prompt index when possible.
+          ({
+            prompt_index: promptIndex,
+            created_at: new Date(user.ts).toISOString(),
+            num_file_snapshots: 0,
+            has_file_changes: false,
+            prompt_preview: fallbackText.slice(0, 120),
+          } satisfies RewindPoint);
+        await get().executeRewind(point, "conversation_only");
       } catch {
-        /* no official checkpoint — still offer the text for a fresh resend */
+        /* agent rewind unavailable — local drop below still prevents duplicate bubbles */
       }
+
+      // Always ensure the original bubble is gone (rewind may no-op without a snapshot).
+      dropLocalTurn();
+
       get().setDraft(fallbackText);
+      if (fallbackAttachments.length > 0) get().setComposerAttachments(fallbackAttachments);
       window.setTimeout(() => {
         document.querySelector<HTMLTextAreaElement>("textarea")?.focus();
       }, 50);

@@ -20,6 +20,7 @@ import {
   validateAttachmentSet,
 } from "../../lib/attachments";
 import { isNativeDragDropActive, listenNativeFileDrop } from "../../lib/dragDrop";
+import { useImeGuard } from "../../lib/ime";
 import { BlackHole } from "../fx/BlackHole";
 import { Starfield } from "../fx/Starfield";
 import { Icon } from "../fx/Icon";
@@ -47,6 +48,7 @@ export function Home() {
   const fileRef = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const dragDepth = useRef(0);
+  const { onCompositionStart, onCompositionEnd, isImeBlocking } = useImeGuard();
   const sessionIndex = useDesktop((s) => s.sessionIndex);
   const sessions = useDesktop((s) => s.sessions);
   const newSession = useDesktop((s) => s.newSession);
@@ -218,6 +220,10 @@ export function Home() {
   };
 
   const onKeyDown = (event: React.KeyboardEvent) => {
+    // IME (e.g. Chinese Pinyin): Enter confirms the candidate, not "send".
+    // Also ignore the post-compositionend Enter some WebViews still fire.
+    if (isImeBlocking(event)) return;
+
     if (atOpen && atMatches.length > 0) {
       if (event.key === "ArrowDown") {
         event.preventDefault();
@@ -397,6 +403,8 @@ export function Home() {
             onKeyUp={(event) => setCursor(event.currentTarget.selectionStart ?? 0)}
             onPaste={onPaste}
             onKeyDown={onKeyDown}
+            onCompositionStart={onCompositionStart}
+            onCompositionEnd={onCompositionEnd}
             rows={2}
             placeholder={zh ? "描述你的任务… · @ 引用文件 · 拖入路径" : "Describe a task… · @ files · drop paths"}
             disabled={auth.required}

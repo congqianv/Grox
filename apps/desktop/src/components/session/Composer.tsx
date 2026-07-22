@@ -28,6 +28,7 @@ import {
   validateAttachmentSet,
 } from "../../lib/attachments";
 import { isNativeDragDropActive, listenNativeFileDrop } from "../../lib/dragDrop";
+import { useImeGuard } from "../../lib/ime";
 import { RewindMenu } from "./RewindMenu";
 
 interface SlashCmd {
@@ -66,6 +67,7 @@ export function Composer() {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const dragDepth = useRef(0);
+  const { onCompositionStart, onCompositionEnd, isImeBlocking } = useImeGuard();
 
   const sendPrompt = useDesktop((s) => s.sendPrompt);
   const removeQueuedPrompt = useDesktop((s) => s.removeQueuedPrompt);
@@ -325,6 +327,10 @@ export function Composer() {
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
+    // IME (e.g. Chinese Pinyin): Enter confirms the candidate, not "send".
+    // Also ignore the post-compositionend Enter some WebViews still fire.
+    if (isImeBlocking(e)) return;
+
     if (atOpen && atMatches.length > 0) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -545,6 +551,8 @@ export function Composer() {
             onClick={(e) => setCursor(e.currentTarget.selectionStart ?? 0)}
             onKeyUp={(e) => setCursor(e.currentTarget.selectionStart ?? 0)}
             onKeyDown={onKeyDown}
+            onCompositionStart={onCompositionStart}
+            onCompositionEnd={onCompositionEnd}
             onPaste={onPaste}
             rows={1}
             placeholder={
