@@ -1390,10 +1390,23 @@ export const useDesktop = create<DesktopState>((set, get) => {
     async deleteProviderProfile(id) {
       const wasActive = get().activeProviderProfileId === id;
       const activeId = get().activeId;
-      await bridge.deleteProviderProfile(id);
-      // Always re-list after a successful disk delete so the settings list
-      // cannot keep showing a removed profile when reconnect side-effects fail.
-      await get().refreshProviderProfiles();
+      // Optimistic remove so the settings list updates even if a later refresh
+      // races with agent restart / webview focus loss.
+      set({
+        providerProfiles: get().providerProfiles.filter((profile) => profile.id !== id),
+        activeProviderProfileId: wasActive ? undefined : get().activeProviderProfileId,
+      });
+      try {
+        await bridge.deleteProviderProfile(id);
+      } catch (error) {
+        await get().refreshProviderProfiles();
+        throw error;
+      }
+      try {
+        await get().refreshProviderProfiles();
+      } catch {
+        // Keep the optimistic removal if re-list fails.
+      }
       if (wasActive) {
         try {
           await Promise.all([get().refreshAccount(), get().refreshModels()]);

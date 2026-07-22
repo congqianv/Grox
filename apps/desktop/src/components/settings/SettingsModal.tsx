@@ -240,6 +240,8 @@ function ProviderAndModels() {
   const [modelQuery, setModelQuery] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  /** In-app confirm target — window.confirm is unreliable in Tauri WKWebView. */
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | undefined>();
 
   useEffect(() => {
     setKind(provider.kind);
@@ -259,6 +261,7 @@ function ProviderAndModels() {
     setApiKey("");
     setCustomModel("");
     setModelQuery("");
+    setPendingDeleteId(undefined);
   };
 
   const startNewProfile = () => {
@@ -271,6 +274,29 @@ function ProviderAndModels() {
     setAvailableModels([]);
     setResidentModels([]);
     setCustomModel("");
+    setPendingDeleteId(undefined);
+  };
+
+  const removeProfile = async (id: string) => {
+    setBusy(true);
+    setError("");
+    try {
+      await deleteProfile(id);
+      if (editingProfileId === id) startNewProfile();
+      setPendingDeleteId(undefined);
+    } catch (cause) {
+      const message =
+        cause instanceof Error
+          ? cause.message
+          : typeof cause === "string"
+            ? cause
+            : cause && typeof cause === "object" && "message" in cause
+              ? String((cause as { message: unknown }).message)
+              : String(cause);
+      setError(message || (zh ? "删除失败" : "Delete failed"));
+    } finally {
+      setBusy(false);
+    }
   };
 
   const addResident = (id: string) => {
@@ -354,17 +380,96 @@ function ProviderAndModels() {
     {error && <p className="mt-2 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{error}</p>}
     <div className="mt-3 flex justify-end"><ActionButton tone="accent" disabled={busy} onClick={() => void save()}>{busy ? t("loading") : kind === "oauth" ? (zh ? "使用 Grok OAuth" : "Use Grok OAuth") : (zh ? "保存" : "Save")}</ActionButton></div>
 
-    {profiles.length > 0 && <div className="mt-5"><div className="mb-2 flex items-center justify-between"><p className="lbl !text-[9.5px]">{zh ? "已保存的第三方供应商" : "SAVED COMPATIBLE PROVIDERS"}</p><span className="tnum text-[9px] text-faint">{profiles.length}</span></div><div className="space-y-1.5">{profiles.map((profile) => <div key={profile.id} className={`flex min-w-0 items-center gap-3 rounded-[5px] border px-3 py-2.5 ${activeProfileId === profile.id ? "border-acc-dim bg-acc-wash" : "border-line2 bg-raise"}`}><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${activeProfileId === profile.id ? "bg-acc" : "bg-faint"}`} /><div className="min-w-0 flex-1"><p className="truncate text-[10.5px] text-fg2" title={profile.name}>{profile.name}</p><p className="mt-0.5 truncate font-mono text-[8.5px] text-faint" title={profile.baseUrl}>{profile.baseUrl} · {profile.residentModels.length} {zh ? "个常驻模型" : "resident"}</p></div>{activeProfileId === profile.id && <span className="chip shrink-0">{zh ? "使用中" : "ACTIVE"}</span>}<button onClick={() => editProfile(profile.id)} className="shrink-0 font-mono text-[9px] text-dim hover:text-fg">{zh ? "编辑" : "EDIT"}</button>{activeProfileId !== profile.id && <button onClick={() => void activateProfile(profile.id).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))} className="shrink-0 font-mono text-[9px] text-acc hover:text-fg">{zh ? "切换" : "USE"}</button>}<button disabled={busy} onClick={() => {
-      if (!window.confirm(zh ? `删除供应商“${profile.name}”？` : `Delete provider “${profile.name}”?`)) return;
-      setBusy(true);
-      setError("");
-      void deleteProfile(profile.id)
-        .then(() => {
-          if (editingProfileId === profile.id) startNewProfile();
-        })
-        .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))
-        .finally(() => setBusy(false));
-    }} className="shrink-0 text-faint hover:text-red disabled:opacity-40" title={zh ? "删除" : "Delete"}><Icon name="trash" size={10} /></button></div>)}</div></div>}
+    {profiles.length > 0 && (
+      <div className="mt-5">
+        <div className="mb-2 flex items-center justify-between">
+          <p className="lbl !text-[9.5px]">{zh ? "已保存的第三方供应商" : "SAVED COMPATIBLE PROVIDERS"}</p>
+          <span className="tnum text-[9px] text-faint">{profiles.length}</span>
+        </div>
+        <div className="space-y-1.5">
+          {profiles.map((profile) => {
+            const confirming = pendingDeleteId === profile.id;
+            return (
+              <div
+                key={profile.id}
+                className={`rounded-[5px] border px-3 py-2.5 ${
+                  activeProfileId === profile.id
+                    ? "border-acc-dim bg-acc-wash"
+                    : confirming
+                      ? "border-red/40 bg-red/5"
+                      : "border-line2 bg-raise"
+                }`}
+              >
+                <div className="flex min-w-0 items-center gap-3">
+                  <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${activeProfileId === profile.id ? "bg-acc" : "bg-faint"}`} />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-[10.5px] text-fg2" title={profile.name}>{profile.name}</p>
+                    <p className="mt-0.5 truncate font-mono text-[8.5px] text-faint" title={profile.baseUrl}>
+                      {profile.baseUrl} · {profile.residentModels.length} {zh ? "个常驻模型" : "resident"}
+                    </p>
+                  </div>
+                  {activeProfileId === profile.id && <span className="chip shrink-0">{zh ? "使用中" : "ACTIVE"}</span>}
+                  {!confirming && (
+                    <>
+                      <button type="button" onClick={() => editProfile(profile.id)} className="shrink-0 font-mono text-[9px] text-dim hover:text-fg">
+                        {zh ? "编辑" : "EDIT"}
+                      </button>
+                      {activeProfileId !== profile.id && (
+                        <button
+                          type="button"
+                          onClick={() => void activateProfile(profile.id).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))}
+                          className="shrink-0 font-mono text-[9px] text-acc hover:text-fg"
+                        >
+                          {zh ? "切换" : "USE"}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          setError("");
+                          setPendingDeleteId(profile.id);
+                        }}
+                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[4px] text-faint hover:bg-red/10 hover:text-red disabled:opacity-40"
+                        title={zh ? "删除" : "Delete"}
+                        aria-label={zh ? "删除" : "Delete"}
+                      >
+                        <Icon name="trash" size={11} />
+                      </button>
+                    </>
+                  )}
+                </div>
+                {confirming && (
+                  <div className="mt-2 flex items-center gap-2 border-t border-red/20 pt-2">
+                    <p className="min-w-0 flex-1 text-[10px] leading-relaxed text-red/90">
+                      {zh ? `确认删除供应商「${profile.name}」？此操作不可撤销。` : `Delete provider “${profile.name}”? This cannot be undone.`}
+                    </p>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => setPendingDeleteId(undefined)}
+                      className="shrink-0 rounded-[4px] border border-line2 px-2.5 py-1 font-mono text-[9px] text-dim hover:bg-high hover:text-fg disabled:opacity-40"
+                    >
+                      {zh ? "取消" : "Cancel"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void removeProfile(profile.id)}
+                      className="shrink-0 rounded-[4px] border border-red/40 bg-red/10 px-2.5 py-1 font-mono text-[9px] text-red hover:bg-red/15 disabled:opacity-40"
+                    >
+                      {busy ? t("loading") : (zh ? "确认删除" : "Delete")}
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    )}
 
     <div className="mt-5 rounded-[6px] border border-line2 bg-raise p-3">
       <div className="flex items-center gap-2"><span className={`h-1.5 w-1.5 rounded-full ${provider.kind === "oauth" ? "animate-pulse-dot bg-acc" : "bg-gold"}`} /><div className="min-w-0 flex-1"><p className="text-[11px] text-fg2">{zh ? "常驻模型" : "Resident model"}</p><p className="mt-0.5 text-[9.5px] text-dim">{provider.kind === "oauth" ? (zh ? "实时目录" : "Live catalog") : (zh ? "API 模型目录" : "API catalog")} · {models.length} {zh ? "个模型" : "models"}{modelsUpdatedAt ? ` · ${new Date(modelsUpdatedAt).toLocaleTimeString()}` : ""}</p></div><ActionButton onClick={() => void refreshModels()}>{t("refresh")}</ActionButton></div>
