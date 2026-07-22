@@ -182,6 +182,12 @@ export function Sidebar() {
                 else next.add(project.id);
                 return next;
               })}
+              onExpand={() => setExpandedProjectIds((current) => {
+                if (current.has(project.id)) return current;
+                const next = new Set(current);
+                next.add(project.id);
+                return next;
+              })}
             />
           ))}
         </div>
@@ -201,6 +207,12 @@ export function Sidebar() {
                   const next = new Set(current);
                   if (next.has(project.id)) next.delete(project.id);
                   else next.add(project.id);
+                  return next;
+                })}
+                onExpand={() => setExpandedProjectIds((current) => {
+                  if (current.has(project.id)) return current;
+                  const next = new Set(current);
+                  next.add(project.id);
                   return next;
                 })}
               />
@@ -285,6 +297,7 @@ function ProjectGroup({
   loadedSessions,
   onOpenSession,
   onToggle,
+  onExpand,
 }: {
   project: ProjectMeta;
   active: boolean;
@@ -294,6 +307,7 @@ function ProjectGroup({
   loadedSessions: Record<string, Session>;
   onOpenSession(id: string): void;
   onToggle(): void;
+  onExpand(): void;
 }) {
   const { t } = useI18n();
   const [showAll, setShowAll] = useState(false);
@@ -309,6 +323,7 @@ function ProjectGroup({
         active={active}
         expanded={expanded}
         onToggle={onToggle}
+        onExpand={onExpand}
       />
       {expanded && (
         <div className="mt-0.5 space-y-0.5 pl-7">
@@ -393,9 +408,22 @@ function ArchiveGroup({ label, children }: { label: string; children: React.Reac
   );
 }
 
-function ProjectRow({ project, active, expanded, onToggle }: { project: ProjectMeta; active: boolean; expanded: boolean; onToggle(): void }) {
+function ProjectRow({
+  project,
+  active,
+  expanded,
+  onToggle,
+  onExpand,
+}: {
+  project: ProjectMeta;
+  active: boolean;
+  expanded: boolean;
+  onToggle(): void;
+  onExpand(): void;
+}) {
   const { t } = useI18n();
   const openProject = useDesktop((state) => state.openProject);
+  const newSession = useDesktop((state) => state.newSession);
   const renameProject = useDesktop((state) => state.renameProject);
   const pinProject = useDesktop((state) => state.pinProject);
   const archiveProject = useDesktop((state) => state.archiveProject);
@@ -403,15 +431,28 @@ function ProjectRow({ project, active, expanded, onToggle }: { project: ProjectM
   const openExplorer = useDesktop((state) => state.openProjectInExplorer);
   const [menu, setMenu] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [creating, setCreating] = useState(false);
   const [draft, setDraft] = useState(project.name);
   const commit = () => {
     setEditing(false);
     renameProject(project.id, draft);
   };
 
+  const createSession = async () => {
+    if (creating) return;
+    setCreating(true);
+    try {
+      onExpand();
+      await openProject(project.id);
+      await newSession();
+    } finally {
+      setCreating(false);
+    }
+  };
+
   return (
     <div
-      className={`group relative flex h-9 items-center gap-2 rounded-xl px-2 ${
+      className={`group relative flex h-9 items-center gap-1 rounded-xl px-2 ${
         active
           ? "bg-high text-fg"
           : "text-fg2 hover:bg-high/50"
@@ -419,11 +460,8 @@ function ProjectRow({ project, active, expanded, onToggle }: { project: ProjectM
       title={project.path}
     >
       <button
-        onClick={() => {
-          if (!expanded) onToggle();
-          void openProject(project.id);
-        }}
-        onDoubleClick={onToggle}
+        type="button"
+        onClick={onToggle}
         className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
       >
         <Icon
@@ -444,16 +482,38 @@ function ProjectRow({ project, active, expanded, onToggle }: { project: ProjectM
         ) : (
           <span className="truncate text-[13px] font-medium leading-none tracking-tight">{project.name}</span>
         )}
+        <Icon
+          name="chevronRight"
+          size={10}
+          className={`ml-auto shrink-0 text-faint transition-transform ${expanded ? "rotate-90" : ""}`}
+        />
       </button>
       {/* Always reserve width — toggling display causes hover layout jitter. */}
       <button
-        onClick={() => setMenu((open) => !open)}
+        type="button"
+        disabled={creating}
+        onClick={(event) => {
+          event.stopPropagation();
+          void createSession();
+        }}
+        title={t("newSession")}
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-dim opacity-0 transition-opacity hover:bg-raise hover:text-acc group-hover:opacity-100 focus-visible:opacity-100 disabled:opacity-40"
+      >
+        <Icon name="plus" size={12} />
+      </button>
+      <button
+        type="button"
+        onClick={(event) => {
+          event.stopPropagation();
+          setMenu((open) => !open);
+        }}
         className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-dim opacity-0 transition-opacity hover:bg-raise hover:text-fg group-hover:opacity-100 focus-visible:opacity-100"
       >
         <Icon name="more" size={12} />
       </button>
       {menu && (
         <ContextMenu close={() => setMenu(false)}>
+          <MenuButton icon="plus" label={t("newSession")} onClick={() => void createSession()} />
           <MenuButton icon={expanded ? "collapseAll" : "expandAll"} label={expanded ? t("collapse") : t("expand")} onClick={onToggle} />
           <MenuButton icon="pin" label={project.pinned ? t("unpin") : t("pin")} onClick={() => pinProject(project.id)} />
           <MenuButton icon="external" label={t("openExplorer")} onClick={() => void openExplorer(project.id)} />

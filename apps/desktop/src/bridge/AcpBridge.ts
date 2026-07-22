@@ -1731,8 +1731,17 @@ export class AcpBridge implements GrokBridge {
 
   async deleteProviderProfile(id: string): Promise<void> {
     const active = (await this.listProviderProfiles()).activeId === id;
+    // Persist the deletion first so a failed agent reconnect cannot leave a
+    // tombstoned profile stuck in the UI as if nothing changed.
     await invoke("delete_provider_profile", { id });
-    if (active) await this.restartAgent();
+    if (active) {
+      try {
+        await this.restartAgent();
+      } catch (error) {
+        // Profile is already gone from disk; surface reconnect issues separately.
+        console.warn("provider deleted, agent restart failed", error);
+      }
+    }
   }
 
   async readConfigDocuments(cwd: string): Promise<ConfigDocument[]> {

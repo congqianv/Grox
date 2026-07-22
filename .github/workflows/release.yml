@@ -13,14 +13,25 @@ jobs:
     name: Prepare release notes
     runs-on: windows-latest
     steps:
-      - name: Create GitHub release with generated notes
+      - name: Checkout tagged commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Create GitHub release with tag notes
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release view $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --title "Grox $env:GITHUB_REF_NAME" --generate-notes --verify-tag
+            # Prefer the annotated tag body so hand-written release notes land on GitHub.
+            # Fall back to auto-generated notes for lightweight tags.
+            gh release create $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --title "Grox $env:GITHUB_REF_NAME" --notes-from-tag --verify-tag
+            if ($LASTEXITCODE -ne 0) {
+              gh release create $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --title "Grox $env:GITHUB_REF_NAME" --generate-notes --verify-tag
+            }
           }
 
   build:

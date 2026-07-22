@@ -1391,10 +1391,21 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const wasActive = get().activeProviderProfileId === id;
       const activeId = get().activeId;
       await bridge.deleteProviderProfile(id);
+      // Always re-list after a successful disk delete so the settings list
+      // cannot keep showing a removed profile when reconnect side-effects fail.
       await get().refreshProviderProfiles();
       if (wasActive) {
-        await Promise.all([get().refreshAccount(), get().refreshModels()]);
-        if (activeId) await bridge.loadSession(activeId);
+        try {
+          await Promise.all([get().refreshAccount(), get().refreshModels()]);
+          if (activeId) await bridge.loadSession(activeId);
+        } catch (error) {
+          set({
+            startupError:
+              error instanceof Error
+                ? `供应商已删除，但重连失败：${error.message}`
+                : `供应商已删除，但重连失败：${String(error)}`,
+          });
+        }
       }
     },
 

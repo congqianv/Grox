@@ -3,6 +3,7 @@ import { usePreferences } from "../state/preferences";
 
 const zh = {
   newProject: "新项目",
+  newSession: "新建会话",
   projects: "项目",
   missions: "任务",
   sessions: "会话",
@@ -94,7 +95,7 @@ const zh = {
 } as const;
 
 const en: Record<keyof typeof zh, string> = {
-  newProject: "New project", projects: "Projects", missions: "Missions", sessions: "Sessions",
+  newProject: "New project", newSession: "New session", projects: "Projects", missions: "Missions", sessions: "Sessions",
   expandAll: "Expand all", collapseAll: "Collapse all", archived: "Archived",
   pin: "Pin", unpin: "Unpin", archive: "Archive", unarchive: "Unarchive", rename: "Rename",
   remove: "Remove", delete: "Delete", openExplorer: "Open in Explorer", settings: "Settings",
