@@ -482,11 +482,6 @@ function ProjectRow({
         ) : (
           <span className="truncate text-[13px] font-medium leading-none tracking-tight">{project.name}</span>
         )}
-        <Icon
-          name="chevronRight"
-          size={10}
-          className={`ml-auto shrink-0 text-faint transition-transform ${expanded ? "rotate-90" : ""}`}
-        />
       </button>
       {/* Always reserve width — toggling display causes hover layout jitter. */}
       <button
