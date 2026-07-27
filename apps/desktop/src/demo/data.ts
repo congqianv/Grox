@@ -27,6 +27,67 @@ export function seedSessions(): Session[] {
 
   return [
     {
+      id: "m-00-live-processes",
+      title: "Live subagents (demo)",
+      cwd: DEMO_CWD,
+      createdAt: now - 8 * 60_000,
+      updatedAt: now - 30_000,
+      model: "grok-build",
+      demo: true,
+      status: "running",
+      usage: usage({
+        inputTokens: 22_400,
+        outputTokens: 1_180,
+        cacheReadTokens: 14_200,
+        costUSD: 0.0061,
+        contextUsed: 28_900,
+        turns: 4,
+      }),
+      blocks: [
+        {
+          type: "user",
+          id: "m0-u1",
+          ts: now - 8 * 60_000,
+          text: "Have an explore subagent map the composer surface, and a plan subagent design the markdown auto-render.\n\nUse **Markdown** in the reply so we can verify the bubble renderer.",
+        },
+        {
+          type: "thinking",
+          id: "m0-t1",
+          ts: now - 7 * 60_000,
+          live: true,
+          text: "Two parallel subagents: explore on Composer.tsx, plan on markdown auto-render.",
+        },
+        {
+          type: "tool",
+          id: "m0-tc-sub",
+          ts: now - 4 * 60_000,
+          call: {
+            id: "c-sub",
+            kind: "task",
+            title: "spawn_subagent",
+            detail: "explore · map Composer markdown surface",
+            status: "running",
+            startedAt: now - 4 * 60_000,
+            input: '{"subagent_type":"explore","description":"Composer surface"}',
+          },
+        },
+        {
+          type: "tool",
+          id: "m0-tc-sub2",
+          ts: now - 3 * 60_000,
+          call: {
+            id: "c-sub2",
+            kind: "task",
+            title: "spawn_subagent",
+            detail: "plan · composer markdown auto-render",
+            status: "running",
+            startedAt: now - 3 * 60_000,
+            input: '{"subagent_type":"plan","description":"Markdown auto-render"}',
+          },
+        },
+      ],
+    },
+    {
       id: "m-01-scrollback",
       title: "Double-buffer the pager scrollback",
       cwd: DEMO_CWD,

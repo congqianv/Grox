@@ -36,7 +36,7 @@ export function UserMsg({
   const [editing, setEditing] = useState(false);
   const [editError, setEditError] = useState("");
   const [preview, setPreview] = useState<{ src: string; alt: string } | null>(null);
-  const textRef = useRef<HTMLParagraphElement>(null);
+  const textRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const element = textRef.current;
     if (!element || expanded) {
@@ -67,9 +67,12 @@ export function UserMsg({
       <div className="relative w-fit max-w-[90%]">
         <div className="rounded-[16px] rounded-br-md bg-high px-4 py-3">
           {block.text ? (
-            <p ref={textRef} className={`min-w-0 whitespace-pre-wrap text-[14.5px] leading-[1.7] text-fg select-text ${expanded ? "" : "line-clamp-6"}`}>
-              {block.text}
-            </p>
+            <div
+              ref={textRef}
+              className={`min-w-0 text-[14.5px] leading-[1.7] text-fg select-text ${expanded ? "" : "line-clamp-6"}`}
+            >
+              <Markdown text={block.text} className="user-md" />
+            </div>
           ) : null}
           {block.attachments && block.attachments.length > 0 && (
             <div className={`${block.text ? "mt-2.5" : ""} flex flex-wrap gap-2`}>

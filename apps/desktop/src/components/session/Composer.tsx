@@ -29,6 +29,9 @@ import {
 } from "../../lib/attachments";
 import { isNativeDragDropActive, listenNativeFileDrop } from "../../lib/dragDrop";
 import { useImeGuard } from "../../lib/ime";
+import { Markdown } from "../../lib/markdown";
+import { looksLikeMarkdown } from "../../lib/markdownInput";
+import { ActiveProcessBar } from "./ActiveProcessBar";
 import { RewindMenu } from "./RewindMenu";
 
 interface SlashCmd {
@@ -64,6 +67,7 @@ export function Composer() {
   const [attachmentError, setAttachmentError] = useState("");
   const [readingFiles, setReadingFiles] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [composerFocused, setComposerFocused] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const dragDepth = useRef(0);
@@ -73,6 +77,7 @@ export function Composer() {
   const removeQueuedPrompt = useDesktop((s) => s.removeQueuedPrompt);
   const clearPromptQueue = useDesktop((s) => s.clearPromptQueue);
   const activeId = useDesktop((s) => s.activeId);
+  const session = useDesktop((s) => (s.activeId ? s.sessions[s.activeId] : null));
   const composer = useDesktop((s) => (s.activeId ? s.sessionComposers[s.activeId] : undefined));
   const queue = useDesktop((s) => {
     if (!s.activeId) return EMPTY_QUEUE;
@@ -155,13 +160,28 @@ export function Composer() {
     }
   }, [atOpen, workspaceFiles.length, refreshWorkspaceFiles]);
 
+  const markdownDraft = looksLikeMarkdown(text);
+  // While focused, always edit raw source; when blurred and markdown is present, show only the render.
+  const showMarkdownRender = markdownDraft && !composerFocused;
+
   // auto-grow
   useEffect(() => {
     const el = taRef.current;
-    if (!el) return;
+    if (!el || showMarkdownRender) return;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
-  }, [text]);
+  }, [text, showMarkdownRender]);
+
+  // After switching from rendered view back to the textarea, restore focus.
+  useEffect(() => {
+    if (showMarkdownRender || !composerFocused) return;
+    const el = taRef.current;
+    if (!el || document.activeElement === el) return;
+    el.focus();
+    const end = el.value.length;
+    el.setSelectionRange(end, end);
+    setCursor(end);
+  }, [showMarkdownRender, composerFocused]);
 
   const applyText = (next: string, nextCursor?: number) => {
     setText(next);
@@ -387,6 +407,8 @@ export function Composer() {
   return (
     <div className="relative z-30 shrink-0 px-6 pb-5 pt-2">
       <div className="relative mx-auto max-w-[760px]">
+        <ActiveProcessBar session={session} zh={zh} />
+
         {slashOpen && slashMatches.length > 0 && (
           <div className="absolute bottom-full left-0 z-50 mb-2 w-full overflow-hidden rounded-lg border border-line2 bg-raise py-1 shadow-[var(--shadow-float)] animate-fade-up">
             {slashMatches.map((c, i) => (
@@ -540,28 +562,42 @@ export function Composer() {
               {zh ? "放下以添加文件路径" : "Drop to attach file paths"}
             </div>
           )}
-          <textarea
-            ref={taRef}
-            value={text}
-            onChange={(e) => {
-              setText(e.target.value);
-              setCursor(e.target.selectionStart ?? e.target.value.length);
-            }}
-            onSelect={(e) => setCursor(e.currentTarget.selectionStart ?? 0)}
-            onClick={(e) => setCursor(e.currentTarget.selectionStart ?? 0)}
-            onKeyUp={(e) => setCursor(e.currentTarget.selectionStart ?? 0)}
-            onKeyDown={onKeyDown}
-            onCompositionStart={onCompositionStart}
-            onCompositionEnd={onCompositionEnd}
-            onPaste={onPaste}
-            rows={1}
-            placeholder={
-              running
-                ? (zh ? "Grok 正在处理 — 回车加入队列…" : "Grok is working — Enter to queue…")
-                : (zh ? "发送给 Grok… · @ 引用文件 · 拖入路径" : "Message Grok… · @ files · drop paths")
-            }
-            className="block w-full resize-none bg-transparent px-4 pb-1 pt-3 text-[14.5px] leading-relaxed text-fg placeholder:text-faint focus:outline-none"
-          />
+
+          {showMarkdownRender ? (
+            <button
+              type="button"
+              className="block w-full max-h-[180px] min-h-[44px] overflow-y-auto bg-transparent px-4 pb-1 pt-3 text-left focus:outline-none"
+              title={zh ? "点击继续编辑" : "Click to edit"}
+              onClick={() => setComposerFocused(true)}
+            >
+              <Markdown text={text} className="composer-md text-[14.5px] leading-relaxed text-fg" />
+            </button>
+          ) : (
+            <textarea
+              ref={taRef}
+              value={text}
+              onChange={(e) => {
+                setText(e.target.value);
+                setCursor(e.target.selectionStart ?? e.target.value.length);
+              }}
+              onSelect={(e) => setCursor(e.currentTarget.selectionStart ?? 0)}
+              onClick={(e) => setCursor(e.currentTarget.selectionStart ?? 0)}
+              onKeyUp={(e) => setCursor(e.currentTarget.selectionStart ?? 0)}
+              onKeyDown={onKeyDown}
+              onCompositionStart={onCompositionStart}
+              onCompositionEnd={onCompositionEnd}
+              onPaste={onPaste}
+              onFocus={() => setComposerFocused(true)}
+              onBlur={() => setComposerFocused(false)}
+              rows={1}
+              placeholder={
+                running
+                  ? (zh ? "Grok 正在处理 — 回车加入队列…" : "Grok is working — Enter to queue…")
+                  : (zh ? "发送给 Grok… · @ 引用文件 · 拖入路径" : "Message Grok… · @ files · drop paths")
+              }
+              className="block w-full resize-none bg-transparent px-4 pb-1 pt-3 text-[14.5px] leading-relaxed text-fg placeholder:text-faint focus:outline-none"
+            />
+          )}
 
           <div className="flex flex-wrap items-center gap-1.5 px-2.5 pb-2.5 pt-1">
             <ProviderSwitcher />
@@ -624,11 +660,11 @@ export function Composer() {
           <span className="text-[11.5px] text-faint">
             {zh
               ? running
-                ? "⏎ 加入队列 · ⇧⏎ 换行 · 粘贴长文→文件 · @ 文件 · / 命令"
-                : "⏎ 发送 · ⇧⏎ 换行 · 粘贴长文→文件 · @ 文件 · / 命令"
+                ? "⏎ 加入队列 · ⇧⏎ 换行 · @ 文件 · / 命令"
+                : "⏎ 发送 · ⇧⏎ 换行 · @ 文件 · / 命令"
               : running
-                ? "⏎ queue · ⇧⏎ newline · long paste→file · @ files · / commands"
-                : "⏎ send · ⇧⏎ newline · long paste→file · @ files · / commands"}
+                ? "⏎ queue · ⇧⏎ newline · @ files · / commands"
+                : "⏎ send · ⇧⏎ newline · @ files · / commands"}
           </span>
           <span className="text-[11.5px] text-faint">
             {zh

@@ -765,6 +765,47 @@ html[data-reduce-motion="1"] * {
   .assistant-prose {
     letter-spacing: -0.008em;
   }
+
+  /* User bubble + composer render: tight rhythm, no chrome / no extra surface */
+  .user-md p,
+  .composer-md p {
+    margin: 0 0 0.55em;
+  }
+  .user-md > :last-child,
+  .composer-md > :last-child {
+    margin-bottom: 0;
+  }
+  .user-md h1,
+  .user-md h2,
+  .user-md h3,
+  .composer-md h1,
+  .composer-md h2,
+  .composer-md h3 {
+    margin: 0.7em 0 0.35em;
+    font-size: 1em;
+    border: 0;
+    padding: 0;
+  }
+  .user-md .md-code,
+  .composer-md .md-code {
+    margin: 0.55em 0;
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+  }
+  .user-md .md-code-bar,
+  .composer-md .md-code-bar {
+    height: 24px;
+  }
+  .user-md ul,
+  .user-md ol,
+  .composer-md ul,
+  .composer-md ol {
+    margin: 0.2em 0 0.55em;
+  }
+  .composer-md {
+    background: transparent;
+  }
   .md-streaming {
     color: var(--color-fg2);
     overflow-wrap: anywhere;
