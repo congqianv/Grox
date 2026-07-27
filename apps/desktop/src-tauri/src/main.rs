@@ -412,20 +412,18 @@ fn restrict_private_file(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn replace_managed_env_block(content: &str, replacement: &str) -> String {
-    const START: &str = "# >>> Grox managed provider";
-    const END: &str = "# <<< Grox managed provider";
-    let preserved = if let Some(start) = content.find(START) {
-        let suffix = &content[start..];
-        if let Some(relative_end) = suffix.find(END) {
-            let after = start + relative_end + END.len();
+fn replace_managed_block(content: &str, start: &str, end: &str, replacement: &str) -> String {
+    let preserved = if let Some(start_idx) = content.find(start) {
+        let suffix = &content[start_idx..];
+        if let Some(relative_end) = suffix.find(end) {
+            let after = start_idx + relative_end + end.len();
             format!(
                 "{}{}",
-                content[..start].trim_end(),
+                content[..start_idx].trim_end(),
                 content[after..].trim_start()
             )
         } else {
-            content[..start].trim_end().to_string()
+            content[..start_idx].trim_end().to_string()
         }
     } else {
         content.trim_end().to_string()
@@ -442,11 +440,238 @@ fn replace_managed_env_block(content: &str, replacement: &str) -> String {
     } else {
         format!("{preserved}\n\n")
     };
-    format!("{prefix}{START}\n{replacement}\n{END}\n")
+    format!("{prefix}{start}\n{replacement}\n{end}\n")
+}
+
+fn replace_managed_env_block(content: &str, replacement: &str) -> String {
+    replace_managed_block(
+        content,
+        "# >>> Grox managed provider",
+        "# <<< Grox managed provider",
+        replacement,
+    )
+}
+
+fn replace_managed_model_block(content: &str, replacement: &str) -> String {
+    replace_managed_block(
+        content,
+        "# >>> Grox managed models",
+        "# <<< Grox managed models",
+        replacement,
+    )
 }
 
 fn env_value(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn toml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// TOML table header for a model id (`[model.foo]` or `[model."grok-4.5"]`).
+fn model_table_header(model_id: &str) -> String {
+    let bare = model_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-');
+    if bare {
+        format!("[model.{model_id}]")
+    } else {
+        format!("[model.{}]", toml_string(model_id))
+    }
+}
+
+fn model_table_header_aliases(model_id: &str) -> Vec<String> {
+    let mut headers = vec![model_table_header(model_id), format!("[model.{}]", toml_string(model_id))];
+    headers.sort();
+    headers.dedup();
+    headers
+}
+
+fn provider_resident_model_ids(profile: &StoredProviderProfile) -> Vec<String> {
+    let mut ids = profile.resident_models.clone();
+    if ids.is_empty() {
+        if let Some(model) = profile.model.as_ref().filter(|model| !model.is_empty()) {
+            ids.push(model.clone());
+        }
+    }
+    if ids.is_empty() {
+        ids.push("grok-4.5".into());
+    }
+    // Keep order, drop empties / dupes.
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty() && seen.insert(id.to_ascii_lowercase()))
+        .collect()
+}
+
+/// Remove whole `[model.<id>]` tables so a later managed block is the sole
+/// definition Grok sees for those ids (avoids local base_url winning).
+fn strip_model_tables(content: &str, model_ids: &[String]) -> String {
+    if model_ids.is_empty() || content.is_empty() {
+        return content.to_owned();
+    }
+    let mut drop_headers = std::collections::HashSet::new();
+    for id in model_ids {
+        for header in model_table_header_aliases(id) {
+            drop_headers.insert(header);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut skipping = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            skipping = drop_headers.contains(trimmed);
+            if skipping {
+                continue;
+            }
+        } else if skipping {
+            continue;
+        }
+        out.push(line);
+    }
+
+    // Collapse runs of 3+ blank lines left by removals.
+    let mut cleaned = Vec::new();
+    let mut blank_run = 0usize;
+    for line in out {
+        if line.trim().is_empty() {
+            blank_run += 1;
+            if blank_run <= 2 {
+                cleaned.push(line);
+            }
+        } else {
+            blank_run = 0;
+            cleaned.push(line);
+        }
+    }
+    let mut text = cleaned.join("\n");
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// Ensure `[models].default` points at a resident model of the active provider.
+/// Creates a minimal `[models]` table when the file has none.
+fn ensure_models_default(content: &str, default_id: &str) -> String {
+    let mut lines: Vec<String> = content.lines().map(str::to_owned).collect();
+    let mut in_models = false;
+    let mut saw_models = false;
+    let mut patched = false;
+    for line in &mut lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_models = trimmed == "[models]";
+            if in_models {
+                saw_models = true;
+            }
+            continue;
+        }
+        if !in_models || patched {
+            continue;
+        }
+        if trimmed.starts_with("default") && trimmed.contains('=') {
+            *line = format!("default = {}", toml_string(default_id));
+            patched = true;
+        }
+    }
+    if !saw_models {
+        let mut block = vec![
+            "[models]".to_string(),
+            format!("default = {}", toml_string(default_id)),
+            String::new(),
+        ];
+        block.append(&mut lines);
+        lines = block;
+    } else if !patched {
+        // `[models]` exists but has no default key — insert one right after the header.
+        if let Some(index) = lines.iter().position(|line| line.trim() == "[models]") {
+            lines.insert(index + 1, format!("default = {}", toml_string(default_id)));
+        }
+    }
+    let mut text = lines.join("\n");
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// Build the managed `config.toml` fragment so selected model ids route to the
+/// active compatible provider. Per-model `base_url` wins over env alone, which
+/// is why saving only `GROK_MODELS_BASE_URL` was not enough when the user already
+/// had local `[model.*]` overrides.
+fn compatible_provider_model_config(profile: &StoredProviderProfile) -> Result<String, String> {
+    let base = checked_service_url(&profile.base_url, "服务地址")?;
+    let key = checked_api_key(&profile.api_key)?;
+    let backend = profile.api_backend.resolved(&profile.name, &base);
+    let model_ids = provider_resident_model_ids(profile);
+    if model_ids.is_empty() {
+        return Err("供应商没有可用模型".into());
+    }
+
+    let mut lines = Vec::new();
+    lines.push("# Written by Grox when a compatible provider is activated.".to_string());
+    lines.push(
+        "# Per-model base_url is required so requests do not stick to older local overrides."
+            .to_string(),
+    );
+
+    for model_id in &model_ids {
+        lines.push(model_table_header(model_id));
+        lines.push(format!("model = {}", toml_string(model_id)));
+        lines.push(format!("base_url = {}", toml_string(&base)));
+        lines.push(format!(
+            "name = {}",
+            toml_string(&format!("{} · {model_id}", profile.name))
+        ));
+        lines.push(format!("api_key = {}", toml_string(key)));
+        lines.push(format!("api_backend = {}", toml_string(backend)));
+        lines.push("context_window = 500000".to_string());
+        lines.push("supports_backend_search = true".to_string());
+        lines.push("supports_reasoning_effort = true".to_string());
+        lines.push(String::new());
+    }
+
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    Ok(lines.join("\n"))
+}
+
+fn apply_compatible_provider_to_config(profile: &StoredProviderProfile) -> Result<(), String> {
+    let path = grok_home()?.join("config.toml");
+    let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
+    // Drop previous managed block first so strip only sees user tables.
+    let without_managed = replace_managed_model_block(&current, "");
+    let model_ids = provider_resident_model_ids(profile);
+    let default_id = model_ids
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "grok-4.5".into());
+    let stripped = strip_model_tables(&without_managed, &model_ids);
+    let patched = ensure_models_default(&stripped, &default_id);
+    let fragment = compatible_provider_model_config(profile)?;
+    atomic_write(&path, &replace_managed_model_block(&patched, &fragment))?;
+    restrict_private_file(&path)?;
+    Ok(())
+}
+
+fn clear_compatible_provider_from_config() -> Result<(), String> {
+    let path = grok_home()?.join("config.toml");
+    if !path.exists() {
+        return Ok(());
+    }
+    let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
+    let next = replace_managed_model_block(&current, "");
+    if next != current {
+        atomic_write(&path, &next)?;
+        restrict_private_file(&path)?;
+    }
+    Ok(())
 }
 
 fn config_path(id: &str, cwd: &Path) -> Result<(PathBuf, &'static str, &'static str), String> {
@@ -2212,6 +2437,9 @@ fn activate_provider_profile(id: String) -> Result<(), String> {
     let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
     atomic_write(&path, &replace_managed_env_block(&current, &replacement))?;
     restrict_private_file(&path)?;
+    // Also pin each resident model id to this provider in config.toml so
+    // existing local [model.*] overrides cannot keep routing to 127.0.0.1.
+    apply_compatible_provider_to_config(&profile)?;
     value.active_id = Some(profile.id);
     write_provider_profiles_file(&value)
 }
@@ -2229,6 +2457,7 @@ fn delete_provider_profile(id: String) -> Result<(), String> {
         let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
         atomic_write(&path, &replace_managed_env_block(&current, ""))?;
         restrict_private_file(&path)?;
+        clear_compatible_provider_from_config()?;
         value.active_id = None;
     }
     write_provider_profiles_file(&value)
@@ -2294,6 +2523,27 @@ fn configure_provider(request: ProviderConfig) -> Result<(), String> {
     };
     atomic_write(&path, &replace_managed_env_block(&current, &replacement))?;
     restrict_private_file(&path)?;
+    // Leaving OAuth / official xAI: drop managed model routes so built-ins
+    // and any remaining user [model.*] sections take over again.
+    if request.kind != "compatible" {
+        clear_compatible_provider_from_config()?;
+    } else if let Some(base_url) = request.base_url.as_deref() {
+        // One-shot compatible configure (no named profile): still pin a
+        // default model so the session does not stick to a local override.
+        let key = requested_key.or(saved_key).ok_or("API Key 不能为空")?;
+        let synthetic = StoredProviderProfile {
+            id: "compatible".into(),
+            name: "compatible".into(),
+            api_key: checked_api_key(key)?.to_owned(),
+            base_url: checked_service_url(base_url, "服务地址")?,
+            api_backend: ProviderApiBackend::ChatCompletions,
+            models_url: None,
+            model: Some("grok-4.5".into()),
+            available_models: Vec::new(),
+            resident_models: vec!["grok-4.5".into()],
+        };
+        apply_compatible_provider_to_config(&synthetic)?;
+    }
     let mut profiles = read_provider_profiles_file()?;
     if profiles.active_id.take().is_some() {
         write_provider_profiles_file(&profiles)?;
@@ -2393,6 +2643,10 @@ async fn acp_spawn(
                     "GROK_MODELS_API_BACKEND",
                     profile.api_backend.resolved(&profile.name, &base),
                 );
+            // Keep config.toml in lockstep with the active profile so a restart
+            // after editing resident models still routes away from stale local
+            // [model.*] base_url overrides without requiring a manual re-activate.
+            let _ = apply_compatible_provider_to_config(profile);
         }
     }
     // This is deliberately applied after the user environment so neither a
@@ -2813,6 +3067,55 @@ mod tests {
             ProviderApiBackend::Auto,
         )
         .is_err());
+    }
+
+    #[test]
+    fn managed_model_block_overrides_local_base_url() {
+        let profile = StoredProviderProfile {
+            id: "p1".into(),
+            name: "picpi".into(),
+            api_key: "sk-test".into(),
+            base_url: "https://api.picpi.top/v1".into(),
+            api_backend: ProviderApiBackend::Responses,
+            models_url: None,
+            model: Some("grok-4.5".into()),
+            available_models: Vec::new(),
+            resident_models: vec!["grok-4.5".into(), "grok-build".into()],
+        };
+        let existing = r#"
+[models]
+default = "local"
+
+[model.local]
+model = "grok-4.5"
+base_url = "http://127.0.0.1:8000/v1"
+api_key = "local-key"
+
+[model."grok-4.5"]
+model = "grok-4.5"
+base_url = "http://127.0.0.1:8000/v1"
+api_key = "local-key"
+"#;
+        let without = replace_managed_model_block(existing, "");
+        let ids = provider_resident_model_ids(&profile);
+        let stripped = strip_model_tables(&without, &ids);
+        assert!(
+            !stripped.contains("[model.\"grok-4.5\"]"),
+            "resident model tables should be stripped: {stripped}"
+        );
+        assert!(
+            stripped.contains("[model.local]"),
+            "unrelated local alias should remain"
+        );
+        let patched = ensure_models_default(&stripped, "grok-4.5");
+        assert!(patched.contains("default = \"grok-4.5\""));
+        let fragment = compatible_provider_model_config(&profile).unwrap();
+        assert!(fragment.contains("base_url = \"https://api.picpi.top/v1\""));
+        assert!(fragment.contains("api_key = \"sk-test\""));
+        let final_cfg = replace_managed_model_block(&patched, &fragment);
+        assert!(final_cfg.contains("# >>> Grox managed models"));
+        assert!(final_cfg.contains("https://api.picpi.top/v1"));
+        assert!(final_cfg.contains("[model.\"grok-4.5\"]") || final_cfg.contains("[model.grok-4.5]"));
     }
 
     #[test]

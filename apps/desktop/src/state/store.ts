@@ -1418,16 +1418,36 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async saveProviderProfile(config) {
-      const wasActive = Boolean(config.id && get().activeProviderProfileId === config.id);
       let profile = await bridge.saveProviderProfile(config);
       try {
         profile = await bridge.refreshProviderModels(profile.id);
       } catch (error) {
         set({ startupError: `供应商已保存，但模型列表获取失败：${error instanceof Error ? error.message : String(error)}` });
       }
-      if (wasActive) await bridge.activateProviderProfile(profile.id);
-      await get().refreshProviderProfiles();
-      if (get().activeProviderProfileId === profile.id) await get().refreshModels();
+      // Always activate after save so the just-configured provider is what the
+      // agent uses — no separate "switch + edit config.toml" step required.
+      if (Object.values(get().sessions).some((session) => session.status !== "idle")) {
+        await get().refreshProviderProfiles();
+        set({
+          startupError:
+            "供应商已保存。请先停止正在执行的任务，再在输入框左侧切换到该供应商以生效。",
+        });
+        return profile;
+      }
+      const activeId = get().activeId;
+      set({ providerSwitching: true });
+      try {
+        await bridge.activateProviderProfile(profile.id);
+        await get().refreshProviderProfiles();
+        await Promise.all([get().refreshAccount(), get().refreshModels()]);
+        if (activeId) await bridge.loadSession(activeId);
+        set({ providerSwitching: false, startupError: null });
+      } catch (error) {
+        set({
+          providerSwitching: false,
+          startupError: `供应商已保存，但激活失败：${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
       return profile;
     },
 
