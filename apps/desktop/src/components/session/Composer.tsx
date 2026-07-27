@@ -27,7 +27,12 @@ import {
   searchWorkspaceFiles,
   validateAttachmentSet,
 } from "../../lib/attachments";
-import { isNativeDragDropActive, listenNativeFileDrop } from "../../lib/dragDrop";
+import {
+  elementContainsPoint,
+  isNativeDragDropActive,
+  listenNativeFileDrop,
+  pathsFromDataTransfer,
+} from "../../lib/dragDrop";
 import { useImeGuard } from "../../lib/ime";
 import { Markdown } from "../../lib/markdown";
 import { looksLikeMarkdown } from "../../lib/markdownInput";
@@ -70,6 +75,7 @@ export function Composer() {
   const [composerFocused, setComposerFocused] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const surfaceRef = useRef<HTMLDivElement>(null);
   const dragDepth = useRef(0);
   const { onCompositionStart, onCompositionEnd, isImeBlocking } = useImeGuard();
 
@@ -219,12 +225,14 @@ export function Composer() {
   pathDropRef.current = appendPathStrings;
 
   // Tauri native drag-drop exposes real filesystem paths (HTML5 File.path is empty).
+  // Only accept when the pointer is over the composer surface — sidebar drops import projects.
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
     void listenNativeFileDrop((event) => {
+      const overComposer = elementContainsPoint(surfaceRef.current, event.position);
       if (event.phase === "enter" || event.phase === "over") {
-        setDragOver(true);
+        setDragOver(overComposer);
         return;
       }
       if (event.phase === "leave") {
@@ -233,7 +241,8 @@ export function Composer() {
       }
       if (event.phase === "drop") {
         setDragOver(false);
-        if (event.paths.length > 0) pathDropRef.current(event.paths);
+        if (!overComposer || event.paths.length === 0) return;
+        pathDropRef.current(event.paths);
       }
     }).then((fn) => {
       if (cancelled) fn?.();
@@ -309,26 +318,6 @@ export function Composer() {
     }
   };
 
-  const parseDroppedPaths = (raw: string): string[] => {
-    return raw
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#"))
-      .map((line) => {
-        if (line.startsWith("file://")) {
-          try {
-            const url = new URL(line);
-            // macOS/Linux: pathname is absolute; Windows: /C:/...
-            return decodeURIComponent(url.pathname).replace(/^\/([A-Za-z]:)/, "$1");
-          } catch {
-            return line.replace(/^file:\/\//, "");
-          }
-        }
-        return line;
-      })
-      .filter(Boolean);
-  };
-
   const onDrop = (event: React.DragEvent) => {
     event.preventDefault();
     dragDepth.current = 0;
@@ -341,9 +330,8 @@ export function Composer() {
       return;
     }
     // Fallback: some hosts only provide text/uri-list or plain path text.
-    const uriList =
-      event.dataTransfer.getData("text/uri-list") || event.dataTransfer.getData("text/plain");
-    if (uriList.trim()) appendPathStrings(parseDroppedPaths(uriList));
+    const paths = pathsFromDataTransfer(event.dataTransfer);
+    if (paths.length > 0) appendPathStrings(paths);
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -497,6 +485,7 @@ export function Composer() {
 
         {/* overflow-visible: chip/options menus open below the toolbar and must not be clipped */}
         <div
+          ref={surfaceRef}
           className={`surface overflow-visible transition-shadow ${
             dragOver ? "ring-1 ring-acc/50 shadow-[0_0_0_1px_var(--color-acc)]" : ""
           }`}

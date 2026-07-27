@@ -28,6 +28,71 @@ function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+/** Hit-test a client point against an element (used to route native drops). */
+export function elementContainsPoint(
+  el: Element | null | undefined,
+  position?: { x: number; y: number } | null,
+): boolean {
+  if (!el || !position) return false;
+  const rect = el.getBoundingClientRect();
+  return (
+    position.x >= rect.left &&
+    position.x <= rect.right &&
+    position.y >= rect.top &&
+    position.y <= rect.bottom
+  );
+}
+
+/**
+ * Parse absolute paths from HTML5 drag data (text/uri-list / plain text).
+ * Used when Tauri is not available or File.path is empty.
+ */
+export function parseDroppedPathList(raw: string): string[] {
+  return raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .map((line) => {
+      if (line.startsWith("file://")) {
+        try {
+          const url = new URL(line);
+          return decodeURIComponent(url.pathname).replace(/^\/([A-Za-z]:)/, "$1");
+        } catch {
+          return line.replace(/^file:\/\//, "");
+        }
+      }
+      return line;
+    })
+    .filter(Boolean);
+}
+
+/** Collect filesystem paths from an HTML5 DataTransfer (File.path + uri-list). */
+export function pathsFromDataTransfer(data: DataTransfer | null | undefined): string[] {
+  if (!data) return [];
+  const fromFiles: string[] = [];
+  for (const file of Array.from(data.files ?? [])) {
+    const path = (file as File & { path?: string }).path;
+    if (typeof path === "string" && path.trim()) fromFiles.push(path.trim());
+  }
+  if (fromFiles.length > 0) return uniquePaths(fromFiles);
+
+  const uriList = data.getData("text/uri-list") || data.getData("text/plain");
+  if (uriList.trim()) return uniquePaths(parseDroppedPathList(uriList));
+  return [];
+}
+
+function uniquePaths(paths: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const path of paths) {
+    const key = path.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(path);
+  }
+  return out;
+}
+
 /**
  * Subscribe to native path-aware drag/drop when running under Tauri.
  * Returns null outside Tauri so callers can keep HTML5 handlers.

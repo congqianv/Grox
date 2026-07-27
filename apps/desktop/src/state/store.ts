@@ -174,6 +174,15 @@ interface DesktopState {
   openSession(id: string): Promise<void>;
   newSession(): Promise<void>;
   newProject(): Promise<void>;
+  /**
+   * Import one or more folders as projects (e.g. drag onto the sidebar list).
+   * Validates each path as a directory, adds it to the project list, and
+   * switches the active workspace to the last successful import.
+   */
+  importProjects(paths: string[]): Promise<{
+    imported: string[];
+    failed: { path: string; error: string }[];
+  }>;
   openProject(id: string): Promise<void>;
   renameProject(id: string, name: string): void;
   pinProject(id: string): void;
@@ -1198,6 +1207,65 @@ export const useDesktop = create<DesktopState>((set, get) => {
       } catch (error) {
         set({ startupError: error instanceof Error ? error.message : String(error) });
       }
+    },
+
+    async importProjects(paths) {
+      const imported: string[] = [];
+      const failed: { path: string; error: string }[] = [];
+      // Deduplicate while preserving order.
+      const seen = new Set<string>();
+      const unique: string[] = [];
+      for (const raw of paths) {
+        const trimmed = raw.trim();
+        if (!trimmed) continue;
+        const key = projectId(trimmed);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        unique.push(trimmed);
+      }
+
+      for (const path of unique) {
+        try {
+          let workspace = path;
+          if (bridge.kind === "acp") {
+            // Canonicalize + ensure it is an existing directory.
+            workspace = await invoke<string>("validate_workspace", { cwd: path });
+          } else if (!workspace.includes("/") && !workspace.includes("\\")) {
+            // Mock / browser: require a path-looking string.
+            throw new Error("Not a folder path");
+          }
+          // Add (or re-show) in the sidebar without switching yet.
+          const projects = ensureProject(get().projects, workspace, { force: true });
+          set({ projects, startupError: null });
+          imported.push(workspace);
+        } catch (error) {
+          failed.push({
+            path,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      // Activate the last successful import so the user lands in that project.
+      if (imported.length > 0) {
+        try {
+          await get().setWorkspace(imported[imported.length - 1]);
+        } catch (error) {
+          // Projects are already listed; surface switch failure without rolling back imports.
+          set({
+            startupError: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } else if (failed.length > 0) {
+        set({
+          startupError:
+            failed.length === 1
+              ? failed[0].error
+              : failed.map((f) => f.error).join(" · "),
+        });
+      }
+
+      return { imported, failed };
     },
 
     async openProject(id) {

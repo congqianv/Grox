@@ -3,6 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { useDesktop, type ProjectMeta } from "../../state/store";
 import { usePreferences } from "../../state/preferences";
 import { useI18n } from "../../lib/i18n";
+import {
+  elementContainsPoint,
+  isNativeDragDropActive,
+  listenNativeFileDrop,
+  pathsFromDataTransfer,
+} from "../../lib/dragDrop";
 import { Wordmark } from "../fx/Wordmark";
 import { Icon } from "../fx/Icon";
 import type { Session, SessionMeta } from "../../bridge/types";
@@ -14,6 +20,7 @@ const TASK_PREVIEW = 5;
 
 export function Sidebar() {
   const { t, language } = useI18n();
+  const zh = language === "zh-CN";
   const width = usePreferences((state) => state.sidebarWidth);
   const sessionIndex = useDesktop((state) => state.sessionIndex);
   const sessions = useDesktop((state) => state.sessions);
@@ -24,6 +31,7 @@ export function Sidebar() {
   const openSession = useDesktop((state) => state.openSession);
   const goHome = useDesktop((state) => state.goHome);
   const newProject = useDesktop((state) => state.newProject);
+  const importProjects = useDesktop((state) => state.importProjects);
   const account = useDesktop((state) => state.account);
   const billing = useDesktop((state) => state.billing);
   const setSettingsOpen = useDesktop((state) => state.setSettingsOpen);
@@ -34,7 +42,12 @@ export function Sidebar() {
   const historyCount = useDesktop((state) => state.historyCount);
   const historyError = useDesktop((state) => state.historyError);
   const [accountOpen, setAccountOpen] = useState(false);
+  const [projectDropOver, setProjectDropOver] = useState(false);
+  const [importingProjects, setImportingProjects] = useState(false);
+  const [importNotice, setImportNotice] = useState("");
   const accountRef = useRef<HTMLDivElement>(null);
+  const projectListRef = useRef<HTMLDivElement>(null);
+  const projectDropDepth = useRef(0);
   // Default: all active projects expanded (flat list like the reference UI).
   const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(
     () => new Set(activeProjectId ? [activeProjectId] : []),
@@ -80,6 +93,70 @@ export function Sidebar() {
     document.addEventListener("pointerdown", close);
     return () => document.removeEventListener("pointerdown", close);
   }, [accountOpen]);
+
+  const importDroppedFolders = async (paths: string[]) => {
+    if (paths.length === 0 || importingProjects) return;
+    setImportingProjects(true);
+    setImportNotice("");
+    try {
+      const result = await importProjects(paths);
+      if (result.imported.length > 0) {
+        setImportNotice(
+          zh
+            ? result.imported.length === 1
+              ? `已导入 ${result.imported[0].replace(/[\\/]+$/, "").split(/[\\/]/).at(-1)}`
+              : `已导入 ${result.imported.length} 个项目`
+            : result.imported.length === 1
+              ? `Imported ${result.imported[0].replace(/[\\/]+$/, "").split(/[\\/]/).at(-1)}`
+              : `Imported ${result.imported.length} projects`,
+        );
+        window.setTimeout(() => setImportNotice(""), 3200);
+      } else if (result.failed.length > 0) {
+        setImportNotice(
+          zh
+            ? result.failed[0].error || "无法导入该路径（需要文件夹）"
+            : result.failed[0].error || "Could not import path (folder required)",
+        );
+        window.setTimeout(() => setImportNotice(""), 4200);
+      }
+    } finally {
+      setImportingProjects(false);
+      setProjectDropOver(false);
+      projectDropDepth.current = 0;
+    }
+  };
+
+  const importDroppedRef = useRef(importDroppedFolders);
+  importDroppedRef.current = importDroppedFolders;
+
+  // Tauri native drag-drop: route only when the pointer is over the project list.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    void listenNativeFileDrop((event) => {
+      const overList = elementContainsPoint(projectListRef.current, event.position);
+      if (event.phase === "enter" || event.phase === "over") {
+        setProjectDropOver(overList);
+        return;
+      }
+      if (event.phase === "leave") {
+        setProjectDropOver(false);
+        return;
+      }
+      if (event.phase === "drop") {
+        setProjectDropOver(false);
+        if (!overList || event.paths.length === 0) return;
+        void importDroppedRef.current(event.paths);
+      }
+    }).then((fn) => {
+      if (cancelled) fn?.();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   // Stable order: pin first, then newest import (createdAt desc). Never re-rank
   // by lastOpenedAt — switching projects used to reshuffle the whole list.
@@ -149,7 +226,36 @@ export function Sidebar() {
         </button>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-2.5 pb-3">
+      <div
+        ref={projectListRef}
+        className={`relative min-h-0 flex-1 overflow-y-auto px-2.5 pb-3 transition-colors ${
+          projectDropOver ? "bg-acc/5 ring-1 ring-inset ring-acc/30" : ""
+        }`}
+        onDragEnter={(event) => {
+          event.preventDefault();
+          if (isNativeDragDropActive()) return;
+          projectDropDepth.current += 1;
+          setProjectDropOver(true);
+        }}
+        onDragOver={(event) => {
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "copy";
+        }}
+        onDragLeave={() => {
+          if (isNativeDragDropActive()) return;
+          projectDropDepth.current = Math.max(0, projectDropDepth.current - 1);
+          if (projectDropDepth.current === 0) setProjectDropOver(false);
+        }}
+        onDrop={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          projectDropDepth.current = 0;
+          setProjectDropOver(false);
+          if (isNativeDragDropActive()) return;
+          const paths = pathsFromDataTransfer(event.dataTransfer);
+          if (paths.length > 0) void importDroppedFolders(paths);
+        }}
+      >
         <SectionTitle
           label={t("projects")}
           action={
@@ -165,6 +271,23 @@ export function Sidebar() {
             ) : null
           }
         />
+
+        {(projectDropOver || importingProjects || importNotice) && (
+          <div
+            className={`mb-2 rounded-md border px-2.5 py-2 text-[12px] leading-snug ${
+              projectDropOver || importingProjects
+                ? "border-acc/30 bg-acc/5 text-acc"
+                : "border-line2 bg-raise text-mute"
+            }`}
+          >
+            {importingProjects
+              ? (zh ? "正在导入项目…" : "Importing projects…")
+              : projectDropOver
+                ? (zh ? "放下以导入文件夹为项目" : "Drop folders to import as projects")
+                : importNotice}
+          </div>
+        )}
+
         <div className="space-y-3">
           {activeProjects.map((project) => (
             <ProjectGroup
@@ -190,6 +313,13 @@ export function Sidebar() {
               })}
             />
           ))}
+          {activeProjects.length === 0 && !projectDropOver && !importNotice && (
+            <p className="px-2 py-3 text-[12.5px] leading-relaxed text-faint">
+              {zh
+                ? "拖入文件夹到此处即可导入项目，或点上方「新项目」。"
+                : "Drop a folder here to import a project, or use New project above."}
+            </p>
+          )}
         </div>
         {archivedProjects.length > 0 && (
           <ArchiveGroup label={t("archived")}>
