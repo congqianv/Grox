@@ -1,19 +1,7 @@
 # Contributing
 
-This repository does **not** accept external pull requests or unsolicited
-patches.
+This is a Lite desktop-shell fork focused on `apps/desktop`.
 
-SpaceXAI develops this software internally. The public tree is published for
-source transparency and local builds under the terms of the Apache License,
-Version 2.0 (see [`LICENSE`](LICENSE)).
-
-## Security reports
-
-Please report security issues through the process described in
-[`SECURITY.md`](SECURITY.md). Do not open a public issue for vulnerabilities.
-
-## Licensing of this source
-
-By downloading or using this source, you agree that your use is governed by
-the Apache License, Version 2.0. No contributor license agreement is offered
-because external contributions are not accepted.
+- Prefer changes that keep the app buildable without the Grok Build agent source tree.
+- Runtime behavior depends on a system-installed Grok Build CLI.
+- Do not reintroduce a vendored Agent workspace unless the project deliberately moves back to a bundled build.

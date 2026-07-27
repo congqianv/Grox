@@ -1,7 +1,20 @@
-/target
-**/*.rs.bk
+# Desktop frontend
+apps/desktop/node_modules/
+apps/desktop/dist/
+apps/desktop/dist-ssr/
+apps/desktop/*.local
+
+# Tauri
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/binaries/*
+!apps/desktop/src-tauri/binaries/.gitkeep
+
+# Local caches / OS
 .DS_Store
 .pnpm-store/
+*.log
+**/*.rs.bk
 
 # Local secrets and signing material
 .env
@@ -14,7 +27,7 @@
 *.jks
 *.keystore
 
-# Local IDE / agent state and development-only notes
+# Local IDE / agent state
 /.agents/
 /.codex/
 /.claude/
@@ -22,5 +35,3 @@
 /.kilocode/
 /.vscode/
 /.idea/
-/docs/desktop/
-*.log

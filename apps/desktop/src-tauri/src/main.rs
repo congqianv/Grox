@@ -32,7 +32,6 @@ use tokio::{
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GROX_BUILD_COMMIT: &str = env!("GROX_BUILD_COMMIT");
-const GROK_UPSTREAM_PROVENANCE: &str = include_str!("../../../../.grox/upstream.json");
 const GROK_INSTALL_PS1_URL: &str = "https://x.ai/cli/install.ps1";
 const GROK_INSTALL_SH_URL: &str = "https://x.ai/cli/install.sh";
 /// Public GitHub repo used for desktop release checks / download links.
@@ -752,14 +751,6 @@ fn grok_binary_version(path: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn grok_upstream_commit() -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(GROK_UPSTREAM_PROVENANCE)
-        .ok()?
-        .get("commit")?
-        .as_str()
-        .map(str::to_owned)
-}
-
 fn runtime_info(
     path: String,
     source: &'static str,
@@ -777,7 +768,9 @@ fn runtime_info(
         bundled_path,
         selection_required,
         grox_commit: GROX_BUILD_COMMIT,
-        upstream_commit: grok_upstream_commit(),
+        // Lite fork: no vendored agent tree / .grox provenance. CLI version
+        // comes from the system binary via `grok_binary_version`.
+        upstream_commit: None,
     }
 }
 

@@ -2,9 +2,8 @@ node_modules
 dist
 dist-ssr
 *.local
+.cache
 
 # Tauri
 src-tauri/target
 src-tauri/gen
-src-tauri/binaries/*
-!src-tauri/binaries/.gitkeep

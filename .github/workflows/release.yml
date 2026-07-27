@@ -41,8 +41,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Lite release: desktop shell only. Runtime uses system Grok CLI
-          # (~/.grok/bin/grok, PATH, or GROK_DESKTOP_CLI). No bundled sidecar.
+          # Lite-only repo: desktop shell. Runtime uses system Grok CLI
+          # (~/.grok/bin/grok, PATH, or GROK_DESKTOP_CLI).
           - name: Windows x64
             platform: windows-latest
             args: ""

@@ -5,9 +5,7 @@ description = "Grox desktop agent powered by Grok Build"
 edition = "2021"
 rust-version = "1.77"
 
-# Keep this crate OUT of the grok-build workspace (root Cargo.toml is
-# auto-generated and treated as read-only). The empty table makes this
-# project its own workspace root.
+# Standalone workspace for the Lite desktop shell (no root agent workspace).
 [workspace]
 
 [build-dependencies]
