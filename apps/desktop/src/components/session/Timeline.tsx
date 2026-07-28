@@ -16,6 +16,22 @@ interface Turn {
   promptIndex: number;
 }
 
+/** True when `next` is a stream-retry twin of `prev` (same/fuller body, not new content). */
+function isRetryTwinText(prev: string, next: string): boolean {
+  const a = prev.trim();
+  const b = next.trim();
+  if (!a || !b) return false;
+  if (a === b) return true;
+  // Retried stream often restarts from the top; longer text usually contains the shorter prefix.
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  if (shorter.length < 40) return false;
+  if (longer.startsWith(shorter.slice(0, Math.min(shorter.length, 200)))) return true;
+  // High overlap on the leading window ≈ duplicate full answers stacked by retry.
+  const window = Math.min(120, shorter.length);
+  return longer.includes(shorter.slice(0, window)) && shorter.length / longer.length > 0.55;
+}
+
 function groupTurns(blocks: SessionBlock[]): Turn[] {
   const turns: Turn[] = [];
   let promptIndex = -1;
@@ -164,14 +180,25 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
 
   // Merge every assistant segment into one visible reply so intermediate
   // progress notes are not mistaken for a truncated final answer.
+  // Drop near-duplicate twins left by pre-fix stream retries (same body
+  // re-rendered into a second bubble) so the join does not show the answer twice.
   const answerBlock = (() => {
     if (assistants.length === 0) return null;
-    if (assistants.length === 1) return assistants[0];
-    const text = assistants
-      .map((block) => block.text.trim())
-      .filter(Boolean)
-      .join("\n\n");
-    const last = assistants[assistants.length - 1];
+    const collapsed: typeof assistants = [];
+    for (const block of assistants) {
+      const prev = collapsed[collapsed.length - 1];
+      const cur = block.text.trim();
+      if (!cur) continue;
+      if (prev && isRetryTwinText(prev.text, cur)) {
+        collapsed[collapsed.length - 1] = block;
+        continue;
+      }
+      collapsed.push(block);
+    }
+    if (collapsed.length === 0) return assistants.at(-1) ?? null;
+    if (collapsed.length === 1) return collapsed[0];
+    const text = collapsed.map((block) => block.text.trim()).filter(Boolean).join("\n\n");
+    const last = collapsed[collapsed.length - 1];
     return {
       type: "assistant" as const,
       id: last.id,

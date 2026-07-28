@@ -217,6 +217,8 @@ interface DesktopState {
 
   sendPrompt(text: string, attachments?: PromptAttachment[], sessionId?: string): void;
   removeQueuedPrompt(sessionId: string, queueId: string): void;
+  /** Reorder a pending follow-up before it drains (fromIndex → toIndex). */
+  reorderQueuedPrompt(sessionId: string, fromIndex: number, toIndex: number): void;
   clearPromptQueue(sessionId?: string): void;
   stop(): void;
   compact(): void;
@@ -1780,6 +1782,29 @@ export const useDesktop = create<DesktopState>((set, get) => {
         promptQueues: {
           ...get().promptQueues,
           [sessionId]: queue.filter((item) => item.id !== queueId),
+        },
+      });
+    },
+
+    reorderQueuedPrompt(sessionId, fromIndex, toIndex) {
+      const queue = get().promptQueues[sessionId] ?? [];
+      if (
+        fromIndex === toIndex ||
+        fromIndex < 0 ||
+        toIndex < 0 ||
+        fromIndex >= queue.length ||
+        toIndex >= queue.length
+      ) {
+        return;
+      }
+      const next = [...queue];
+      const [item] = next.splice(fromIndex, 1);
+      if (!item) return;
+      next.splice(toIndex, 0, item);
+      set({
+        promptQueues: {
+          ...get().promptQueues,
+          [sessionId]: next,
         },
       });
     },

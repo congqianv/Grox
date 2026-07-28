@@ -81,7 +81,10 @@ export function Composer() {
 
   const sendPrompt = useDesktop((s) => s.sendPrompt);
   const removeQueuedPrompt = useDesktop((s) => s.removeQueuedPrompt);
+  const reorderQueuedPrompt = useDesktop((s) => s.reorderQueuedPrompt);
   const clearPromptQueue = useDesktop((s) => s.clearPromptQueue);
+  const [queueDragIndex, setQueueDragIndex] = useState<number | null>(null);
+  const [queueDropIndex, setQueueDropIndex] = useState<number | null>(null);
   const activeId = useDesktop((s) => s.activeId);
   const session = useDesktop((s) => (s.activeId ? s.sessions[s.activeId] : null));
   const composer = useDesktop((s) => (s.activeId ? s.sessionComposers[s.activeId] : undefined));
@@ -453,32 +456,138 @@ export function Composer() {
               <span className="text-[12px] font-medium text-mute">
                 {zh ? `队列 ${queue.length}` : `Queued ${queue.length}`}
               </span>
-              <button
-                onClick={() => activeId && clearPromptQueue(activeId)}
-                className="text-[11.5px] text-faint transition-colors hover:text-fg"
-              >
-                {zh ? "清空" : "Clear"}
-              </button>
-            </div>
-            <div className="max-h-28 overflow-y-auto py-1">
-              {queue.map((item, index) => (
-                <div key={item.id} className="flex items-center gap-2 px-3 py-1.5">
-                  <span className="tnum w-4 shrink-0 text-[11px] text-faint">{index + 1}</span>
-                  <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg2">
-                    {item.text || item.attachments.map((a) => attachmentLabel(a)).join(", ")}
+              <div className="flex items-center gap-2">
+                {queue.length > 1 && (
+                  <span className="text-[11px] text-faint">
+                    {zh ? "拖拽或箭头调整顺序" : "Drag or arrows to reorder"}
                   </span>
-                  {item.attachments.length > 0 && (
-                    <span className="shrink-0 text-[11px] text-faint">{item.attachments.length}</span>
-                  )}
-                  <button
-                    onClick={() => activeId && removeQueuedPrompt(activeId, item.id)}
-                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-faint hover:bg-high hover:text-fg"
-                    title={zh ? "移除" : "Remove"}
+                )}
+                <button
+                  onClick={() => activeId && clearPromptQueue(activeId)}
+                  className="text-[11.5px] text-faint transition-colors hover:text-fg"
+                >
+                  {zh ? "清空" : "Clear"}
+                </button>
+              </div>
+            </div>
+            <div
+              className="max-h-40 overflow-y-auto py-1"
+              onDragLeave={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                  setQueueDropIndex(null);
+                }
+              }}
+            >
+              {queue.map((item, index) => {
+                const canMoveUp = index > 0;
+                const canMoveDown = index < queue.length - 1;
+                const isDragging = queueDragIndex === index;
+                const isDropTarget = queueDropIndex === index && queueDragIndex !== null && queueDragIndex !== index;
+                return (
+                  <div
+                    key={item.id}
+                    draggable={queue.length > 1}
+                    onDragStart={(event) => {
+                      if (queue.length <= 1) return;
+                      setQueueDragIndex(index);
+                      event.dataTransfer.effectAllowed = "move";
+                      event.dataTransfer.setData("text/plain", String(index));
+                      // Firefox requires data; some engines need a drag image delay.
+                      if (event.currentTarget instanceof HTMLElement) {
+                        event.currentTarget.style.opacity = "0.55";
+                      }
+                    }}
+                    onDragEnd={(event) => {
+                      if (event.currentTarget instanceof HTMLElement) {
+                        event.currentTarget.style.opacity = "";
+                      }
+                      setQueueDragIndex(null);
+                      setQueueDropIndex(null);
+                    }}
+                    onDragOver={(event) => {
+                      if (queueDragIndex === null || queueDragIndex === index) return;
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = "move";
+                      if (queueDropIndex !== index) setQueueDropIndex(index);
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      const from =
+                        queueDragIndex ??
+                        Number.parseInt(event.dataTransfer.getData("text/plain"), 10);
+                      if (
+                        activeId &&
+                        Number.isFinite(from) &&
+                        from !== index &&
+                        from >= 0 &&
+                        from < queue.length
+                      ) {
+                        reorderQueuedPrompt(activeId, from, index);
+                      }
+                      setQueueDragIndex(null);
+                      setQueueDropIndex(null);
+                    }}
+                    className={`flex items-center gap-1.5 px-2 py-1.5 transition-colors ${
+                      isDragging ? "bg-high/40" : isDropTarget ? "bg-acc/10" : "hover:bg-high/40"
+                    } ${queue.length > 1 ? "cursor-grab active:cursor-grabbing" : ""}`}
                   >
-                    <Icon name="x" size={10} />
-                  </button>
-                </div>
-              ))}
+                    {queue.length > 1 && (
+                      <span
+                        className="flex h-6 w-4 shrink-0 items-center justify-center text-faint"
+                        title={zh ? "拖拽调整顺序" : "Drag to reorder"}
+                        aria-hidden
+                      >
+                        <Icon name="grip" size={10} />
+                      </span>
+                    )}
+                    <span className="tnum w-4 shrink-0 text-center text-[11px] text-faint">{index + 1}</span>
+                    <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg2">
+                      {item.text || item.attachments.map((a) => attachmentLabel(a)).join(", ")}
+                    </span>
+                    {item.attachments.length > 0 && (
+                      <span className="shrink-0 text-[11px] text-faint">{item.attachments.length}</span>
+                    )}
+                    {queue.length > 1 && (
+                      <div className="flex shrink-0 items-center">
+                        <button
+                          type="button"
+                          disabled={!canMoveUp || !activeId}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            if (activeId && canMoveUp) reorderQueuedPrompt(activeId, index, index - 1);
+                          }}
+                          className="flex h-6 w-5 items-center justify-center rounded-md text-faint transition-colors hover:bg-high hover:text-fg disabled:cursor-default disabled:opacity-25 disabled:hover:bg-transparent disabled:hover:text-faint"
+                          title={zh ? "上移" : "Move up"}
+                          aria-label={zh ? "上移" : "Move up"}
+                        >
+                          <Icon name="chevronUp" size={11} />
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!canMoveDown || !activeId}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            if (activeId && canMoveDown) reorderQueuedPrompt(activeId, index, index + 1);
+                          }}
+                          className="flex h-6 w-5 items-center justify-center rounded-md text-faint transition-colors hover:bg-high hover:text-fg disabled:cursor-default disabled:opacity-25 disabled:hover:bg-transparent disabled:hover:text-faint"
+                          title={zh ? "下移" : "Move down"}
+                          aria-label={zh ? "下移" : "Move down"}
+                        >
+                          <Icon name="chevronDown" size={11} />
+                        </button>
+                      </div>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => activeId && removeQueuedPrompt(activeId, item.id)}
+                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-faint hover:bg-high hover:text-fg"
+                      title={zh ? "移除" : "Remove"}
+                    >
+                      <Icon name="x" size={10} />
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}

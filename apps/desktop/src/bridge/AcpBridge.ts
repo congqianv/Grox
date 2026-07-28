@@ -93,12 +93,27 @@ interface ContentCursor {
   assistantId?: string;
   thinkingId?: string;
   thinkingStartedAt?: number;
+  /** Last assistant bubble this turn — reused on stream retry (single-bubble replace). */
+  lastAssistantId?: string;
+  /** Last thinking bubble this turn — reused on stream retry. */
+  lastThinkingId?: string;
   userId?: string;
   userText?: string;
   userPromptIndex?: number;
   userOpen?: boolean;
   planId?: string;
   toolBlocks: Map<string, string>;
+  /** Agent-reported + client-observed retry count for the active turn. */
+  retryCount?: number;
+  /** Cumulative assistant chars rendered this turn (for retry limiting). */
+  visibleAssistantChars?: number;
+  /**
+   * After retry_state, the next agent_message/thought chunk must replace the
+   * existing draft bubble instead of opening a second one.
+   */
+  expectReplace?: boolean;
+  /** Stop applying stream chunks after client aborts further retries. */
+  streamSuppressed?: boolean;
 }
 
 interface PendingInteraction {
@@ -140,6 +155,13 @@ const MAX_TOOL_TEXT = 128 * 1024;
 const MAX_JSON_NODES = 5_000;
 const MAX_JSON_ARRAY_ITEMS = 200;
 const MAX_TERMINAL_LINES = 2_000;
+/** Assistant text length that counts as "visible body" for retry limiting. */
+const VISIBLE_ASSISTANT_BODY_CHARS = 80;
+/**
+ * Once a visible assistant body is already on screen, only clear+replace for
+ * this many additional retries. Further retries keep the body and cancel.
+ */
+const MAX_RETRIES_WITH_VISIBLE_BODY = 1;
 
 function truncateText(value: string, limit = MAX_TOOL_TEXT): string {
   if (value.length <= limit) return value;
@@ -742,6 +764,138 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
+  /** Drop buffered stream deltas without emitting (used before retry replace). */
+  private discardStreamAppends(sessionId: string) {
+    for (const [key, event] of this.streamAppends) {
+      if (event.sessionId === sessionId) this.streamAppends.delete(key);
+    }
+    if (this.streamAppends.size === 0 && this.streamFlushTimer !== undefined) {
+      window.clearTimeout(this.streamFlushTimer);
+      this.streamFlushTimer = undefined;
+    }
+  }
+
+  private resetTurnRetryState(cursor: ContentCursor) {
+    cursor.retryCount = 0;
+    cursor.visibleAssistantChars = 0;
+    cursor.expectReplace = false;
+    cursor.streamSuppressed = false;
+    cursor.lastAssistantId = undefined;
+    cursor.lastThinkingId = undefined;
+  }
+
+  /**
+   * Clear the in-flight assistant/thinking draft so a stream retry replaces a
+   * single bubble instead of appending a second full answer.
+   */
+  private clearTurnDraft(sessionId: string) {
+    this.discardStreamAppends(sessionId);
+    const cursor = this.cursor(sessionId);
+
+    if (!cursor.assistantId && cursor.lastAssistantId) {
+      cursor.assistantId = cursor.lastAssistantId;
+    }
+    if (cursor.assistantId) {
+      this.emit({
+        type: "block_patch",
+        sessionId,
+        blockId: cursor.assistantId,
+        patch: { type: "assistant", text: "", streaming: true } as Partial<SessionBlock>,
+      });
+      cursor.lastAssistantId = cursor.assistantId;
+    }
+
+    if (!cursor.thinkingId && cursor.lastThinkingId) {
+      cursor.thinkingId = cursor.lastThinkingId;
+      cursor.thinkingStartedAt = Date.now();
+    }
+    if (cursor.thinkingId) {
+      this.emit({
+        type: "block_patch",
+        sessionId,
+        blockId: cursor.thinkingId,
+        patch: { type: "thinking", text: "", live: true } as Partial<SessionBlock>,
+      });
+      cursor.lastThinkingId = cursor.thinkingId;
+    }
+
+    cursor.visibleAssistantChars = 0;
+    cursor.expectReplace = true;
+  }
+
+  private handleRetryState(sessionId: string, update: JsonObject) {
+    const retry = record(update.retryState) ?? update;
+    const variant = (string(retry.type) ?? string(retry.kind) ?? "").toLowerCase();
+    const attempt = number(retry.attempt);
+    const maxRetries = number(retry.max_retries) ?? number(retry.maxRetries);
+    const errorText =
+      string(retry.error) ?? string(retry.message) ?? string(retry.error_type) ?? "transient failure";
+    const exhausted =
+      variant === "exhausted" ||
+      variant === "failed" ||
+      retry.exhausted === true ||
+      (maxRetries !== undefined && attempt !== undefined && attempt >= maxRetries);
+
+    const cursor = this.cursor(sessionId);
+    cursor.retryCount = (cursor.retryCount ?? 0) + 1;
+    const retryLabel =
+      attempt !== undefined
+        ? maxRetries !== undefined
+          ? `${attempt}/${maxRetries}`
+          : `×${attempt}`
+        : `×${cursor.retryCount}`;
+
+    if (exhausted) {
+      cursor.expectReplace = false;
+      this.emit({
+        type: "block_add",
+        sessionId,
+        block: {
+          type: "system",
+          id: uid(),
+          text: `RETRY EXHAUSTED · ${errorText}`,
+          ts: Date.now(),
+          kind: "info",
+        },
+      });
+      return;
+    }
+
+    const hadVisibleBody = (cursor.visibleAssistantChars ?? 0) >= VISIBLE_ASSISTANT_BODY_CHARS;
+    if (hadVisibleBody && (cursor.retryCount ?? 0) > MAX_RETRIES_WITH_VISIBLE_BODY) {
+      // Keep the already-rendered body; stop further retry streams from stacking.
+      cursor.streamSuppressed = true;
+      cursor.expectReplace = false;
+      this.emit({
+        type: "block_add",
+        sessionId,
+        block: {
+          type: "system",
+          id: uid(),
+          text: `RETRY LIMITED · 已有可见正文，停止继续重试（${retryLabel}）· ${errorText}`,
+          ts: Date.now(),
+          kind: "info",
+        },
+      });
+      this.cancel(sessionId);
+      return;
+    }
+
+    // Priority fix: clear draft before the retried stream lands, single-bubble replace.
+    this.clearTurnDraft(sessionId);
+    this.emit({
+      type: "block_add",
+      sessionId,
+      block: {
+        type: "system",
+        id: uid(),
+        text: `RETRY · ${retryLabel} · ${errorText}`,
+        ts: Date.now(),
+        kind: "info",
+      },
+    });
+  }
+
   private queueToolPatch(event: Extract<BridgeEvent, { type: "tool_patch" }>) {
     const key = `${event.sessionId}:${event.blockId}`;
     const pending = this.toolPatches.get(key);
@@ -1049,47 +1203,80 @@ export class AcpBridge implements GrokBridge {
         cursor.assistantId = undefined;
         cursor.thinkingId = undefined;
         cursor.thinkingStartedAt = undefined;
+        this.resetTurnRetryState(cursor);
         return;
       }
       case "agent_message_chunk": {
+        if (cursor.streamSuppressed) return;
         this.closeUser(sessionId);
         this.closeThinking(sessionId);
         const delta = contentText(update.content);
         if (!cursor.assistantId) {
-          cursor.assistantId = uid();
-          this.emit({
-            type: "block_add",
-            sessionId,
-            block: {
-              type: "assistant",
-              id: cursor.assistantId,
-              text: "",
-              ts: Date.now(),
-              streaming: true,
-            },
-          });
+          // After a stream retry, replace the same bubble instead of stacking a twin.
+          if (cursor.expectReplace && cursor.lastAssistantId) {
+            cursor.assistantId = cursor.lastAssistantId;
+            this.discardStreamAppends(sessionId);
+            this.emit({
+              type: "block_patch",
+              sessionId,
+              blockId: cursor.assistantId,
+              patch: { type: "assistant", text: "", streaming: true } as Partial<SessionBlock>,
+            });
+            cursor.visibleAssistantChars = 0;
+          } else {
+            cursor.assistantId = uid();
+            this.emit({
+              type: "block_add",
+              sessionId,
+              block: {
+                type: "assistant",
+                id: cursor.assistantId,
+                text: "",
+                ts: Date.now(),
+                streaming: true,
+              },
+            });
+          }
+          cursor.lastAssistantId = cursor.assistantId;
+          cursor.expectReplace = false;
         }
+        cursor.visibleAssistantChars = (cursor.visibleAssistantChars ?? 0) + delta.length;
         this.queueStreamAppend({ type: "assistant_append", sessionId, blockId: cursor.assistantId, delta });
         return;
       }
       case "agent_thought_chunk": {
+        if (cursor.streamSuppressed) return;
         this.closeUser(sessionId);
         this.closeAssistant(sessionId);
         const delta = contentText(update.content);
         if (!cursor.thinkingId) {
-          cursor.thinkingId = uid();
-          cursor.thinkingStartedAt = Date.now();
-          this.emit({
-            type: "block_add",
-            sessionId,
-            block: {
-              type: "thinking",
-              id: cursor.thinkingId,
-              text: "",
-              ts: Date.now(),
-              live: true,
-            },
-          });
+          if (cursor.expectReplace && cursor.lastThinkingId) {
+            cursor.thinkingId = cursor.lastThinkingId;
+            cursor.thinkingStartedAt = Date.now();
+            this.discardStreamAppends(sessionId);
+            this.emit({
+              type: "block_patch",
+              sessionId,
+              blockId: cursor.thinkingId,
+              patch: { type: "thinking", text: "", live: true } as Partial<SessionBlock>,
+            });
+          } else {
+            cursor.thinkingId = uid();
+            cursor.thinkingStartedAt = Date.now();
+            this.emit({
+              type: "block_add",
+              sessionId,
+              block: {
+                type: "thinking",
+                id: cursor.thinkingId,
+                text: "",
+                ts: Date.now(),
+                live: true,
+              },
+            });
+          }
+          cursor.lastThinkingId = cursor.thinkingId;
+          // Keep expectReplace for a following assistant chunk in the same retry cycle.
         }
         this.queueStreamAppend({ type: "thinking_append", sessionId, blockId: cursor.thinkingId, delta });
         return;
@@ -1239,21 +1426,24 @@ export class AcpBridge implements GrokBridge {
           message: string(update.error) ?? "Grok Agent 恢复失败",
         });
         break;
-      case "retry_state": {
-        const retry = record(update.retryState) ?? update;
+      case "retry_state":
+        this.handleRetryState(sessionId, update);
+        break;
+      case "auto_recovery_started":
+        // Same failure mode as retry: drop partial draft so recovery rewrites one bubble.
+        this.clearTurnDraft(sessionId);
         this.emit({
           type: "block_add",
           sessionId,
           block: {
             type: "system",
             id: uid(),
-            text: `RETRY · ${string(retry.error) ?? string(retry.message) ?? "transient failure"}`,
+            text: `AUTO RECOVERY · ${string(update.error) ?? string(update.message) ?? "recovering"}`,
             ts: Date.now(),
             kind: "info",
           },
         });
         break;
-      }
       case "session_summary_generated": {
         const meta = this.catalogue.get(sessionId);
         const title = string(update.session_summary);
@@ -1280,6 +1470,7 @@ export class AcpBridge implements GrokBridge {
           elapsedMs: cursor.thinkingStartedAt ? Date.now() - cursor.thinkingStartedAt : undefined,
         } as Partial<SessionBlock>,
       });
+      cursor.lastThinkingId = cursor.thinkingId;
       cursor.thinkingId = undefined;
       cursor.thinkingStartedAt = undefined;
     }
@@ -1302,6 +1493,7 @@ export class AcpBridge implements GrokBridge {
         blockId: cursor.assistantId,
         patch: { type: "assistant", streaming: false } as Partial<SessionBlock>,
       });
+      cursor.lastAssistantId = cursor.assistantId;
       cursor.assistantId = undefined;
     }
   }
@@ -1311,6 +1503,7 @@ export class AcpBridge implements GrokBridge {
     this.closeThinking(sessionId);
     this.closeAssistant(sessionId);
     this.flushToolPatches(sessionId);
+    this.resetTurnRetryState(this.cursor(sessionId));
     if (usageValue) this.emitUsage(sessionId, usageValue);
     this.emit({ type: "status", sessionId, status: "idle" });
   }
@@ -1871,6 +2064,13 @@ export class AcpBridge implements GrokBridge {
     await this.ready;
     this.knownSessions.add(sessionId);
     this.closeUser(sessionId);
+    // Fresh turn: drop retry/replace state so a prior interrupted stream cannot
+    // hijack the next reply into the old bubble.
+    this.resetTurnRetryState(this.cursor(sessionId));
+    this.cursor(sessionId).assistantId = undefined;
+    this.cursor(sessionId).thinkingId = undefined;
+    this.cursor(sessionId).thinkingStartedAt = undefined;
+    this.cursor(sessionId).planId = undefined;
     this.emit({ type: "status", sessionId, status: "running" });
     try {
       const previous = this.sessionOptions.get(sessionId);

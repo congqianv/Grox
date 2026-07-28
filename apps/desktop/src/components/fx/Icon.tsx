@@ -10,12 +10,24 @@ const paths: Record<string, JSX.Element> = {
   plus: <path d="M12 5v14M5 12h14" />,
   minus: <path d="M5 12h14" />,
   arrowUp: <path d="M12 19V5M5 12l7-7 7 7" />,
+  arrowDown: <path d="M12 5v14M5 12l7 7 7-7" />,
   arrowRight: <path d="M5 12h14M13 5l7 7-7 7" />,
   stop: <rect x="6.5" y="6.5" width="11" height="11" />,
   x: <path d="M6 6l12 12M18 6L6 18" />,
   check: <path d="M5 12.5l4.5 4.5L19 7.5" />,
+  chevronUp: <path d="M6 14.5l6-6 6 6" />,
   chevronDown: <path d="M6 9.5l6 6 6-6" />,
   chevronRight: <path d="M9.5 6l6 6-6 6" />,
+  grip: (
+    <>
+      <circle cx="9" cy="7" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="7" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="9" cy="12" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="12" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="9" cy="17" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="17" r="1.2" fill="currentColor" stroke="none" />
+    </>
+  ),
   gear: (
     <>
       <circle cx="12" cy="12" r="3.2" />
