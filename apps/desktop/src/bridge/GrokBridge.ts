@@ -30,6 +30,8 @@ import type {
   RewindMode,
   RewindPoint,
   RewindResult,
+  InterjectResult,
+  QueueOperationReceipt,
 } from "./types";
 
 export interface GrokBridge {
@@ -84,6 +86,36 @@ export interface GrokBridge {
   /** ACP: session/prompt — streams events until the turn settles. */
   prompt(sessionId: string, text: string, opts: PromptOptions): Promise<void>;
 
+  /**
+   * Same-turn interjection via `x.ai/interject`.
+   * Older CLIs may not support it — returns `queued_head` so the shell can
+   * pin the message at the front of the local follow-up queue instead.
+   */
+  interject(sessionId: string, text: string, opts: PromptOptions): Promise<InterjectResult>;
+
+  /**
+   * Enqueue a follow-up while a turn is active.
+   * Tries concurrent `session/prompt` with `_meta.promptId` (CLI queue).
+   * Falls back to local-only ownership when the CLI rejects concurrency.
+   */
+  enqueuePrompt(
+    sessionId: string,
+    text: string,
+    opts: PromptOptions,
+    options?: { promptId?: string; sendNow?: boolean },
+  ): Promise<QueueOperationReceipt>;
+
+  /** Best-effort CLI queue mutations (`x.ai/queue/*`); always apply locally too. */
+  editQueuedPrompt(sessionId: string, id: string, text: string): Promise<QueueOperationReceipt>;
+  removeQueuedPrompt(sessionId: string, id: string, version?: number): Promise<QueueOperationReceipt>;
+  reorderQueuedPrompt(sessionId: string, orderedIds: string[]): Promise<QueueOperationReceipt>;
+  clearQueuedPrompts(sessionId: string): Promise<QueueOperationReceipt>;
+  interjectQueuedPrompt(
+    sessionId: string,
+    id: string,
+    options?: { text?: string; version?: number },
+  ): Promise<QueueOperationReceipt>;
+
   /** ACP: session/cancel — abort the in-flight turn. */
   cancel(sessionId: string): void;
 
@@ -94,12 +126,16 @@ export interface GrokBridge {
   listRewindPoints(sessionId: string): Promise<RewindPoint[]>;
   rewind(sessionId: string, targetPromptIndex: number, mode: RewindMode, force: boolean): Promise<RewindResult>;
 
-  /** Resolve a pending permission card (ACP: session/request_permission). */
+  /**
+   * Resolve a pending permission / plan card.
+   * Plan decisions are idempotent: a second click for the same requestId
+   * returns without re-answering the ACP server request.
+   */
   respondPermission(
     sessionId: string,
     blockId: string,
     option: PermissionOption,
-  ): void;
+  ): { duplicate: boolean; message?: string };
 
   /** Resolve a structured x.ai/ask_user_question interaction. */
   respondQuestion(sessionId: string, blockId: string, response: QuestionResponse): void;

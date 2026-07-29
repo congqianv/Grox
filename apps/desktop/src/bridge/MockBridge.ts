@@ -27,6 +27,8 @@ import type {
   SaveProviderProfile,
   RewindMode,
   RewindResult,
+  InterjectResult,
+  QueueOperationReceipt,
 } from "./types";
 import { seedSessions } from "../demo/data";
 import { DEMO_CWD } from "../demo/data";
@@ -42,6 +44,7 @@ export class MockBridge implements GrokBridge {
   private sessions = new Map<string, Session>();
   private turns = new Map<string, AbortController>();
   private permissionWaiters = new Map<string, (o: PermissionOption) => void>();
+  private resolvedPermissions = new Map<string, PermissionOption>();
   private workspace = DEMO_CWD;
   private permissionMode: PermissionMode = "default";
   private providerProfiles: ProviderProfileSummary[] = [];
@@ -276,6 +279,89 @@ export class MockBridge implements GrokBridge {
     });
   }
 
+  async interject(sessionId: string, text: string, options: PromptOptions): Promise<InterjectResult> {
+    const id = uid();
+    const trimmed = text.trim();
+    this.emit({
+      type: "block_add",
+      sessionId,
+      block: {
+        type: "user",
+        id,
+        text: trimmed,
+        attachments: (options.attachments ?? []).map(({ id: aid, kind, name, mime, size, data, path }) => ({
+          id: aid,
+          kind,
+          name,
+          mime,
+          size,
+          ...(kind === "image" && data ? { data } : {}),
+          ...(kind === "path" && path ? { path } : {}),
+        })),
+        ts: Date.now(),
+      },
+    });
+    this.emit({
+      type: "block_add",
+      sessionId,
+      block: {
+        type: "system",
+        id: uid(),
+        text: "INTERJECT · MOCK · applied mid-turn",
+        ts: Date.now(),
+        kind: "info",
+      },
+    });
+    return {
+      state: "interjected",
+      message: "插话已提交到当前回合（Mock）",
+      fallback: false,
+      entryId: id,
+    };
+  }
+
+  async enqueuePrompt(
+    _sessionId: string,
+    _text: string,
+    _opts: PromptOptions,
+    options: { promptId?: string; sendNow?: boolean } = {},
+  ): Promise<QueueOperationReceipt> {
+    return {
+      operationId: uid(),
+      entryId: options.promptId ?? uid(),
+      state: options.sendNow ? "interjected" : "queued",
+      message: options.sendNow ? "插话已置顶并提交（Mock）" : "消息已加入队列（Mock）",
+    };
+  }
+
+  async editQueuedPrompt(_sessionId: string, id: string, _text: string): Promise<QueueOperationReceipt> {
+    return { operationId: uid(), entryId: id, state: "updated", message: "编辑已提交（Mock）" };
+  }
+
+  async removeQueuedPrompt(_sessionId: string, id: string): Promise<QueueOperationReceipt> {
+    return { operationId: uid(), entryId: id, state: "removed", message: "队列消息已移除（Mock）" };
+  }
+
+  async reorderQueuedPrompt(_sessionId: string, _orderedIds: string[]): Promise<QueueOperationReceipt> {
+    return { operationId: uid(), state: "reordered", message: "队列顺序已更新（Mock）" };
+  }
+
+  async clearQueuedPrompts(_sessionId: string): Promise<QueueOperationReceipt> {
+    return { operationId: uid(), state: "cleared", message: "等待队列已清空（Mock）" };
+  }
+
+  async interjectQueuedPrompt(
+    _sessionId: string,
+    id: string,
+  ): Promise<QueueOperationReceipt> {
+    return {
+      operationId: uid(),
+      entryId: id,
+      state: "interjected",
+      message: "插话请求已提交（Mock）",
+    };
+  }
+
   async listRewindPoints(sessionId: string) {
     const session = this.sessions.get(sessionId);
     return (session?.blocks.filter((block) => block.type === "user") ?? []).map((block, index) => ({
@@ -319,12 +405,24 @@ export class MockBridge implements GrokBridge {
     };
   }
 
-  respondPermission(sessionId: string, _blockId: string, option: PermissionOption): void {
+  respondPermission(
+    sessionId: string,
+    blockId: string,
+    option: PermissionOption,
+  ): { duplicate: boolean; message?: string } {
+    const prior = this.resolvedPermissions.get(blockId);
+    if (prior) {
+      this.emit({ type: "permission_resolved", sessionId, blockId, option: prior });
+      return { duplicate: true, message: "该计划决策已经提交，未重复执行" };
+    }
+    this.resolvedPermissions.set(blockId, option);
     const waiter = this.permissionWaiters.get(sessionId);
     if (waiter) {
       this.permissionWaiters.delete(sessionId);
       waiter(option);
     }
+    this.emit({ type: "permission_resolved", sessionId, blockId, option });
+    return { duplicate: false };
   }
 
   respondQuestion(
@@ -620,7 +718,7 @@ export class MockBridge implements GrokBridge {
         setTimeout(() => this.respondPermission(sessionId, permBlockId, "allow_once"), 300);
       }
     });
-    this.emit({ type: "permission_resolved", sessionId, blockId: permBlockId, option });
+    // permission_resolved is emitted by respondPermission (idempotent).
     this.guard(signal);
 
     const allowed = option !== "deny";

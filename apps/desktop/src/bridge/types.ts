@@ -387,11 +387,53 @@ export type BridgeEvent =
   | { type: "question_resolved"; sessionId: string; blockId: string; response: QuestionResponse }
   | { type: "status"; sessionId: string; status: SessionStatus }
   | { type: "usage"; sessionId: string; usage: Usage }
-  | { type: "error"; sessionId: string; message: string };
+  | { type: "error"; sessionId: string; message: string }
+  /** Authoritative prompt queue from CLI (`x.ai/queue/changed`) or bridge. */
+  | { type: "prompt_queue"; sessionId: string; entries: PromptQueueEntry[] };
+
+/** Wire-level queue entry (CLI or local optimistic). */
+export interface PromptQueueEntry {
+  id: string;
+  text: string;
+  state: "queued" | "interjected" | "sending";
+  position: number;
+  createdAt: number;
+  version?: number;
+  /** local = shell-owned drain; cli = server owns execution via concurrent prompt. */
+  source?: "local" | "cli";
+  attachments?: PromptAttachment[];
+}
 
 export interface PromptOptions {
   model: string;
   effort: Effort;
   mode: AgentMode;
   attachments?: PromptAttachment[];
+}
+
+/** Result of Enter-queue / Ctrl+Enter-interject / queue mutations. */
+export type QueueReceiptState =
+  | "queued"
+  | "interjected"
+  | "removed"
+  | "reordered"
+  | "cleared"
+  | "updated"
+  | "blocked"
+  | "duplicate";
+
+export interface QueueOperationReceipt {
+  operationId: string;
+  entryId?: string;
+  state: QueueReceiptState;
+  message: string;
+  /** True when x.ai/interject was unavailable and we fell back to queue-head. */
+  fallback?: boolean;
+}
+
+export interface InterjectResult {
+  state: "interjected" | "queued_head";
+  message: string;
+  fallback: boolean;
+  entryId?: string;
 }

@@ -36,6 +36,9 @@ import type {
   RewindMode,
   RewindPoint,
   RewindResult,
+  InterjectResult,
+  QueueOperationReceipt,
+  PromptQueueEntry,
 } from "./types";
 
 export const ACP_METHODS = {
@@ -195,6 +198,27 @@ function errorText(value: unknown): string {
   );
 }
 
+/** True when the agent/CLI does not expose the requested method. */
+function isMethodUnavailable(error: unknown): boolean {
+  if (error instanceof AcpRpcError) {
+    if (error.code === -32601) return true;
+    const msg = error.message.toLowerCase();
+    return (
+      msg.includes("method not found") ||
+      msg.includes("not supported") ||
+      msg.includes("unknown method") ||
+      msg.includes("unsupported")
+    );
+  }
+  const msg = errorText(error).toLowerCase();
+  return (
+    msg.includes("method not found") ||
+    msg.includes("not supported") ||
+    msg.includes("unknown method") ||
+    msg.includes("-32601")
+  );
+}
+
 function jsonText(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value === "string") return truncateText(value);
@@ -313,6 +337,40 @@ function promptContent(text: string, attachments: PromptAttachment[]): JsonObjec
 
 function wireMethod(method: string): string {
   return method.startsWith("x.ai/") ? `_${method}` : method;
+}
+
+function normalizePromptQueue(value: unknown, previous: PromptQueueEntry[] = []): PromptQueueEntry[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry, index) => {
+      const row = record(entry) ?? {};
+      const id =
+        string(row.id) ??
+        string(row.promptId) ??
+        string(row.prompt_id) ??
+        `queue-${index}`;
+      const prior = previous.find((item) => item.id === id);
+      const stateRaw = string(row.state);
+      const state: PromptQueueEntry["state"] =
+        row.sendNow === true || stateRaw === "interjected"
+          ? "interjected"
+          : stateRaw === "sending"
+            ? "sending"
+            : "queued";
+      const created =
+        string(row.createdAt) ?? string(row.created_at) ?? undefined;
+      return {
+        id,
+        text: string(row.text) ?? string(row.prompt) ?? string(row.content) ?? prior?.text ?? "",
+        state,
+        position: number(row.position) ?? index,
+        createdAt: created ? Date.parse(created) || prior?.createdAt || Date.now() : prior?.createdAt ?? Date.now(),
+        version: number(row.version) ?? prior?.version ?? 0,
+        source: "cli" as const,
+        attachments: prior?.attachments,
+      } satisfies PromptQueueEntry;
+    })
+    .sort((a, b) => a.position - b.position);
 }
 
 function normalizeInboundExtension(message: JsonRpcMessage): JsonRpcMessage {
@@ -672,9 +730,20 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
           { type: "system", id: uid(), text: event.message, ts: Date.now(), kind: "error" },
         ],
       };
+    case "prompt_queue":
+      return {
+        ...session,
+        blocks: session.blocks.map((block) =>
+          block.type === "system"
+            ? { ...block, text: event.entries.map((e) => e.text).join("\n\n") }
+            : block,
+        ),
+      };
     case "session_ready":
       return event.session;
   }
+  // Default
+  return session;
 }
 
 export class AcpBridge implements GrokBridge {
@@ -683,6 +752,12 @@ export class AcpBridge implements GrokBridge {
   private listeners = new Set<(event: BridgeEvent) => void>();
   private pending = new Map<RpcId, PendingRequest>();
   private interactions = new Map<string, PendingInteraction>();
+  /** Plan decisions keyed by `sessionId:rpcId` — first answer wins. */
+  private resolvedPlanDecisions = new Map<string, PermissionOption>();
+  /** Same decisions keyed by blockId for UI duplicate clicks after map delete. */
+  private resolvedPlanByBlock = new Map<string, PermissionOption>();
+  /** Last CLI-authoritative queue snapshot per session (from x.ai/queue/changed). */
+  private cliQueues = new Map<string, PromptQueueEntry[]>();
   private cursors = new Map<string, ContentCursor>();
   private catalogue = new Map<string, SessionMeta>();
   private replaying = new Map<string, Session>();
@@ -1131,6 +1206,11 @@ export class AcpBridge implements GrokBridge {
       this.handleQuestion(message.id!, message.params);
       return;
     }
+    if (message.method === "x.ai/queue/changed" || message.method === "_x.ai/queue/changed") {
+      this.handleQueueChanged(message.params);
+      void this.sendRaw({ jsonrpc: "2.0", id: message.id, result: {} });
+      return;
+    }
     void this.sendRaw({
       jsonrpc: "2.0",
       id: message.id,
@@ -1155,11 +1235,46 @@ export class AcpBridge implements GrokBridge {
       this.captureModelState(paramsValue);
       return;
     }
+    if (method === "x.ai/queue/changed" || method === "_x.ai/queue/changed") {
+      this.handleQueueChanged(paramsValue);
+      return;
+    }
     if (method === "x.ai/session/prompt_complete") {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
       if (sessionId) this.finishTurn(sessionId, record(params?.usage));
     }
+  }
+
+  private handleQueueChanged(paramsValue: unknown) {
+    const params = record(paramsValue) ?? {};
+    const sessionId = string(params.sessionId);
+    if (!sessionId) return;
+    const raw =
+      params.queue ??
+      params.entries ??
+      record(params.update)?.queue ??
+      record(params.update)?.entries ??
+      [];
+    const previous = this.cliQueues.get(sessionId) ?? [];
+    const entries = normalizePromptQueue(raw, previous);
+    this.cliQueues.set(sessionId, entries);
+    this.emit({ type: "prompt_queue", sessionId, entries });
+  }
+
+  /** Fire-and-forget notification to the agent; failures are swallowed. */
+  private queueNotify(method: string, sessionId: string, params: Record<string, unknown>): void {
+    void this.sendRaw({
+      jsonrpc: "2.0",
+      method: wireMethod(method),
+      params: {
+        sessionId,
+        clientIdentifier: "grox-desktop",
+        ...params,
+      },
+    }).catch(() => {
+      // Older CLIs ignore unknown notifications.
+    });
   }
 
   private handleSessionUpdate(sessionId: string, updateValue: unknown) {
@@ -2060,6 +2175,165 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
+  async interject(sessionId: string, text: string, options: PromptOptions): Promise<InterjectResult> {
+    await this.ready;
+    this.knownSessions.add(sessionId);
+    const trimmed = text.trim();
+    const interjectionId = crypto.randomUUID();
+    const content = promptContent(trimmed, options.attachments ?? []);
+    try {
+      await this.request(
+        "x.ai/interject",
+        {
+          sessionId,
+          text: trimmed,
+          interjectionId,
+          content,
+        },
+        30_000,
+      );
+      this.emit({
+        type: "block_add",
+        sessionId,
+        block: {
+          type: "user",
+          id: interjectionId,
+          text: trimmed,
+          attachments: (options.attachments ?? []).map(({ id, kind, name, mime, size, data, path }) => ({
+            id,
+            kind,
+            name,
+            mime,
+            size,
+            ...(kind === "image" && data ? { data } : {}),
+            ...(kind === "path" && path ? { path } : {}),
+          })),
+          ts: Date.now(),
+        },
+      });
+      return {
+        state: "interjected",
+        message: "插话已提交到当前回合",
+        fallback: false,
+        entryId: interjectionId,
+      };
+    } catch (error) {
+      if (isMethodUnavailable(error)) {
+        return {
+          state: "queued_head",
+          message: "当前 CLI 不支持即时插话，已降级为队首排队",
+          fallback: true,
+          entryId: interjectionId,
+        };
+      }
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+  }
+
+  async enqueuePrompt(
+    sessionId: string,
+    text: string,
+    options: PromptOptions,
+    queueOptions: { promptId?: string; sendNow?: boolean } = {},
+  ): Promise<QueueOperationReceipt> {
+    await this.ready;
+    this.knownSessions.add(sessionId);
+    const trimmed = text.trim();
+    const promptId = queueOptions.promptId ?? uid();
+    const sendNow = queueOptions.sendNow === true;
+    const content = promptContent(trimmed, options.attachments ?? []);
+
+    // Concurrent session/prompt with queue meta — CLI owns execution when supported.
+    void this.requestRaw(
+      ACP_METHODS.sessionPrompt,
+      {
+        sessionId,
+        prompt: content,
+        _meta: {
+          promptId,
+          sendNow,
+          clientIdentifier: "grox-desktop",
+        },
+      },
+      1_800_000,
+    ).catch((error) => {
+      this.emit({
+        type: "error",
+        sessionId,
+        message: `队列消息失败：${errorText(error)}`,
+      });
+    });
+
+    return {
+      operationId: uid(),
+      entryId: promptId,
+      state: sendNow ? "interjected" : "queued",
+      message: sendNow ? "插话已置顶并提交到 CLI 队列" : "消息已提交到 CLI 队列",
+      fallback: false,
+    };
+  }
+
+  async editQueuedPrompt(sessionId: string, id: string, text: string): Promise<QueueOperationReceipt> {
+    this.queueNotify("x.ai/queue/edit", sessionId, { id, newText: text });
+    return {
+      operationId: uid(),
+      entryId: id,
+      state: "updated",
+      message: "编辑已提交，等待 CLI 确认",
+    };
+  }
+
+  async removeQueuedPrompt(
+    sessionId: string,
+    id: string,
+    version = 0,
+  ): Promise<QueueOperationReceipt> {
+    this.queueNotify("x.ai/queue/remove", sessionId, { id, expectedVersion: version });
+    return {
+      operationId: uid(),
+      entryId: id,
+      state: "removed",
+      message: "队列消息已移除",
+    };
+  }
+
+  async reorderQueuedPrompt(sessionId: string, orderedIds: string[]): Promise<QueueOperationReceipt> {
+    this.queueNotify("x.ai/queue/reorder", sessionId, { orderedIds });
+    return {
+      operationId: uid(),
+      state: "reordered",
+      message: "队列顺序已更新",
+    };
+  }
+
+  async clearQueuedPrompts(sessionId: string): Promise<QueueOperationReceipt> {
+    this.queueNotify("x.ai/queue/clear", sessionId, {});
+    this.cliQueues.set(sessionId, []);
+    return {
+      operationId: uid(),
+      state: "cleared",
+      message: "等待队列已清空",
+    };
+  }
+
+  async interjectQueuedPrompt(
+    sessionId: string,
+    id: string,
+    options: { text?: string; version?: number } = {},
+  ): Promise<QueueOperationReceipt> {
+    this.queueNotify("x.ai/queue/interject", sessionId, {
+      id,
+      expectedVersion: options.version ?? 0,
+      ...(options.text?.trim() ? { newText: options.text.trim() } : {}),
+    });
+    return {
+      operationId: uid(),
+      entryId: id,
+      state: "interjected",
+      message: "插话请求已提交；若 CLI 不支持即时插话，将按队首消息处理",
+    };
+  }
+
   async prompt(sessionId: string, text: string, options: PromptOptions): Promise<void> {
     await this.ready;
     this.knownSessions.add(sessionId);
@@ -2161,13 +2435,51 @@ export class AcpBridge implements GrokBridge {
     });
   }
 
-  respondPermission(sessionId: string, blockId: string, option: PermissionOption): void {
+  respondPermission(
+    sessionId: string,
+    blockId: string,
+    option: PermissionOption,
+  ): { duplicate: boolean; message?: string } {
+    const priorByBlock = this.resolvedPlanByBlock.get(blockId);
+    if (priorByBlock) {
+      this.emit({ type: "permission_resolved", sessionId, blockId, option: priorByBlock });
+      return { duplicate: true, message: "该计划决策已经提交，未重复执行" };
+    }
+
     const pending = this.interactions.get(blockId);
-    if (!pending || pending.sessionId !== sessionId) return;
+    if (!pending || pending.sessionId !== sessionId) {
+      return { duplicate: true, message: "该请求已处理" };
+    }
+
+    if (pending.kind === "plan") {
+      const key = `${sessionId}:${String(pending.rpcId)}`;
+      const prior = this.resolvedPlanDecisions.get(key);
+      if (prior) {
+        this.interactions.delete(blockId);
+        this.resolvedPlanByBlock.set(blockId, prior);
+        this.emit({ type: "permission_resolved", sessionId, blockId, option: prior });
+        return { duplicate: true, message: "该计划决策已经提交，未重复执行" };
+      }
+      this.resolvedPlanDecisions.set(key, option);
+      this.resolvedPlanByBlock.set(blockId, option);
+      while (this.resolvedPlanDecisions.size > 128) {
+        const oldest = this.resolvedPlanDecisions.keys().next().value;
+        if (oldest === undefined) break;
+        this.resolvedPlanDecisions.delete(oldest);
+      }
+      while (this.resolvedPlanByBlock.size > 128) {
+        const oldest = this.resolvedPlanByBlock.keys().next().value;
+        if (oldest === undefined) break;
+        this.resolvedPlanByBlock.delete(oldest);
+      }
+    }
+
     this.interactions.delete(blockId);
 
     let result: unknown;
     if (pending.kind === "plan") {
+      // Answer the original x.ai/exit_plan_mode request only — never invent a
+      // synthetic "[Plan approved]" user prompt that would spawn a second turn.
       result = { outcome: option === "deny" ? "cancelled" : "approved" };
     } else {
       const optionId = pending.optionIds[option];
@@ -2176,9 +2488,15 @@ export class AcpBridge implements GrokBridge {
         : { outcome: { outcome: "cancelled" } };
     }
     void this.sendRaw({ jsonrpc: "2.0", id: pending.rpcId, result }).catch((error) => {
+      // Roll back the lock so the operator can retry if the wire write failed.
+      if (pending.kind === "plan") {
+        this.resolvedPlanDecisions.delete(`${sessionId}:${String(pending.rpcId)}`);
+        this.resolvedPlanByBlock.delete(blockId);
+      }
       this.emit({ type: "error", sessionId, message: errorText(error) });
     });
     this.emit({ type: "permission_resolved", sessionId, blockId, option });
+    return { duplicate: false };
   }
 
   respondQuestion(sessionId: string, blockId: string, response: QuestionResponse): void {

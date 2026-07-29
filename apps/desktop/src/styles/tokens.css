@@ -588,6 +588,67 @@ html[data-reduce-motion="1"] * {
     line-height: 1.7;
   }
 
+  /* KaTeX */
+  .katex {
+    font-size: 1.05em;
+  }
+  .katex-display {
+    margin: 1.2em 0;
+  }
+  .md-mermaid {
+    margin: 1.5em 0;
+    background: var(--color-void);
+    border: 1px solid var(--color-line2);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+  .md-mermaid .md-mermaid-fallback {
+    display: none;
+  }
+  .md-mermaid.md-mermaid-ready svg {
+    width: 100% !important;
+    max-height: 420px;
+    overflow: auto;
+  }
+  .md-mermaid-error {
+    color: var(--color-red);
+    font-size: 0.85em;
+    padding: 1em;
+    background: var(--color-void);
+  }
+
+  /* Mermaid */
+  .md-mermaid {
+    margin: 1.5em 0;
+    background: var(--color-void);
+    border: 1px solid var(--color-line2);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    box-shadow: var(--shadow-soft);
+  }
+  .md-mermaid .md-mermaid-fallback {
+    display: none;
+  }
+  .md-mermaid.md-mermaid-ready svg {
+    width: 100% !important;
+    max-height: 420px;
+    overflow: auto;
+  }
+  .md-mermaid-error {
+    color: var(--color-red);
+    font-size: 0.85em;
+    padding: 1em;
+    background: var(--color-void);
+  }
+
+  /* KaTeX */
+  .katex {
+    font-size: 1.05em;
+  }
+  .katex-display {
+    margin: 1.2em 0;
+  }
+
   /* syntax accents — monochrome first, functional color for literals */
   .hljs-comment,
   .hljs-quote {

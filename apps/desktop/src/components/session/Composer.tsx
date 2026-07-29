@@ -80,11 +80,19 @@ export function Composer() {
   const { onCompositionStart, onCompositionEnd, isImeBlocking } = useImeGuard();
 
   const sendPrompt = useDesktop((s) => s.sendPrompt);
+  const interjectPrompt = useDesktop((s) => s.interjectPrompt);
   const removeQueuedPrompt = useDesktop((s) => s.removeQueuedPrompt);
   const reorderQueuedPrompt = useDesktop((s) => s.reorderQueuedPrompt);
   const clearPromptQueue = useDesktop((s) => s.clearPromptQueue);
+  const interjectQueuedPrompt = useDesktop((s) => s.interjectQueuedPrompt);
+  const editQueuedPrompt = useDesktop((s) => s.editQueuedPrompt);
+  const queueNotice = useDesktop((s) => s.queueNotice);
+  const dismissQueueNotice = useDesktop((s) => s.dismissQueueNotice);
   const [queueDragIndex, setQueueDragIndex] = useState<number | null>(null);
   const [queueDropIndex, setQueueDropIndex] = useState<number | null>(null);
+  const [interjecting, setInterjecting] = useState(false);
+  const [editingQueueId, setEditingQueueId] = useState<string | null>(null);
+  const [editingQueueText, setEditingQueueText] = useState("");
   const activeId = useDesktop((s) => s.activeId);
   const session = useDesktop((s) => (s.activeId ? s.sessions[s.activeId] : null));
   const composer = useDesktop((s) => (s.activeId ? s.sessionComposers[s.activeId] : undefined));
@@ -115,8 +123,37 @@ export function Composer() {
   const workspaceFiles = useDesktop((s) => s.workspaceFiles);
   const refreshWorkspaceFiles = useDesktop((s) => s.refreshWorkspaceFiles);
 
-  const running =
-    status === "running" || status === "awaiting_permission" || status === "awaiting_input";
+  /** Turn is in flight — Enter queues, Ctrl+Enter interjects. */
+  const busy = status === "running";
+  /** Plan / permission / question gate — typing allowed, submit blocked with reason. */
+  const gated = status === "awaiting_permission" || status === "awaiting_input";
+  const running = busy || gated;
+  const hasPendingPlan = Boolean(
+    session &&
+      status === "awaiting_permission" &&
+      session.blocks.some(
+        (block) =>
+          block.type === "permission" && !block.resolved && block.id.startsWith("plan-approval-"),
+      ),
+  );
+  const hasPendingPermission = status === "awaiting_permission" && !hasPendingPlan;
+  const hasPendingQuestion = status === "awaiting_input";
+  const canSubmit = Boolean(text.trim() || attachments.length > 0) && !readingFiles && !interjecting;
+
+  const submitBlockReason = useMemo(() => {
+    if (!gated) return "";
+    if (hasPendingQuestion) return zh ? "请先回答当前问题再发送" : "Answer the open question before sending";
+    if (hasPendingPlan) return zh ? "请先批准或拒绝当前计划再发送" : "Approve or reject the plan before sending";
+    if (hasPendingPermission) return zh ? "请先处理当前权限请求再发送" : "Resolve the permission request before sending";
+    return zh ? "请先处理当前交互再发送" : "Resolve the pending interaction before sending";
+  }, [gated, hasPendingQuestion, hasPendingPlan, hasPendingPermission, zh]);
+
+  // Auto-dismiss queue receipts after a few seconds.
+  useEffect(() => {
+    if (!queueNotice) return;
+    const timer = window.setTimeout(() => dismissQueueNotice(), 4200);
+    return () => window.clearTimeout(timer);
+  }, [queueNotice, dismissQueueNotice]);
 
   const slashCommands: SlashCmd[] = [
     { id: "/plan", hint: zh ? "计划模式 — 操作前先规划" : "plan mode — think before acting", run: () => setMode("plan") },
@@ -275,14 +312,40 @@ export function Composer() {
     }
   };
 
-  const send = () => {
-    const t = text.trim();
-    if ((!t && attachments.length === 0) || readingFiles) return;
-    sendPrompt(t, attachments);
+  const clearComposer = () => {
     setText("");
     setAttachments([]);
     setAttachmentError("");
     setCursor(0);
+  };
+
+  const send = () => {
+    const t = text.trim();
+    if ((!t && attachments.length === 0) || readingFiles || interjecting) return;
+    // Keep the draft when gated — sendPrompt only posts a notice.
+    if (gated) {
+      sendPrompt(t, attachments);
+      return;
+    }
+    sendPrompt(t, attachments);
+    clearComposer();
+  };
+
+  const interject = () => {
+    const t = text.trim();
+    if ((!t && attachments.length === 0) || readingFiles || interjecting) return;
+    if (gated) {
+      sendPrompt(t, attachments);
+      return;
+    }
+    if (!busy) {
+      send();
+      return;
+    }
+    setInterjecting(true);
+    void interjectPrompt(t, attachments)
+      .then(() => clearComposer())
+      .finally(() => setInterjecting(false));
   };
 
   const pickAtFile = (entry: WorkspaceEntry) => {
@@ -387,6 +450,15 @@ export function Composer() {
         return;
       }
     }
+
+    // Ctrl+Enter → same-turn interject while busy; plain send when idle.
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      interject();
+      return;
+    }
+
+    // Enter → send / queue / blocked notice. Shift+Enter inserts a newline.
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       send();
@@ -450,145 +522,268 @@ export function Composer() {
           </div>
         )}
 
-        {queue.length > 0 && (
+        {(queueNotice || queue.length > 0) && (
           <div className="mb-2 overflow-hidden rounded-lg border border-line2 bg-raise">
-            <div className="flex h-8 items-center justify-between border-b border-line px-3">
-              <span className="text-[12px] font-medium text-mute">
-                {zh ? `队列 ${queue.length}` : `Queued ${queue.length}`}
-              </span>
-              <div className="flex items-center gap-2">
-                {queue.length > 1 && (
-                  <span className="text-[11px] text-faint">
-                    {zh ? "拖拽或箭头调整顺序" : "Drag or arrows to reorder"}
-                  </span>
-                )}
+            {queueNotice && (
+              <div
+                role="status"
+                className={`flex items-center justify-between gap-2 border-b border-line px-3 py-1.5 text-[12px] ${
+                  queueNotice.state === "blocked" || queueNotice.state === "duplicate"
+                    ? "bg-gold/10 text-gold"
+                    : queueNotice.state === "interjected"
+                      ? "bg-acc/10 text-acc"
+                      : "text-mute"
+                }`}
+              >
+                <span className="min-w-0 flex-1 truncate">{queueNotice.message}</span>
                 <button
-                  onClick={() => activeId && clearPromptQueue(activeId)}
-                  className="text-[11.5px] text-faint transition-colors hover:text-fg"
+                  type="button"
+                  onClick={dismissQueueNotice}
+                  className="shrink-0 text-faint hover:text-fg"
+                  title={zh ? "关闭" : "Dismiss"}
                 >
-                  {zh ? "清空" : "Clear"}
+                  <Icon name="x" size={10} />
                 </button>
               </div>
-            </div>
-            <div
-              className="max-h-40 overflow-y-auto py-1"
-              onDragLeave={(event) => {
-                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
-                  setQueueDropIndex(null);
-                }
-              }}
-            >
-              {queue.map((item, index) => {
-                const canMoveUp = index > 0;
-                const canMoveDown = index < queue.length - 1;
-                const isDragging = queueDragIndex === index;
-                const isDropTarget = queueDropIndex === index && queueDragIndex !== null && queueDragIndex !== index;
-                return (
-                  <div
-                    key={item.id}
-                    draggable={queue.length > 1}
-                    onDragStart={(event) => {
-                      if (queue.length <= 1) return;
-                      setQueueDragIndex(index);
-                      event.dataTransfer.effectAllowed = "move";
-                      event.dataTransfer.setData("text/plain", String(index));
-                      // Firefox requires data; some engines need a drag image delay.
-                      if (event.currentTarget instanceof HTMLElement) {
-                        event.currentTarget.style.opacity = "0.55";
-                      }
-                    }}
-                    onDragEnd={(event) => {
-                      if (event.currentTarget instanceof HTMLElement) {
-                        event.currentTarget.style.opacity = "";
-                      }
-                      setQueueDragIndex(null);
-                      setQueueDropIndex(null);
-                    }}
-                    onDragOver={(event) => {
-                      if (queueDragIndex === null || queueDragIndex === index) return;
-                      event.preventDefault();
-                      event.dataTransfer.dropEffect = "move";
-                      if (queueDropIndex !== index) setQueueDropIndex(index);
-                    }}
-                    onDrop={(event) => {
-                      event.preventDefault();
-                      const from =
-                        queueDragIndex ??
-                        Number.parseInt(event.dataTransfer.getData("text/plain"), 10);
-                      if (
-                        activeId &&
-                        Number.isFinite(from) &&
-                        from !== index &&
-                        from >= 0 &&
-                        from < queue.length
-                      ) {
-                        reorderQueuedPrompt(activeId, from, index);
-                      }
-                      setQueueDragIndex(null);
-                      setQueueDropIndex(null);
-                    }}
-                    className={`flex items-center gap-1.5 px-2 py-1.5 transition-colors ${
-                      isDragging ? "bg-high/40" : isDropTarget ? "bg-acc/10" : "hover:bg-high/40"
-                    } ${queue.length > 1 ? "cursor-grab active:cursor-grabbing" : ""}`}
-                  >
+            )}
+            {queue.length > 0 && (
+              <>
+                <div className="flex h-8 items-center justify-between border-b border-line px-3">
+                  <span className="text-[12px] font-medium text-mute">
+                    {zh ? `队列 ${queue.length}` : `Queued ${queue.length}`}
+                  </span>
+                  <div className="flex items-center gap-2">
                     {queue.length > 1 && (
-                      <span
-                        className="flex h-6 w-4 shrink-0 items-center justify-center text-faint"
-                        title={zh ? "拖拽调整顺序" : "Drag to reorder"}
-                        aria-hidden
-                      >
-                        <Icon name="grip" size={10} />
+                      <span className="text-[11px] text-faint">
+                        {zh ? "拖拽或箭头调整顺序" : "Drag or arrows to reorder"}
                       </span>
                     )}
-                    <span className="tnum w-4 shrink-0 text-center text-[11px] text-faint">{index + 1}</span>
-                    <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg2">
-                      {item.text || item.attachments.map((a) => attachmentLabel(a)).join(", ")}
-                    </span>
-                    {item.attachments.length > 0 && (
-                      <span className="shrink-0 text-[11px] text-faint">{item.attachments.length}</span>
-                    )}
-                    {queue.length > 1 && (
-                      <div className="flex shrink-0 items-center">
-                        <button
-                          type="button"
-                          disabled={!canMoveUp || !activeId}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            if (activeId && canMoveUp) reorderQueuedPrompt(activeId, index, index - 1);
-                          }}
-                          className="flex h-6 w-5 items-center justify-center rounded-md text-faint transition-colors hover:bg-high hover:text-fg disabled:cursor-default disabled:opacity-25 disabled:hover:bg-transparent disabled:hover:text-faint"
-                          title={zh ? "上移" : "Move up"}
-                          aria-label={zh ? "上移" : "Move up"}
-                        >
-                          <Icon name="chevronUp" size={11} />
-                        </button>
-                        <button
-                          type="button"
-                          disabled={!canMoveDown || !activeId}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            if (activeId && canMoveDown) reorderQueuedPrompt(activeId, index, index + 1);
-                          }}
-                          className="flex h-6 w-5 items-center justify-center rounded-md text-faint transition-colors hover:bg-high hover:text-fg disabled:cursor-default disabled:opacity-25 disabled:hover:bg-transparent disabled:hover:text-faint"
-                          title={zh ? "下移" : "Move down"}
-                          aria-label={zh ? "下移" : "Move down"}
-                        >
-                          <Icon name="chevronDown" size={11} />
-                        </button>
-                      </div>
-                    )}
                     <button
-                      type="button"
-                      onClick={() => activeId && removeQueuedPrompt(activeId, item.id)}
-                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-faint hover:bg-high hover:text-fg"
-                      title={zh ? "移除" : "Remove"}
+                      onClick={() => activeId && clearPromptQueue(activeId)}
+                      className="text-[11.5px] text-faint transition-colors hover:text-fg"
                     >
-                      <Icon name="x" size={10} />
+                      {zh ? "清空" : "Clear"}
                     </button>
                   </div>
-                );
-              })}
-            </div>
+                </div>
+                <div
+                  className="max-h-40 overflow-y-auto py-1"
+                  onDragLeave={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                      setQueueDropIndex(null);
+                    }
+                  }}
+                >
+                  {queue.map((item, index) => {
+                    const canMoveUp = index > 0;
+                    const canMoveDown = index < queue.length - 1;
+                    const isDragging = queueDragIndex === index;
+                    const isDropTarget =
+                      queueDropIndex === index && queueDragIndex !== null && queueDragIndex !== index;
+                    const stateLabel =
+                      item.state === "interjected"
+                        ? zh
+                          ? "插话优先"
+                          : "Interject"
+                        : item.state === "sending"
+                          ? zh
+                            ? "发送中"
+                            : "Sending"
+                          : zh
+                            ? "已入队"
+                            : "Queued";
+                    return (
+                      <div
+                        key={item.id}
+                        draggable={queue.length > 1 && item.state === "queued"}
+                        onDragStart={(event) => {
+                          if (queue.length <= 1 || item.state !== "queued") return;
+                          setQueueDragIndex(index);
+                          event.dataTransfer.effectAllowed = "move";
+                          event.dataTransfer.setData("text/plain", String(index));
+                          if (event.currentTarget instanceof HTMLElement) {
+                            event.currentTarget.style.opacity = "0.55";
+                          }
+                        }}
+                        onDragEnd={(event) => {
+                          if (event.currentTarget instanceof HTMLElement) {
+                            event.currentTarget.style.opacity = "";
+                          }
+                          setQueueDragIndex(null);
+                          setQueueDropIndex(null);
+                        }}
+                        onDragOver={(event) => {
+                          if (queueDragIndex === null || queueDragIndex === index) return;
+                          event.preventDefault();
+                          event.dataTransfer.dropEffect = "move";
+                          if (queueDropIndex !== index) setQueueDropIndex(index);
+                        }}
+                        onDrop={(event) => {
+                          event.preventDefault();
+                          const from =
+                            queueDragIndex ??
+                            Number.parseInt(event.dataTransfer.getData("text/plain"), 10);
+                          if (
+                            activeId &&
+                            Number.isFinite(from) &&
+                            from !== index &&
+                            from >= 0 &&
+                            from < queue.length
+                          ) {
+                            reorderQueuedPrompt(activeId, from, index);
+                          }
+                          setQueueDragIndex(null);
+                          setQueueDropIndex(null);
+                        }}
+                        className={`flex items-center gap-1.5 px-2 py-1.5 transition-colors ${
+                          isDragging
+                            ? "bg-high/40"
+                            : isDropTarget
+                              ? "bg-acc/10"
+                              : item.state === "interjected"
+                                ? "bg-acc/5"
+                                : "hover:bg-high/40"
+                        } ${queue.length > 1 && item.state === "queued" ? "cursor-grab active:cursor-grabbing" : ""}`}
+                      >
+                        {queue.length > 1 && (
+                          <span
+                            className="flex h-6 w-4 shrink-0 items-center justify-center text-faint"
+                            title={zh ? "拖拽调整顺序" : "Drag to reorder"}
+                            aria-hidden
+                          >
+                            <Icon name="grip" size={10} />
+                          </span>
+                        )}
+                        <span className="tnum w-4 shrink-0 text-center text-[11px] text-faint">
+                          {index + 1}
+                        </span>
+                        <span
+                          className={`shrink-0 rounded px-1 py-0.5 font-mono text-[9.5px] ${
+                            item.state === "interjected"
+                              ? "bg-acc/15 text-acc"
+                              : item.state === "sending"
+                                ? "bg-gold/15 text-gold"
+                                : "bg-high text-faint"
+                          }`}
+                        >
+                          {stateLabel}
+                        </span>
+                        {editingQueueId === item.id ? (
+                          <input
+                            autoFocus
+                            value={editingQueueText}
+                            onChange={(event) => setEditingQueueText(event.target.value)}
+                            onClick={(event) => event.stopPropagation()}
+                            onKeyDown={(event) => {
+                              if (event.key === "Escape") {
+                                event.preventDefault();
+                                setEditingQueueId(null);
+                                return;
+                              }
+                              if (event.key === "Enter" && !event.shiftKey) {
+                                event.preventDefault();
+                                if (activeId && editingQueueText.trim()) {
+                                  editQueuedPrompt(activeId, item.id, editingQueueText);
+                                }
+                                setEditingQueueId(null);
+                              }
+                            }}
+                            onBlur={() => {
+                              if (activeId && editingQueueText.trim() && editingQueueText.trim() !== item.text) {
+                                editQueuedPrompt(activeId, item.id, editingQueueText);
+                              }
+                              setEditingQueueId(null);
+                            }}
+                            className="min-w-0 flex-1 rounded border border-acc/40 bg-void px-2 py-0.5 text-[12.5px] text-fg outline-none"
+                          />
+                        ) : (
+                          <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg2">
+                            {item.text || item.attachments.map((a) => attachmentLabel(a)).join(", ")}
+                          </span>
+                        )}
+                        {item.attachments.length > 0 && editingQueueId !== item.id && (
+                          <span className="shrink-0 text-[11px] text-faint">
+                            {item.attachments.length}
+                          </span>
+                        )}
+                        {item.state === "queued" && activeId && editingQueueId !== item.id && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setEditingQueueId(item.id);
+                                setEditingQueueText(item.text);
+                              }}
+                              className="shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] text-mute hover:bg-high hover:text-fg"
+                              title={zh ? "编辑" : "Edit"}
+                            >
+                              {zh ? "编辑" : "Edit"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                interjectQueuedPrompt(activeId, item.id);
+                              }}
+                              className="shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] text-acc hover:bg-acc/10"
+                              title={zh ? "置顶优先发送" : "Promote to front"}
+                            >
+                              {zh ? "插话" : "Bump"}
+                            </button>
+                          </>
+                        )}
+                        {queue.length > 1 && item.state === "queued" && (
+                          <div className="flex shrink-0 items-center">
+                            <button
+                              type="button"
+                              disabled={!canMoveUp || !activeId}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                if (activeId && canMoveUp) {
+                                  reorderQueuedPrompt(activeId, index, index - 1);
+                                }
+                              }}
+                              className="flex h-6 w-5 items-center justify-center rounded-md text-faint transition-colors hover:bg-high hover:text-fg disabled:cursor-default disabled:opacity-25 disabled:hover:bg-transparent disabled:hover:text-faint"
+                              title={zh ? "上移" : "Move up"}
+                              aria-label={zh ? "上移" : "Move up"}
+                            >
+                              <Icon name="chevronUp" size={11} />
+                            </button>
+                            <button
+                              type="button"
+                              disabled={!canMoveDown || !activeId}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                if (activeId && canMoveDown) {
+                                  reorderQueuedPrompt(activeId, index, index + 1);
+                                }
+                              }}
+                              className="flex h-6 w-5 items-center justify-center rounded-md text-faint transition-colors hover:bg-high hover:text-fg disabled:cursor-default disabled:opacity-25 disabled:hover:bg-transparent disabled:hover:text-faint"
+                              title={zh ? "下移" : "Move down"}
+                              aria-label={zh ? "下移" : "Move down"}
+                            >
+                              <Icon name="chevronDown" size={11} />
+                            </button>
+                          </div>
+                        )}
+                        <button
+                          type="button"
+                          disabled={item.state !== "queued"}
+                          onClick={() =>
+                            activeId && item.state === "queued" && removeQueuedPrompt(activeId, item.id)
+                          }
+                          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-faint hover:bg-high hover:text-fg disabled:opacity-25"
+                          title={zh ? "移除" : "Remove"}
+                        >
+                          <Icon name="x" size={10} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
           </div>
         )}
 
@@ -689,12 +884,25 @@ export function Composer() {
               onBlur={() => setComposerFocused(false)}
               rows={1}
               placeholder={
-                running
-                  ? (zh ? "Grok 正在处理 — 回车加入队列…" : "Grok is working — Enter to queue…")
-                  : (zh ? "发送给 Grok… · @ 引用文件 · 拖入路径" : "Message Grok… · @ files · drop paths")
+                gated
+                  ? submitBlockReason ||
+                    (zh ? "可以继续输入；请先处理当前交互再发送…" : "Keep typing; resolve the open interaction first…")
+                  : busy
+                    ? zh
+                      ? "继续输入；Enter 排队，Ctrl+Enter 插话…"
+                      : "Keep typing; Enter queues, Ctrl+Enter interjects…"
+                    : zh
+                      ? "发送给 Grok… · @ 引用文件 · 拖入路径"
+                      : "Message Grok… · @ files · drop paths"
               }
               className="block w-full resize-none bg-transparent px-4 pb-1 pt-3 text-[14.5px] leading-relaxed text-fg placeholder:text-faint focus:outline-none"
             />
+          )}
+
+          {gated && submitBlockReason && (
+            <div className="border-t border-gold/20 bg-gold/5 px-3 py-1.5 text-[12px] text-gold">
+              {submitBlockReason}
+            </div>
           )}
 
           <div className="flex flex-wrap items-center gap-1.5 px-2.5 pb-2.5 pt-1">
@@ -738,18 +946,49 @@ export function Composer() {
               </button>
             )}
 
-            <button
-              onClick={send}
-              disabled={(!text.trim() && attachments.length === 0) || readingFiles}
-              title={running ? (zh ? "加入队列" : "Queue") : (zh ? "发送" : "Send")}
-              className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
-                text.trim() || attachments.length > 0
-                  ? "bg-acc text-base hover:bg-acc-deep"
-                  : "bg-high text-faint"
-              }`}
-            >
-              <Icon name="arrowUp" size={13} strokeWidth={2} />
-            </button>
+            {busy && (
+              <>
+                <button
+                  type="button"
+                  onClick={send}
+                  disabled={!canSubmit}
+                  title={zh ? "加入队列 (Enter)" : "Queue (Enter)"}
+                  className="flex h-7 items-center gap-1 rounded-md border border-line2 px-2.5 text-[11.5px] text-fg2 transition-colors hover:bg-high disabled:opacity-40"
+                >
+                  {zh ? "加入队列" : "Queue"}
+                </button>
+                <button
+                  type="button"
+                  onClick={interject}
+                  disabled={!canSubmit}
+                  title={zh ? "插入当前回合 (Ctrl+Enter)" : "Interject current turn (Ctrl+Enter)"}
+                  className="flex h-7 items-center gap-1 rounded-md border border-acc/40 bg-acc/10 px-2.5 text-[11.5px] text-acc transition-colors hover:bg-acc/15 disabled:opacity-40"
+                >
+                  {interjecting ? (zh ? "插话中…" : "Interjecting…") : zh ? "插话" : "Interject"}
+                </button>
+              </>
+            )}
+
+            {!busy && (
+              <button
+                onClick={send}
+                disabled={!canSubmit}
+                title={
+                  gated
+                    ? submitBlockReason
+                    : zh
+                      ? "发送"
+                      : "Send"
+                }
+                className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+                  canSubmit && !gated
+                    ? "bg-acc text-base hover:bg-acc-deep"
+                    : "bg-high text-faint"
+                }`}
+              >
+                <Icon name="arrowUp" size={13} strokeWidth={2} />
+              </button>
+            )}
           </div>
           {attachmentError && <p className="border-t border-red/15 px-3 py-1.5 text-[12px] text-red">{attachmentError}</p>}
         </div>
@@ -757,12 +996,16 @@ export function Composer() {
         <div className="mt-2 flex items-center justify-between px-1.5">
           <span className="text-[11.5px] text-faint">
             {zh
-              ? running
-                ? "⏎ 加入队列 · ⇧⏎ 换行 · @ 文件 · / 命令"
-                : "⏎ 发送 · ⇧⏎ 换行 · @ 文件 · / 命令"
-              : running
-                ? "⏎ queue · ⇧⏎ newline · @ files · / commands"
-                : "⏎ send · ⇧⏎ newline · @ files · / commands"}
+              ? gated
+                ? "可继续输入 · 先处理计划/权限/问题 · ⇧⏎ 换行"
+                : busy
+                  ? "⏎ 加入队列 · ⌃⏎ 插话 · ⇧⏎ 换行 · @ 文件 · / 命令"
+                  : "⏎ 发送 · ⇧⏎ 换行 · @ 文件 · / 命令"
+              : gated
+                ? "Keep typing · resolve plan/permission/question first · ⇧⏎ newline"
+                : busy
+                  ? "⏎ queue · ⌃⏎ interject · ⇧⏎ newline · @ files · / commands"
+                  : "⏎ send · ⇧⏎ newline · @ files · / commands"}
           </span>
           <span className="text-[11.5px] text-faint">
             {zh

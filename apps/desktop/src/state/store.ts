@@ -102,6 +102,18 @@ export interface QueuedPrompt {
   text: string;
   attachments: PromptAttachment[];
   createdAt: number;
+  state: "queued" | "interjected" | "sending";
+  version?: number;
+  source?: "local" | "cli";
+}
+
+/** Ephemeral operator-facing receipt for queue / interject / gate actions. */
+export interface QueueNotice {
+  id: string;
+  message: string;
+  state: import("../bridge/types").QueueReceiptState;
+  entryId?: string;
+  at: number;
 }
 
 interface DesktopState {
@@ -145,6 +157,8 @@ interface DesktopState {
   permissionMode: PermissionMode;
   sessionComposers: Record<string, SessionComposerState>;
   promptQueues: Record<string, QueuedPrompt[]>;
+  /** Last queue/interject/gate receipt shown above the composer. */
+  queueNotice: QueueNotice | null;
 
   inspectorOpen: boolean;
   inspectorTab: InspectorTab;
@@ -216,10 +230,20 @@ interface DesktopState {
   closePreview(): void;
 
   sendPrompt(text: string, attachments?: PromptAttachment[], sessionId?: string): void;
+  /**
+   * Same-turn interjection (Ctrl+Enter while busy).
+   * Tries `x.ai/interject`; on older CLIs pins the message at the queue head.
+   */
+  interjectPrompt(text: string, attachments?: PromptAttachment[], sessionId?: string): Promise<void>;
   removeQueuedPrompt(sessionId: string, queueId: string): void;
   /** Reorder a pending follow-up before it drains (fromIndex → toIndex). */
   reorderQueuedPrompt(sessionId: string, fromIndex: number, toIndex: number): void;
   clearPromptQueue(sessionId?: string): void;
+  /** Promote a queued entry to front and mark it for interjection drain order. */
+  interjectQueuedPrompt(sessionId: string, queueId: string): void;
+  /** Inline-edit a queued message (local + x.ai/queue/edit). */
+  editQueuedPrompt(sessionId: string, queueId: string, text: string): void;
+  dismissQueueNotice(): void;
   stop(): void;
   compact(): void;
   listRewindPoints(): Promise<RewindPoint[]>;
@@ -816,20 +840,68 @@ export const useDesktop = create<DesktopState>((set, get) => {
         }));
         window.setTimeout(() => drainPromptQueue(e.sessionId), 0);
         break;
+      case "prompt_queue": {
+        // CLI is authoritative: merge text/state/version, keep local attachment payloads by id.
+        const previous = get().promptQueues[e.sessionId] ?? [];
+        const nextQueue: QueuedPrompt[] = e.entries.map((entry) => {
+          const prior = previous.find((item) => item.id === entry.id);
+          return {
+            id: entry.id,
+            text: entry.text || prior?.text || "",
+            attachments: prior?.attachments ?? entry.attachments ?? [],
+            createdAt: entry.createdAt || prior?.createdAt || Date.now(),
+            state: entry.state,
+            version: entry.version ?? prior?.version ?? 0,
+            source: "cli" as const,
+          };
+        });
+        set({
+          promptQueues: {
+            ...get().promptQueues,
+            [e.sessionId]: nextQueue,
+          },
+        });
+        break;
+      }
     }
   };
 
-  /** Pop and send the next queued follow-up when the session is idle. */
+  /** Pop and send the next *local* queued follow-up when the session is idle.
+   * CLI-owned entries are executed by the agent via concurrent session/prompt. */
   const drainPromptQueue = (sessionId: string) => {
     const state = get();
     const session = state.sessions[sessionId];
     const queue = state.promptQueues[sessionId] ?? [];
     if (!session || session.status !== "idle" || queue.length === 0) return;
-    const [next, ...rest] = queue;
+
+    // Prefer interjected, then first local-owned entry.
+    const localIndex = queue.findIndex(
+      (item) => item.source !== "cli" && item.state !== "sending",
+    );
+    if (localIndex < 0) {
+      // Only CLI entries remain — clear sending ones the server already took.
+      const remaining = queue.filter((item) => item.state !== "sending");
+      if (remaining.length !== queue.length) {
+        set({
+          promptQueues: { ...state.promptQueues, [sessionId]: remaining },
+        });
+      }
+      return;
+    }
+
+    const next = queue[localIndex];
+    const rest = queue.filter((_, index) => index !== localIndex);
     set({
       promptQueues: {
         ...state.promptQueues,
         [sessionId]: rest,
+      },
+      queueNotice: {
+        id: uid(),
+        entryId: next.id,
+        message: next.state === "interjected" ? "正在发送插话优先消息…" : "正在发送队首消息…",
+        state: "queued",
+        at: Date.now(),
       },
     });
     get().sendPrompt(next.text, next.attachments, sessionId);
@@ -880,6 +952,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           : "default",
     sessionComposers: loadSessionComposers(),
     promptQueues: {},
+    queueNotice: null,
 
     inspectorOpen: true,
     inspectorTab: "files",
@@ -1699,6 +1772,31 @@ export const useDesktop = create<DesktopState>((set, get) => {
         permissionMode,
       };
 
+      // Waiting for plan / permission / question — keep typing, block submit.
+      if (session.status === "awaiting_permission" || session.status === "awaiting_input") {
+        const isPlan = session.blocks.some(
+          (block) =>
+            block.type === "permission" &&
+            !block.resolved &&
+            block.id.startsWith("plan-approval-"),
+        );
+        const message =
+          session.status === "awaiting_input"
+            ? "请先回答当前问题再发送"
+            : isPlan
+              ? "请先批准或拒绝当前计划再发送"
+              : "请先处理当前权限请求再发送";
+        set({
+          queueNotice: {
+            id: uid(),
+            message,
+            state: "blocked",
+            at: Date.now(),
+          },
+        });
+        return;
+      }
+
       // Busy turn → enqueue follow-up (Grok Build CLI-style queue).
       if (session.status !== "idle") {
         const entry: QueuedPrompt = {
@@ -1706,19 +1804,58 @@ export const useDesktop = create<DesktopState>((set, get) => {
           text: trimmed,
           attachments: [...attachments],
           createdAt: Date.now(),
+          state: "queued",
+          source: "local",
         };
         const nextComposers = {
           ...sessionComposers,
           [session.id]: { ...composer, text: "", attachments: [] },
         };
         persistSessionComposers(nextComposers);
+        const depth = (promptQueues[session.id] ?? []).length + 1;
         set({
           promptQueues: {
             ...promptQueues,
             [session.id]: [...(promptQueues[session.id] ?? []), entry],
           },
           sessionComposers: nextComposers,
+          queueNotice: {
+            id: uid(),
+            entryId: entry.id,
+            message: `已加入队列（第 ${depth} 条）`,
+            state: "queued",
+            at: Date.now(),
+          },
         });
+
+        // Try CLI queue path (concurrent prompt) — if it succeeds, CLI owns execution.
+        void bridge
+          .enqueuePrompt(
+            session.id,
+            trimmed,
+            {
+              model: composer.model,
+              effort: composer.effort,
+              mode: composer.mode,
+              attachments,
+            },
+            { promptId: entry.id },
+          )
+          .then(() => {
+            const current = get().promptQueues[session.id] ?? [];
+            if (!current.some((item) => item.id === entry.id)) return;
+            set({
+              promptQueues: {
+                ...get().promptQueues,
+                [session.id]: current.map((item) =>
+                  item.id === entry.id ? { ...item, source: "cli" as const } : item,
+                ),
+              },
+            });
+          })
+          .catch(() => {
+            // CLI rejected — keep local ownership and drain on idle.
+          });
         return;
       }
 
@@ -1776,14 +1913,137 @@ export const useDesktop = create<DesktopState>((set, get) => {
       });
     },
 
+    async interjectPrompt(text, attachments = [], sessionId) {
+      const { activeId, sessions, model, effort, mode, permissionMode, sessionComposers, promptQueues } =
+        get();
+      const targetId = sessionId ?? activeId;
+      const session = targetId ? sessions[targetId] : null;
+      if (!session) return;
+
+      const trimmed = text.trim();
+      if (!trimmed && attachments.length === 0) return;
+
+      if (session.status === "idle") {
+        get().sendPrompt(trimmed, attachments, session.id);
+        return;
+      }
+
+      if (session.status === "awaiting_permission" || session.status === "awaiting_input") {
+        get().sendPrompt(trimmed, attachments, session.id);
+        return;
+      }
+
+      const composer = sessionComposers[session.id] ?? {
+        text: "",
+        attachments: [],
+        model,
+        effort,
+        mode,
+        permissionMode,
+      };
+
+      try {
+        const result = await bridge.interject(session.id, trimmed, {
+          model: composer.model,
+          effort: composer.effort,
+          mode: composer.mode,
+          attachments,
+        });
+
+        const nextComposers = {
+          ...sessionComposers,
+          [session.id]: { ...composer, text: "", attachments: [] },
+        };
+        persistSessionComposers(nextComposers);
+
+        if (result.fallback || result.state === "queued_head") {
+          const entry: QueuedPrompt = {
+            id: result.entryId ?? uid(),
+            text: trimmed,
+            attachments: [...attachments],
+            createdAt: Date.now(),
+            state: "interjected",
+          };
+          set({
+            promptQueues: {
+              ...promptQueues,
+              [session.id]: [entry, ...(promptQueues[session.id] ?? [])],
+            },
+            sessionComposers: nextComposers,
+            queueNotice: {
+              id: uid(),
+              entryId: entry.id,
+              message: result.message,
+              state: "interjected",
+              at: Date.now(),
+            },
+          });
+          return;
+        }
+
+        set({
+          sessionComposers: nextComposers,
+          queueNotice: {
+            id: uid(),
+            entryId: result.entryId,
+            message: result.message,
+            state: "interjected",
+            at: Date.now(),
+          },
+        });
+      } catch (error) {
+        // Hard failure — still pin to queue head so the operator does not lose text.
+        const entry: QueuedPrompt = {
+          id: uid(),
+          text: trimmed,
+          attachments: [...attachments],
+          createdAt: Date.now(),
+          state: "interjected",
+        };
+        const nextComposers = {
+          ...get().sessionComposers,
+          [session.id]: {
+            ...(get().sessionComposers[session.id] ?? composer),
+            text: "",
+            attachments: [],
+          },
+        };
+        persistSessionComposers(nextComposers);
+        set({
+          promptQueues: {
+            ...get().promptQueues,
+            [session.id]: [entry, ...(get().promptQueues[session.id] ?? [])],
+          },
+          sessionComposers: nextComposers,
+          queueNotice: {
+            id: uid(),
+            entryId: entry.id,
+            message: `插话失败，已降级为队首：${error instanceof Error ? error.message : String(error)}`,
+            state: "interjected",
+            at: Date.now(),
+          },
+        });
+      }
+    },
+
     removeQueuedPrompt(sessionId, queueId) {
       const queue = get().promptQueues[sessionId] ?? [];
+      const entry = queue.find((item) => item.id === queueId);
+      if (!entry) return;
       set({
         promptQueues: {
           ...get().promptQueues,
           [sessionId]: queue.filter((item) => item.id !== queueId),
         },
+        queueNotice: {
+          id: uid(),
+          entryId: queueId,
+          message: "队列消息已移除",
+          state: "removed",
+          at: Date.now(),
+        },
       });
+      void bridge.removeQueuedPrompt(sessionId, queueId, entry.version ?? 0);
     },
 
     reorderQueuedPrompt(sessionId, fromIndex, toIndex) {
@@ -1806,18 +2066,95 @@ export const useDesktop = create<DesktopState>((set, get) => {
           ...get().promptQueues,
           [sessionId]: next,
         },
+        queueNotice: {
+          id: uid(),
+          entryId: item.id,
+          message: `已调整到第 ${toIndex + 1} 位`,
+          state: "reordered",
+          at: Date.now(),
+        },
       });
+      void bridge.reorderQueuedPrompt(
+        sessionId,
+        next.map((entry) => entry.id),
+      );
     },
 
     clearPromptQueue(sessionId) {
       const id = sessionId ?? get().activeId;
       if (!id) return;
+      const had = (get().promptQueues[id] ?? []).length > 0;
       set({
         promptQueues: {
           ...get().promptQueues,
           [id]: [],
         },
+        ...(had
+          ? {
+              queueNotice: {
+                id: uid(),
+                message: "等待队列已清空",
+                state: "cleared" as const,
+                at: Date.now(),
+              },
+            }
+          : {}),
       });
+      if (had) void bridge.clearQueuedPrompts(id);
+    },
+
+    interjectQueuedPrompt(sessionId, queueId) {
+      const queue = get().promptQueues[sessionId] ?? [];
+      const index = queue.findIndex((item) => item.id === queueId);
+      if (index < 0) return;
+      const entry = queue[index];
+      if (!entry || entry.state !== "queued") return;
+      const rest = queue.filter((item) => item.id !== queueId);
+      const promoted: QueuedPrompt = { ...entry, state: "interjected" };
+      set({
+        promptQueues: {
+          ...get().promptQueues,
+          [sessionId]: [promoted, ...rest],
+        },
+        queueNotice: {
+          id: uid(),
+          entryId: queueId,
+          message: "已置顶；回合结束后将优先发送",
+          state: "interjected",
+          at: Date.now(),
+        },
+      });
+      void bridge.interjectQueuedPrompt(sessionId, queueId, {
+        version: entry.version ?? 0,
+      });
+    },
+
+    editQueuedPrompt(sessionId, queueId, text) {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      const queue = get().promptQueues[sessionId] ?? [];
+      const entry = queue.find((item) => item.id === queueId);
+      if (!entry || entry.state !== "queued") return;
+      set({
+        promptQueues: {
+          ...get().promptQueues,
+          [sessionId]: queue.map((item) =>
+            item.id === queueId ? { ...item, text: trimmed } : item,
+          ),
+        },
+        queueNotice: {
+          id: uid(),
+          entryId: queueId,
+          message: "编辑已提交，等待 CLI 确认",
+          state: "updated",
+          at: Date.now(),
+        },
+      });
+      void bridge.editQueuedPrompt(sessionId, queueId, trimmed);
+    },
+
+    dismissQueueNotice() {
+      set({ queueNotice: null });
     },
 
     stop() {
@@ -1949,8 +2286,46 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     resolvePermission(blockId, option) {
-      const { activeId } = get();
-      if (activeId) bridge.respondPermission(activeId, blockId, option);
+      const { activeId, sessions } = get();
+      if (!activeId) return;
+      const session = sessions[activeId];
+      const block = session?.blocks.find((item) => item.id === blockId && item.type === "permission");
+      if (block?.type === "permission" && block.resolved) {
+        set({
+          queueNotice: {
+            id: uid(),
+            message: "该请求已处理，未重复提交",
+            state: "duplicate",
+            at: Date.now(),
+          },
+        });
+        return;
+      }
+      const result = bridge.respondPermission(activeId, blockId, option);
+      if (result.duplicate) {
+        set({
+          queueNotice: {
+            id: uid(),
+            message: result.message ?? "该请求已处理，未重复提交",
+            state: "duplicate",
+            at: Date.now(),
+          },
+        });
+        return;
+      }
+      if (blockId.startsWith("plan-approval-")) {
+        set({
+          queueNotice: {
+            id: uid(),
+            message:
+              option === "deny"
+                ? "计划已拒绝，原回合将继续规划"
+                : "计划已批准，原回合将继续执行（未额外发送消息）",
+            state: "queued",
+            at: Date.now(),
+          },
+        });
+      }
     },
 
     resolveQuestion(blockId, response) {
