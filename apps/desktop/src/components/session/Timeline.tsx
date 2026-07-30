@@ -109,6 +109,9 @@ interface TurnGroupProps {
 
 function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
   const { language } = useI18n();
+  // Only the latest in-flight turn uses live process chrome. Historical turns
+  // must stay in the collapsed "Processed" view even while a newer turn runs —
+  // otherwise prior answers reappear as thinking/process text.
   const complete = !active || status === "idle";
   const [processOpen, setProcessOpen] = useState(!complete);
   const user = turn.blocks.find((block): block is Extract<SessionBlock, { type: "user" }> => block.type === "user");
@@ -346,6 +349,10 @@ export function Timeline({ session }: { session: Session }) {
     );
   }
 
+  // Identity of the tail turn — used instead of Virtuoso's shifted item index so
+  // "active" always means "latest turn", never the first visible row.
+  const lastTurnId = turns.at(-1)?.id;
+
   return (
     <div
       ref={scrollRef}
@@ -365,24 +372,37 @@ export function Timeline({ session }: { session: Session }) {
         followOutput={(isAtBottom) => (isAtBottom ? "smooth" : false)}
         initialTopMostItemIndex={Math.max(0, visibleTurns.length - 1)}
         increaseViewportBy={{ top: 600, bottom: 600 }}
-        firstItemIndex={visibleTurns.length - 1}
-        itemContent={(index, turn) => {
-          const absoluteIndex = hiddenCount + index;
-          return (
-            <div className="mx-auto max-w-[860px] px-8">
-              <MemoTurnGroup
-                key={turn.id}
-                turn={turn}
-                sessionId={session.id}
-                status={session.status}
-                active={absoluteIndex === turns.length - 1}
-              />
-            </div>
-          );
-        }}
+        // Keep default firstItemIndex (0). A shifting firstItemIndex used to
+        // offset itemContent's index so absoluteIndex === turns.length - 1
+        // matched the *first* row — prior answers flipped into live/thinking UI.
+        itemContent={(_index, turn) => (
+          <div className="mx-auto max-w-[860px] px-8">
+            <MemoTurnGroup
+              key={turn.id}
+              turn={turn}
+              sessionId={session.id}
+              status={session.status}
+              active={turn.id === lastTurnId}
+            />
+          </div>
+        )}
         components={{
           Header: () => (
-            <div className="h-8" />
+            <div className="mx-auto max-w-[860px] px-8">
+              <div className="h-8" />
+              {hiddenCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    followRef.current = false;
+                    setShowAll(true);
+                  }}
+                  className="mb-6 flex w-full items-center justify-center gap-2 rounded-md border border-line bg-raise/60 py-2 text-[12px] text-mute transition-colors hover:bg-high hover:text-fg2"
+                >
+                  {language === "zh-CN" ? `显示更早的 ${hiddenCount} 轮对话` : `Show ${hiddenCount} earlier turns`}
+                </button>
+              )}
+            </div>
           ),
           Footer: () => <div className="h-2" />,
         }}
