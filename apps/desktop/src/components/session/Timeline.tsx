@@ -260,11 +260,8 @@ const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
 const INITIAL_TURN_WINDOW = 24;
 const STICK_BOTTOM_PX = 120;
 
-import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
-
 export function Timeline({ session }: { session: Session }) {
   const { language } = useI18n();
-  const virtuosoRef = useRef<VirtuosoHandle>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
@@ -275,6 +272,8 @@ export function Timeline({ session }: { session: Session }) {
   const lastBlock = session.blocks.at(-1);
   const signature = `${session.id}:${session.blocks.length}:${lastBlock?.type === "assistant" || lastBlock?.type === "thinking" ? lastBlock.text.length : lastBlock?.id ?? ""}:${session.status}`;
   const hasBlocks = session.blocks.length > 0;
+  // Latest turn id — only this row uses live process chrome while the session runs.
+  const lastTurnId = turns.at(-1)?.id;
 
   // Reset window when switching sessions so we don't keep a previous "show all".
   useEffect(() => {
@@ -349,10 +348,6 @@ export function Timeline({ session }: { session: Session }) {
     );
   }
 
-  // Identity of the tail turn — used instead of Virtuoso's shifted item index so
-  // "active" always means "latest turn", never the first visible row.
-  const lastTurnId = turns.at(-1)?.id;
-
   return (
     <div
       ref={scrollRef}
@@ -365,48 +360,30 @@ export function Timeline({ session }: { session: Session }) {
       }}
       className="flex-1 overflow-y-auto"
     >
-      <Virtuoso
-        ref={virtuosoRef}
-        className="md-timeline"
-        data={visibleTurns}
-        followOutput={(isAtBottom) => (isAtBottom ? "smooth" : false)}
-        initialTopMostItemIndex={Math.max(0, visibleTurns.length - 1)}
-        increaseViewportBy={{ top: 600, bottom: 600 }}
-        // Keep default firstItemIndex (0). A shifting firstItemIndex used to
-        // offset itemContent's index so absoluteIndex === turns.length - 1
-        // matched the *first* row — prior answers flipped into live/thinking UI.
-        itemContent={(_index, turn) => (
-          <div className="mx-auto max-w-[860px] px-8">
-            <MemoTurnGroup
-              key={turn.id}
-              turn={turn}
-              sessionId={session.id}
-              status={session.status}
-              active={turn.id === lastTurnId}
-            />
-          </div>
+      <div ref={contentRef} className="mx-auto max-w-[860px] px-8 py-8">
+        {hiddenCount > 0 && (
+          <button
+            type="button"
+            onClick={() => {
+              followRef.current = false;
+              setShowAll(true);
+            }}
+            className="mb-6 flex w-full items-center justify-center gap-2 rounded-md border border-line bg-raise/60 py-2 text-[12px] text-mute transition-colors hover:bg-high hover:text-fg2"
+          >
+            {language === "zh-CN" ? `显示更早的 ${hiddenCount} 轮对话` : `Show ${hiddenCount} earlier turns`}
+          </button>
         )}
-        components={{
-          Header: () => (
-            <div className="mx-auto max-w-[860px] px-8">
-              <div className="h-8" />
-              {hiddenCount > 0 && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    followRef.current = false;
-                    setShowAll(true);
-                  }}
-                  className="mb-6 flex w-full items-center justify-center gap-2 rounded-md border border-line bg-raise/60 py-2 text-[12px] text-mute transition-colors hover:bg-high hover:text-fg2"
-                >
-                  {language === "zh-CN" ? `显示更早的 ${hiddenCount} 轮对话` : `Show ${hiddenCount} earlier turns`}
-                </button>
-              )}
-            </div>
-          ),
-          Footer: () => <div className="h-2" />,
-        }}
-      />
+        {visibleTurns.map((turn) => (
+          <MemoTurnGroup
+            key={turn.id}
+            turn={turn}
+            sessionId={session.id}
+            status={session.status}
+            active={turn.id === lastTurnId}
+          />
+        ))}
+        <div className="h-2" />
+      </div>
     </div>
   );
 }
