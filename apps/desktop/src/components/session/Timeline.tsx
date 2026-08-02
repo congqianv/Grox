@@ -408,14 +408,8 @@ const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
  * click "show earlier turns" just to read what was already loaded from disk.
  */
 const LIVE_TURN_WINDOW = 40;
-/** How close to the true bottom before we consider "stuck" for auto-follow. */
+/** How close to the true bottom before Virtuoso reports atBottom (chrome only). */
 const STICK_BOTTOM_PX = 64;
-/**
- * After user scrolls *up*, suppress follow so stream growth cannot yank.
- * Shorter than R4++ (2800ms): long cooldown made "scroll back down to live"
- * feel broken until the timer expired.
- */
-const USER_UNFOLLOW_MS = 1600;
 
 /** Stable Footer type — inline `Footer: () => …` remounts Virtuoso chrome every stream tick. */
 function TimelineVirtuosoFooter() {
@@ -432,12 +426,13 @@ export function Timeline({ session }: { session: Session }) {
   const scanProgress =
     diskHistoryProgress?.id === session.id ? diskHistoryProgress : null;
   const virtuosoRef = useRef<VirtuosoHandle>(null);
-  /** When true, stream growth may pin the viewport to the last turn. */
+  /**
+   * Sticky follow flag. Once the user scrolls *up*, this stays false until they
+   * click "Jump to latest" (or open/switch session). Never auto re-stick from
+   * near-bottom / atBottom / scroll-down — tall CU tables remeasure and would
+   * yank the viewport back (R23 regressor → R24 hard unfollow).
+   */
   const followRef = useRef(true);
-  /** Timestamp until which follow is forced off after explicit user scroll-up. */
-  const unfollowUntilRef = useRef(0);
-  /** True when the latest user scroll intent was downward (re-stick allowed). */
-  const scrollDownIntentRef = useRef(false);
   const jumpTimersRef = useRef<number[]>([]);
   const scrollerElRef = useRef<HTMLElement | null>(null);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
@@ -472,29 +467,20 @@ export function Timeline({ session }: { session: Session }) {
 
   const markUserUnfollow = useCallback(() => {
     followRef.current = false;
-    unfollowUntilRef.current = Date.now() + USER_UNFOLLOW_MS;
-    scrollDownIntentRef.current = false;
     setShowJumpLatest(true);
   }, []);
 
   const markFollowLatest = useCallback(() => {
     followRef.current = true;
-    unfollowUntilRef.current = 0;
-    scrollDownIntentRef.current = false;
     setShowJumpLatest(false);
   }, []);
 
-  const canFollow = useCallback(() => {
-    if (Date.now() < unfollowUntilRef.current) return false;
-    return followRef.current;
-  }, []);
+  const canFollow = useCallback(() => followRef.current, []);
 
   // Opening / switching: always show full history (scroll sticks to bottom).
   useEffect(() => {
     setShowAll(true);
     followRef.current = true;
-    unfollowUntilRef.current = 0;
-    scrollDownIntentRef.current = false;
     setShowJumpLatest(false);
   }, [session.id]);
 
@@ -601,9 +587,9 @@ export function Timeline({ session }: { session: Session }) {
   }, []);
 
   // Attach to Virtuoso scroller.
-  // R23: only *upward* scroll unfollows. Downward wheel/drag must stay free so
-  // users can scroll back to the live edge; re-stick when near bottom.
-  // atBottomStateChange alone is too slow / flaky while tall Computer-Use tables remeasure.
+  // R24 hard unfollow: only *upward* motion freezes follow. Downward scroll is
+  // free and never re-enables follow — user must click "Jump to latest".
+  // (R23 re-stick on near-bottom / atBottom+downIntent yanks when CU tables grow.)
   const scrollerRef = useCallback(
     (el: HTMLElement | Window | null) => {
       detachScroller(scrollerElRef.current as ScrollerEl | null);
@@ -613,7 +599,6 @@ export function Timeline({ session }: { session: Session }) {
       const onWheel = (event: WheelEvent) => {
         // deltaY < 0 → fingers/trackpad scroll content upward (read history).
         if (event.deltaY < 0) markUserUnfollow();
-        else if (event.deltaY > 0) scrollDownIntentRef.current = true;
       };
       node.addEventListener("wheel", onWheel, { passive: true });
       const onKeyUnfollow = (event: KeyboardEvent) => {
@@ -625,29 +610,15 @@ export function Timeline({ session }: { session: Session }) {
           (event.key === " " && event.shiftKey)
         ) {
           markUserUnfollow();
-        } else if (
-          event.key === "PageDown" ||
-          event.key === "End" ||
-          event.key === "ArrowDown" ||
-          (event.key === " " && !event.shiftKey)
-        ) {
-          scrollDownIntentRef.current = true;
         }
       };
       node.addEventListener("keydown", onKeyUnfollow);
       let lastTop = node.scrollTop;
       const onScrollerScroll = () => {
         const top = node.scrollTop;
-        const max = Math.max(0, node.scrollHeight - node.clientHeight);
         if (top + 2 < lastTop) {
-          // Upward motion freezes follow.
+          // Upward motion freezes follow until Jump to latest.
           markUserUnfollow();
-        } else if (top > lastTop + 1) {
-          // Downward motion: free the viewport; re-stick only when near bottom.
-          scrollDownIntentRef.current = true;
-          if (max - top <= STICK_BOTTOM_PX) {
-            markFollowLatest();
-          }
         }
         lastTop = top;
       };
@@ -656,7 +627,7 @@ export function Timeline({ session }: { session: Session }) {
       node.__groxWheel = onWheel;
       node.addEventListener("scroll", onScrollerScroll, { passive: true });
     },
-    [detachScroller, markFollowLatest, markUserUnfollow],
+    [detachScroller, markUserUnfollow],
   );
 
   useEffect(
@@ -843,28 +814,21 @@ export function Timeline({ session }: { session: Session }) {
         increaseViewportBy={{ top: 800, bottom: 1000 }}
         atBottomThreshold={STICK_BOTTOM_PX}
         atBottomStateChange={(atBottom) => {
-          if (atBottom && scrollDownIntentRef.current) {
-            // User scrolled down to the live edge — re-stick immediately.
-            markFollowLatest();
+          // Hard unfollow: never set followRef=true from Virtuoso chrome.
+          // Tall markdown / CU tables remeasure and falsely report atBottom.
+          // Re-stick only via Jump-to-latest button (markFollowLatest).
+          if (!followRef.current) {
+            if (isLive) setShowJumpLatest(true);
             return;
           }
-          // During unfollow cooldown, ignore flaky atBottom=true from CU remeasure
-          // unless the user is clearly still away from bottom.
-          if (Date.now() < unfollowUntilRef.current) {
-            if (!atBottom) {
-              followRef.current = false;
-              setShowJumpLatest(true);
-            }
-            return;
-          }
-          followRef.current = atBottom;
+          // While following: only surface jump chrome if we leave the bottom.
           if (atBottom) setShowJumpLatest(false);
           else if (isLive) setShowJumpLatest(true);
         }}
         followOutput={(isAtBottom) => {
-          // Require BOTH sticky intent and Virtuoso's at-bottom — live `true`
-          // alone yanked tall CU tables whenever the last item grew.
-          if (!canFollow() || !isAtBottom) return false;
+          // Hard gate: user unfollow freezes pin even if isAtBottom flickers true.
+          if (!canFollow()) return false;
+          if (!isAtBottom) return false;
           // "auto" follows without stacking smooth animations under token stream.
           return isLive ? "auto" : false;
         }}
