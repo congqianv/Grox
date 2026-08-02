@@ -41,6 +41,7 @@ import {
   type QueueOperationReceipt,
   type PromptQueueEntry,
 } from "./types";
+import { isAllowedOAuthUrl } from "../lib/oauthUrl";
 import {
   COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
   computerLeaseIfAttached,
@@ -1459,9 +1460,19 @@ export class AcpBridge implements GrokBridge {
   }
 
   private onExit(payload: ExitPayload) {
-    if (payload.reason === "killed") return;
     this.flushStreamAppends();
     this.flushToolPatches();
+    // Intentional stop (acp_kill / replace) still must clear bind/lease state —
+    // skipping cleanup left silent-bind and Computer leases sticky across restarts.
+    if (payload.reason === "killed") {
+      for (const request of this.pending.values()) {
+        if (request.timeoutId !== undefined) window.clearTimeout(request.timeoutId);
+        request.reject(new Error("Grok Agent 已停止"));
+      }
+      this.pending.clear();
+      this.resetBindStateAfterAgentExit();
+      return;
+    }
     const diagnostic = this.diagnostics
       .filter((line) => {
         const value = line.trim();
@@ -2375,6 +2386,9 @@ export class AcpBridge implements GrokBridge {
         authUrl = string(urlResponse?.auth_url) ?? string(urlResponse?.authUrl);
       }
       if (!authUrl) throw new Error("Grok Agent 未返回登录链接，请重试");
+      if (!isAllowedOAuthUrl(authUrl)) {
+        throw new Error("登录链接域名不受信任，已拒绝打开浏览器");
+      }
       await invoke("open_external", { url: authUrl });
       const authResult = await auth;
       if (authResult.error) throw authResult.error;

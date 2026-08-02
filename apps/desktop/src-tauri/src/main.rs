@@ -373,6 +373,8 @@ struct OpenAiModelsResponse {
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_WORKSPACE_ENTRIES: usize = 2_000;
+/// Cap recursion so pathological deep trees cannot freeze the UI thread.
+const MAX_WORKSPACE_DEPTH: usize = 12;
 const UPSTREAM_CLI_CLIENT_NAME: &str = "grok-shell";
 const PROVIDER_ENV_KEYS: [&str; 3] = [
     "XAI_API_KEY",
@@ -1404,8 +1406,44 @@ fn preview_type(path: &Path) -> (&'static str, &'static str) {
     }
 }
 
+fn is_skipped_workspace_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | "out"
+            | ".next"
+            | ".nuxt"
+            | ".turbo"
+            | ".cache"
+            | ".pnpm-store"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+            | "coverage"
+            | ".idea"
+            | ".vs"
+            | "Pods"
+            | "vendor"
+            | "bin"
+            | "obj"
+    )
+}
+
 fn collect_workspace_entries(root: &Path, dir: &Path, output: &mut Vec<WorkspaceEntry>) {
-    if output.len() >= MAX_WORKSPACE_ENTRIES {
+    collect_workspace_entries_depth(root, dir, output, 0);
+}
+
+fn collect_workspace_entries_depth(
+    root: &Path,
+    dir: &Path,
+    output: &mut Vec<WorkspaceEntry>,
+    depth: usize,
+) {
+    if output.len() >= MAX_WORKSPACE_ENTRIES || depth > MAX_WORKSPACE_DEPTH {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
@@ -1420,18 +1458,14 @@ fn collect_workspace_entries(root: &Path, dir: &Path, output: &mut Vec<Workspace
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
+        // Never follow symlinks (escape / cycles outside the workspace).
         if file_type.is_symlink() {
             continue;
         }
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         let is_dir = file_type.is_dir();
-        if is_dir
-            && matches!(
-                name.as_str(),
-                ".git" | "node_modules" | "target" | "dist" | ".pnpm-store"
-            )
-        {
+        if is_dir && is_skipped_workspace_dir(&name) {
             continue;
         }
         let relative = path.strip_prefix(root).unwrap_or(&path);
@@ -1441,7 +1475,7 @@ fn collect_workspace_entries(root: &Path, dir: &Path, output: &mut Vec<Workspace
             is_dir,
         });
         if is_dir {
-            collect_workspace_entries(root, &path, output);
+            collect_workspace_entries_depth(root, &path, output, depth + 1);
         }
     }
 }
@@ -6685,6 +6719,35 @@ fn install_panic_lifecycle_hook() {
     }));
 }
 
+/// Second desktop shell would race ACP child ownership and Computer MCP bind.
+/// Hold a process-lifetime named mutex (Windows) so only one UI instance runs.
+#[cfg(windows)]
+fn acquire_single_instance_lock() -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    let name: Vec<u16> = "Local\\GroxDesktopSingleInstance\0"
+        .encode_utf16()
+        .collect();
+    unsafe {
+        let handle = CreateMutexW(None, true, PCWSTR(name.as_ptr()))
+            .map_err(|error| format!("无法创建单实例锁：{error}"))?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(handle);
+            return Err("Grox 已在运行（只允许一个桌面实例）".into());
+        }
+        // HANDLE has no Drop/Close — leaving it open keeps the mutex until process exit.
+        let _ = handle;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn acquire_single_instance_lock() -> Result<(), String> {
+    Ok(())
+}
+
 fn main() {
     let process_args = std::env::args().collect::<Vec<_>>();
     if process_args
@@ -6702,6 +6765,12 @@ fn main() {
         return;
     }
     install_panic_lifecycle_hook();
+    if let Err(error) = acquire_single_instance_lock() {
+        append_lifecycle_log(&format!("single-instance refuse: {error}"));
+        eprintln!("grox: {error}");
+        // Short-lived message box would need more UI; stderr + non-zero exit is enough.
+        std::process::exit(2);
+    }
     append_lifecycle_log("start");
     tauri::Builder::default()
         .manage(Arc::new(AcpState::default()))
@@ -7177,6 +7246,16 @@ api_key = "local-key"
         assert!(is_denied_cli_env_key("RUSTFLAGS"));
         assert!(!is_denied_cli_env_key("XAI_API_KEY"));
         assert!(!is_denied_cli_env_key("GROK_MODELS_BASE_URL"));
+    }
+
+    #[test]
+    fn skipped_workspace_dirs_cover_heavy_tooling() {
+        assert!(is_skipped_workspace_dir("node_modules"));
+        assert!(is_skipped_workspace_dir(".git"));
+        assert!(is_skipped_workspace_dir(".next"));
+        assert!(is_skipped_workspace_dir("__pycache__"));
+        assert!(!is_skipped_workspace_dir("src"));
+        assert!(!is_skipped_workspace_dir("apps"));
     }
 
     #[test]

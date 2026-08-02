@@ -68,6 +68,8 @@ let openSessionGeneration = 0;
 let openSessionTargetId: string | null = null;
 /** Offline scan finished while turn was live — merge on idle. */
 const pendingOfflineMerge = new Map<string, Session>();
+/** Overlapping list_workspace_files walks thrash large repos — one in-flight. */
+let workspaceFilesInFlight = false;
 
 /** Invalidate in-flight openSession applyChrome (Home / new mission / workspace). */
 function bumpOpenSessionGeneration(clearTarget = true): void {
@@ -2440,6 +2442,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
     setAccountSetupOpen: (accountSetupOpen) => set({ accountSetupOpen }),
 
     async refreshWorkspaceFiles() {
+      if (workspaceFilesInFlight) return;
+      workspaceFilesInFlight = true;
       try {
         const workspaceFiles = await invoke<WorkspaceEntry[]>("list_workspace_files", {
           cwd: get().workspace,
@@ -2447,6 +2451,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({ workspaceFiles });
       } catch (error) {
         set({ previewError: error instanceof Error ? error.message : String(error) });
+      } finally {
+        workspaceFilesInFlight = false;
       }
     },
 
