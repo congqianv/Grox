@@ -9,6 +9,8 @@ function sess(
     cwd: "C:\\proj",
     title: "t",
     createdAt: 0,
+    updatedAt: 0,
+    model: "test",
     usage: {
       inputTokens: 0,
       outputTokens: 0,
