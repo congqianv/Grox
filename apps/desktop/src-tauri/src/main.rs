@@ -2308,6 +2308,7 @@ async fn install_app_update(
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(600)).await;
+                    append_lifecycle_log("exit after install_app_update restarted=true");
                     handle.exit(0);
                 });
             }
@@ -6435,6 +6436,46 @@ fn install_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Append a line to %LOCALAPPDATA%\Grox\last-exit.log for post-mortem (crash vs clean close).
+fn append_lifecycle_log(reason: &str) {
+    let Ok(local) = std::env::var("LOCALAPPDATA") else {
+        eprintln!("grox lifecycle: {reason}");
+        return;
+    };
+    let dir = PathBuf::from(local).join("Grox");
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("last-exit.log");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("{stamp}\t{reason}\n");
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = file.write_all(line.as_bytes());
+    }
+    eprintln!("grox lifecycle: {reason}");
+}
+
+fn install_panic_lifecycle_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".into()
+        };
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".into());
+        append_lifecycle_log(&format!("PANIC at {loc}: {payload}"));
+        previous(info);
+    }));
+}
+
 fn main() {
     let process_args = std::env::args().collect::<Vec<_>>();
     if process_args
@@ -6451,6 +6492,8 @@ fn main() {
         }
         return;
     }
+    install_panic_lifecycle_hook();
+    append_lifecycle_log("start");
     tauri::Builder::default()
         .manage(Arc::new(AcpState::default()))
         .manage(Arc::new(PreviewState::default()))
@@ -6551,22 +6594,30 @@ fn main() {
             acp_set_silent_stream,
         ])
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::Destroyed) {
-                let state = window.state::<Arc<AcpState>>().inner().clone();
-                let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Some(process) = state.process.lock().await.take() {
-                        terminate_process(process).await;
-                    }
-                    if let Some(mut process) = preview_state.process.lock().await.take() {
-                        let _ = process.child.kill().await;
-                        let _ = process.child.wait().await;
-                    }
-                });
+            match event {
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    append_lifecycle_log("window CloseRequested (user or system close)");
+                }
+                tauri::WindowEvent::Destroyed => {
+                    append_lifecycle_log("window Destroyed");
+                    let state = window.state::<Arc<AcpState>>().inner().clone();
+                    let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(process) = state.process.lock().await.take() {
+                            terminate_process(process).await;
+                        }
+                        if let Some(mut process) = preview_state.process.lock().await.take() {
+                            let _ = process.child.kill().await;
+                            let _ = process.child.wait().await;
+                        }
+                    });
+                }
+                _ => {}
             }
         })
         .run(tauri::generate_context!())
         .expect("error while running Grox Desktop");
+    append_lifecycle_log("run() returned (normal process end)");
 }
 
 #[cfg(test)]
