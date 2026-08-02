@@ -808,6 +808,8 @@ export class AcpBridge implements GrokBridge {
    * live stream, and avoids stacking multi-minute rehydrates on one stdio child.
    */
   private channelTail: Promise<unknown> = Promise.resolve();
+  /** Serialize restartAgent so double activate cannot spawn two children. */
+  private restartTail: Promise<void> = Promise.resolve();
   /**
    * Scheme C + visit memory:
    * 1) Always prefer full-load of the active mission if unbound.
@@ -1384,6 +1386,19 @@ export class AcpBridge implements GrokBridge {
   }
 
   private async restartAgent(): Promise<void> {
+    // Queue restarts: concurrent activate/logout must not interleave spawn.
+    const run = this.restartTail.then(
+      () => this.restartAgentInner(),
+      () => this.restartAgentInner(),
+    );
+    this.restartTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async restartAgentInner(): Promise<void> {
     this.flushStreamAppends();
     this.flushToolPatches();
     const error = new Error("模型服务已切换，请重新发送尚未完成的请求");

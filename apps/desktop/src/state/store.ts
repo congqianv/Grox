@@ -70,6 +70,11 @@ let openSessionTargetId: string | null = null;
 const pendingOfflineMerge = new Map<string, Session>();
 /** Overlapping list_workspace_files walks thrash large repos — one in-flight. */
 let workspaceFilesInFlight = false;
+/** git/diffs is heavy — one in-flight + min interval. */
+let workspaceDiffsInFlight = false;
+let lastWorkspaceDiffAt = 0;
+/** openPreview race: late read must not clobber a newer path. */
+let previewOpenGeneration = 0;
 
 /** Invalidate in-flight openSession applyChrome (Home / new mission / workspace). */
 function bumpOpenSessionGeneration(clearTarget = true): void {
@@ -1552,8 +1557,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (workspaceWatchTimer === undefined) {
           workspaceWatchTimer = window.setInterval(() => {
             if (document.visibilityState !== "visible" || get().auth.inProgress || get().view !== "session") return;
+            if (get().providerSwitching) return;
             workspaceWatchTick += 1;
-            void get().refreshWorkspaceDiffs();
+            // Diff poll only when inspector is open (otherwise wasted agent IPC).
+            if (get().inspectorOpen && workspaceWatchTick % 2 === 0) {
+              void get().refreshWorkspaceDiffs();
+            }
             if (workspaceWatchTick % 3 === 0) void get().refreshWorkspaceFiles();
             if (get().projectPreview.status === "starting") void get().refreshProjectPreview();
           }, 2_000);
@@ -2304,6 +2313,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
       // Always activate after save so the just-configured provider is what the
       // agent uses — no separate "switch + edit config.toml" step required.
+      if (get().providerSwitching || promptInFlightSessions.size > 0) {
+        await get().refreshProviderProfiles();
+        set({
+          startupError:
+            "供应商已保存。当前有任务/切换进行中，请稍后再在输入框左侧切换到该供应商。",
+        });
+        return profile;
+      }
       if (Object.values(get().sessions).some((session) => session.status !== "idle")) {
         await get().refreshProviderProfiles();
         set({
@@ -2318,7 +2335,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await bridge.activateProviderProfile(profile.id);
         await get().refreshProviderProfiles();
         await Promise.all([get().refreshAccount(), get().refreshModels()]);
-        if (activeId) {
+        if (activeId && get().activeId === activeId && get().sessions[activeId]) {
           await bridge.loadSession(activeId, { background: true, silent: true });
         }
         set({ providerSwitching: false, startupError: null });
@@ -2338,8 +2355,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async activateProviderProfile(id) {
+      if (get().providerSwitching) {
+        throw new Error("正在切换模型服务，请稍候");
+      }
       if (Object.values(get().sessions).some((session) => session.status !== "idle")) {
         throw new Error("请先终止正在执行的任务，再切换模型服务");
+      }
+      if (promptInFlightSessions.size > 0) {
+        throw new Error("请等待当前发送完成，再切换模型服务");
       }
       const activeId = get().activeId;
       set({ providerSwitching: true });
@@ -2347,7 +2370,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await bridge.activateProviderProfile(id);
         await get().refreshProviderProfiles();
         await Promise.all([get().refreshAccount(), get().refreshModels()]);
-        if (activeId) {
+        // Re-bind only if still the same focused mission after the agent restart.
+        if (activeId && get().activeId === activeId && get().sessions[activeId]) {
           await bridge.loadSession(activeId, { background: true, silent: true });
         }
         set({ providerSwitching: false, startupError: null });
@@ -2458,19 +2482,28 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     async refreshWorkspaceDiffs() {
       if (bridge.kind === "mock") return;
+      if (workspaceDiffsInFlight) return;
+      const now = Date.now();
+      // Min 3.5s between full diffs — interval + agent cost on large repos.
+      if (now - lastWorkspaceDiffAt < 3_500) return;
+      workspaceDiffsInFlight = true;
+      lastWorkspaceDiffAt = now;
       try {
         const response = await bridge.callExtension<unknown>("x.ai/git/diffs", {
           gitRoot: get().workspace,
           from: "HEAD",
           to: "working",
           includePatch: true,
-          includeContent: true,
-          maxPatchBytes: 2_000_000,
-          maxPatchLines: 20_000,
+          // Patch is enough for UI hunks; full file contents double IPC size.
+          includeContent: false,
+          maxPatchBytes: 1_000_000,
+          maxPatchLines: 12_000,
         });
         set({ workspaceDiffs: mapGitDiffs(response), workspaceDiffReady: true });
       } catch {
         // Non-git workspaces and older agents simply have no project-level diff.
+      } finally {
+        workspaceDiffsInFlight = false;
       }
     },
 
@@ -2551,6 +2584,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async openPreview(path) {
+      const gen = ++previewOpenGeneration;
       set({
         previewOpen: true,
         planPreviewOpen: false,
@@ -2562,8 +2596,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
           cwd: get().workspace,
           path,
         });
+        if (gen !== previewOpenGeneration) return;
         set({ previewFile, previewLoading: false });
       } catch (error) {
+        if (gen !== previewOpenGeneration) return;
         set({
           previewFile: null,
           previewLoading: false,
@@ -2572,7 +2608,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
     },
 
-    closePreview: () => set({ previewOpen: false, previewFile: null, previewError: null }),
+    closePreview: () => {
+      previewOpenGeneration += 1;
+      set({ previewOpen: false, previewFile: null, previewError: null });
+    },
 
     async deleteSession(id) {
       // Tombstone first so late offline scan / in-flight openSession cannot resurrect.

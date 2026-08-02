@@ -57,7 +57,9 @@ export function PreviewPane() {
           ) : file.kind === "html" ? (
             <iframe
               title={file.name}
+              // Empty sandbox = all restrictions (no scripts/forms/same-origin).
               sandbox=""
+              referrerPolicy="no-referrer"
               srcDoc={safeHtml}
               className="h-full min-h-[320px] w-full border-0 bg-white"
             />
