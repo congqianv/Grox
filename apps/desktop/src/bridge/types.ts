@@ -371,6 +371,23 @@ export const EFFORTS = ["low", "medium", "high", "xhigh"] as const;
 export type Effort = (typeof EFFORTS)[number];
 export type PermissionMode = "default" | "auto" | "bypass";
 
+/** Product default: Auto (fewer prompts). Explicit localStorage "default" still honored. */
+export const DEFAULT_PERMISSION_MODE: PermissionMode = "auto";
+
+export function readStoredPermissionMode(
+  read: (key: string) => string | null = (key) => {
+    try {
+      return typeof localStorage !== "undefined" ? localStorage.getItem(key) : null;
+    } catch {
+      return null;
+    }
+  },
+): PermissionMode {
+  const raw = read("grok.permissionMode");
+  if (raw === "default" || raw === "bypass" || raw === "auto") return raw;
+  return DEFAULT_PERMISSION_MODE;
+}
+
 /** Events a bridge pushes into the store. Wire-level naming kept close to ACP. */
 export type BridgeEvent =
   | { type: "auth_state"; state: AuthState }

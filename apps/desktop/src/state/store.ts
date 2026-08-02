@@ -7,7 +7,7 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { bridge } from "../bridge";
-import { MODELS } from "../bridge/types";
+import { DEFAULT_PERMISSION_MODE, MODELS, readStoredPermissionMode } from "../bridge/types";
 import type {
   AgentMode,
   AccountInfo,
@@ -615,13 +615,7 @@ function loadSessionComposers(): Record<string, SessionComposerState> {
     model: localStorage.getItem("grok.model") ?? "grok-build",
     effort: (localStorage.getItem("grok.effort") as Effort) ?? "high",
     mode: "agent" as AgentMode,
-    permissionMode: (
-      localStorage.getItem("grok.permissionMode") === "auto"
-        ? "auto"
-        : localStorage.getItem("grok.permissionMode") === "bypass"
-          ? "bypass"
-          : "default"
-    ) as PermissionMode,
+    permissionMode: readStoredPermissionMode(),
   };
   return Object.fromEntries(
     Object.entries(stored).map(([id, state]) => [
@@ -1025,7 +1019,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           model: fallbackModel,
           effort: state.effort || "high",
           mode: state.mode || "agent",
-          permissionMode: state.permissionMode || "default",
+          permissionMode: state.permissionMode || DEFAULT_PERMISSION_MODE,
         });
         const sessionComposers = { ...state.sessionComposers, [e.session.id]: composer };
         persistSessionComposers(sessionComposers);
@@ -1295,12 +1289,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     modelsUpdatedAt: 0,
     effort: (localStorage.getItem("grok.effort") as Effort) ?? "high",
     mode: "agent",
-    permissionMode:
-      localStorage.getItem("grok.permissionMode") === "auto"
-        ? "auto"
-        : localStorage.getItem("grok.permissionMode") === "bypass"
-          ? "bypass"
-          : "default",
+    permissionMode: readStoredPermissionMode(),
     sessionComposers: loadSessionComposers(),
     promptQueues: {},
     queueNotice: null,
@@ -1448,6 +1437,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
           bridge.getModelState(),
           bridge.getProviderStatus(),
         ]);
+        // Product default Auto: if the operator never set a mode, persist + push to bridge.
+        if (localStorage.getItem("grok.permissionMode") == null) {
+          localStorage.setItem("grok.permissionMode", DEFAULT_PERMISSION_MODE);
+          bridge.setPermissionMode(DEFAULT_PERMISSION_MODE);
+          set({ permissionMode: DEFAULT_PERMISSION_MODE });
+        } else {
+          bridge.setPermissionMode(get().permissionMode);
+        }
         const sessionIndex = decorateSessions(loadJson<SessionMeta[]>("grox.sessionCatalog", []));
         set({
           workspace,
@@ -1739,7 +1736,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           model: state.model || state.models[0]?.id || MODELS[0]?.id || "grok-build",
           effort: state.effort || "high",
           mode: state.mode || "agent",
-          permissionMode: state.permissionMode || "default",
+          permissionMode: state.permissionMode || DEFAULT_PERMISSION_MODE,
         });
         const sessionComposers = { ...state.sessionComposers, [id]: composer };
         persistSessionComposers(sessionComposers);
@@ -1966,7 +1963,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           model: get().model || get().models[0]?.id || MODELS[0]?.id || "grok-build",
           effort: get().effort || "high",
           mode: get().mode || "agent",
-          permissionMode: get().permissionMode || "default",
+          permissionMode: get().permissionMode || DEFAULT_PERMISSION_MODE,
         });
         const sessionComposers = { ...get().sessionComposers, [id]: composer };
         persistSessionComposers(sessionComposers);

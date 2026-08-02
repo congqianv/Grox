@@ -46,7 +46,7 @@ export class MockBridge implements GrokBridge {
   private permissionWaiters = new Map<string, (o: PermissionOption) => void>();
   private resolvedPermissions = new Map<string, PermissionOption>();
   private workspace = DEMO_CWD;
-  private permissionMode: PermissionMode = "default";
+  private permissionMode: PermissionMode = "auto";
   private providerProfiles: ProviderProfileSummary[] = [];
   private activeProviderProfileId: string | undefined;
   private configDrafts: Record<ConfigDocument["id"], string> = {

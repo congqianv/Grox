@@ -3,7 +3,44 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { GrokBridge } from "./GrokBridge";
-import { MODELS } from "./types";
+import {
+  MODELS,
+  readStoredPermissionMode,
+  type AccountInfo,
+  type AgentMode,
+  type AuthState,
+  type BillingInfo,
+  type BridgeEvent,
+  type DiffHunk,
+  type PermissionOption,
+  type PermissionMode,
+  type PlanStep,
+  type PromptOptions,
+  type QuestionItem,
+  type QuestionResponse,
+  type ModelState,
+  type Session,
+  type SessionBlock,
+  type SessionMeta,
+  type TerminalIO,
+  type ToolCall,
+  type ToolKind,
+  type ToolStatus,
+  type Usage,
+  type ConfigDocument,
+  type ProviderConfig,
+  type ProviderProfileSummary,
+  type ProviderProfilesState,
+  type ProviderStatus,
+  type PromptAttachment,
+  type SaveProviderProfile,
+  type RewindMode,
+  type RewindPoint,
+  type RewindResult,
+  type InterjectResult,
+  type QueueOperationReceipt,
+  type PromptQueueEntry,
+} from "./types";
 import {
   COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
   computerLeaseIfAttached,
@@ -15,42 +52,6 @@ import {
   setComputerUseHostEnvEnabled,
 } from "../lib/computerUse";
 import { shouldDropSilentInbound } from "../lib/silentAcp";
-import type {
-  AccountInfo,
-  AgentMode,
-  AuthState,
-  BillingInfo,
-  BridgeEvent,
-  DiffHunk,
-  PermissionOption,
-  PermissionMode,
-  PlanStep,
-  PromptOptions,
-  QuestionItem,
-  QuestionResponse,
-  ModelState,
-  Session,
-  SessionBlock,
-  SessionMeta,
-  TerminalIO,
-  ToolCall,
-  ToolKind,
-  ToolStatus,
-  Usage,
-  ConfigDocument,
-  ProviderConfig,
-  ProviderProfileSummary,
-  ProviderProfilesState,
-  ProviderStatus,
-  PromptAttachment,
-  SaveProviderProfile,
-  RewindMode,
-  RewindPoint,
-  RewindResult,
-  InterjectResult,
-  QueueOperationReceipt,
-  PromptQueueEntry,
-} from "./types";
 
 export const ACP_METHODS = {
   initialize: "initialize",
@@ -835,12 +836,7 @@ export class AcpBridge implements GrokBridge {
   private authMethodId: string | undefined;
   private authState: AuthState = { required: false, inProgress: false };
   private modelState: ModelState = { models: MODELS, currentId: MODELS[0].id };
-  private permissionMode: PermissionMode =
-    localStorage.getItem("grok.permissionMode") === "auto"
-      ? "auto"
-      : localStorage.getItem("grok.permissionMode") === "bypass"
-        ? "bypass"
-        : "default";
+  private permissionMode: PermissionMode = readStoredPermissionMode();
   private workspace = "";
   private computerLeases = new Map<string, string>();
   private activeComputerSessions = new Set<string>();
