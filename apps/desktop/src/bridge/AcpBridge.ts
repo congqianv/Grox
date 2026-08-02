@@ -3284,9 +3284,19 @@ export class AcpBridge implements GrokBridge {
     if (!isComputerUseOperatorEnabled()) {
       await this.refreshComputerUseHostEnv();
     }
-    return invoke<ComputerSessionExtensions>("computer_session_extensions", {
-      operatorEnabled: isComputerUseOperatorEnabled(),
-    });
+    try {
+      return await invoke<ComputerSessionExtensions>("computer_session_extensions", {
+        operatorEnabled: isComputerUseOperatorEnabled(),
+      });
+    } catch (error) {
+      // Belt-and-braces: older shells hard-Err when CU opt-in is off. Never let
+      // that kill session/new for ordinary chat (Home "111" → 连接失败).
+      const message = errorText(error);
+      if (/computer\s*use|GROX_COMPUTER_USE|未启用/i.test(message)) {
+        return { mcpServers: [], pluginDirs: [], leaseId: "" };
+      }
+      throw error instanceof Error ? error : new Error(message);
+    }
   }
 
   private async attachComputerMcp(sessionId: string): Promise<void> {

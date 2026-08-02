@@ -286,13 +286,33 @@ export function Home() {
             <div className="flex items-start gap-3">
               <Icon name="alert" size={14} className="mt-0.5 shrink-0 text-red" />
               <div className="min-w-0">
-                <p className="text-[13px] font-medium text-red">{zh ? "连接失败" : "Connection failed"}</p>
+                <p className="text-[13px] font-medium text-red">
+                  {/computer\s*use|GROX_COMPUTER_USE|未启用/i.test(startupError)
+                    ? zh
+                      ? "Computer Use 提示"
+                      : "Computer Use notice"
+                    : zh
+                      ? "连接失败"
+                      : "Connection failed"}
+                </p>
                 <p className="mt-1 break-words text-[12.5px] leading-relaxed text-fg2">
                   {startupError}
                 </p>
-                <p className="mt-1.5 text-[12px] text-dim">
-                  {zh ? "请安装 Grok CLI，或设置 GROK_DESKTOP_CLI 后重启 Grox。" : "Install Grok CLI or set GROK_DESKTOP_CLI, then restart Grox."}
-                </p>
+                {/* Only show CLI install hint for real runtime/CLI failures — not CU opt-in text. */}
+                {!/computer\s*use|GROX_COMPUTER_USE|未启用/i.test(startupError) && (
+                  <p className="mt-1.5 text-[12px] text-dim">
+                    {zh
+                      ? "请安装 Grok CLI，或设置 GROK_DESKTOP_CLI 后重启 Grox。"
+                      : "Install Grok CLI or set GROK_DESKTOP_CLI, then restart Grox."}
+                  </p>
+                )}
+                {/computer\s*use|GROX_COMPUTER_USE|未启用/i.test(startupError) && (
+                  <p className="mt-1.5 text-[12px] text-dim">
+                    {zh
+                      ? "普通对话不需要打开 Computer Use。若仍无法新建任务，请更新到最新桌面壳（soft-fail 已修复）。设置 → 允许 Computer Use 仅用于 /computer 桌面控制。"
+                      : "Normal chat does not need Computer Use. If new missions still fail, update the desktop shell (soft-fail fix). Enable Computer Use only for /computer desktop control."}
+                  </p>
+                )}
               </div>
             </div>
           </div>
