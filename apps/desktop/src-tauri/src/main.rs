@@ -505,19 +505,29 @@ fn restrict_private_file(path: &Path) -> Result<(), String> {
 }
 
 /// Absolute System32 tool path — never resolve bare names via %PATH% (hijack).
+/// Basename only (no separators); rejects empty / relative names.
 #[cfg(windows)]
 fn system32_tool(name: &str) -> PathBuf {
+    let base = name
+        .trim()
+        .trim_start_matches(['\\', '/'])
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let base = if base.is_empty() { "invalid.exe" } else { base };
     let root = std::env::var_os("SystemRoot")
         .or_else(|| std::env::var_os("WINDIR"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    root.join("System32").join(name)
+    root.join("System32").join(base)
 }
 
 #[cfg(windows)]
 fn restrict_private_file(path: &Path) -> Result<(), String> {
-    // Cred files (~/.grok/.env, grox-providers.json) hold API keys in plaintext.
-    // Drop inherited ACLs and grant only the current user R/W via System32\icacls.
+    // Cred files: grox-providers.json keys are DPAPI-sealed (R11); ~/.grok/.env
+    // still holds plaintext for CLI children. Drop inherited ACLs; grant only
+    // the current user R/W via System32\icacls.
     if !path.exists() {
         return Ok(());
     }
@@ -1266,7 +1276,7 @@ fn reveal_in_explorer(cwd: String, path: String) -> Result<(), String> {
     {
         // explorer wants a single `/select,<path>` argument (spaces/commas break two-arg form).
         let select = format!("/select,{}", file.display());
-        std::process::Command::new("explorer.exe")
+        std::process::Command::new(system32_tool("explorer.exe"))
             .arg(select)
             .spawn()
             .map_err(|error| format!("无法打开资源管理器：{error}"))?;
@@ -2855,7 +2865,7 @@ fn open_in_explorer(cwd: String, path: Option<String>) -> Result<(), String> {
     };
 
     #[cfg(windows)]
-    std::process::Command::new("explorer.exe")
+    std::process::Command::new(system32_tool("explorer.exe"))
         .arg(&target)
         .spawn()
         .map_err(|error| format!("无法打开资源管理器：{error}"))?;
@@ -3544,7 +3554,7 @@ fn list_windows_open_applications() -> Result<Vec<OpenApplicationOption>, String
     // flashes a full PowerShell console (the blank blue window operators saw).
     use std::os::windows::process::CommandExt as _;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let output = std::process::Command::new("powershell.exe")
+    let output = std::process::Command::new(system32_tool("powershell.exe"))
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -3977,11 +3987,11 @@ fn open_file_with_application(cwd: String, path: String, application: String) ->
             .unwrap_or_default()
             .to_ascii_lowercase();
         let mut command = if matches!(extension.as_str(), "bat" | "cmd") {
-            let mut command = std::process::Command::new("cmd.exe");
+            let mut command = std::process::Command::new(system32_tool("cmd.exe"));
             command.args(["/D", "/C"]).arg(&target);
             command
         } else if extension == "ps1" {
-            let mut command = std::process::Command::new("powershell.exe");
+            let mut command = std::process::Command::new(system32_tool("powershell.exe"));
             command.args(["-NoProfile", "-File"]).arg(&target);
             command
         } else {
@@ -4029,7 +4039,7 @@ fn open_file_with_dialog(cwd: String, path: String) -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        std::process::Command::new("rundll32.exe")
+        std::process::Command::new(system32_tool("rundll32.exe"))
             .arg("shell32.dll,OpenAs_RunDLL")
             .arg(path_for_webview(&file))
             .creation_flags(CREATE_NO_WINDOW)
@@ -6115,7 +6125,6 @@ fn unseal_secret_from_storage(stored: &str) -> Result<String, String> {
 }
 
 /// Redact sealed or raw API key material from operator-facing export dumps.
-#[allow(dead_code)] // Used by unit tests + ready for future export/support dumps.
 fn redact_secret_for_export(value: &str) -> String {
     let v = value.trim();
     if v.is_empty() {
@@ -6136,8 +6145,96 @@ fn read_provider_profiles_file() -> Result<ProviderProfilesFile, String> {
         return Ok(ProviderProfilesFile::default());
     }
     let content = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
-    serde_json::from_str(&content)
-        .map_err(|error| format!("无法解析供应商档案 {}：{error}", path.display()))
+    let mut value: ProviderProfilesFile = serde_json::from_str(&content)
+        .map_err(|error| format!("无法解析供应商档案 {}：{error}", path.display()))?;
+    // R12: migrate legacy plaintext keys on first read (not only on save).
+    let needs_seal = value.profiles.iter().any(|profile| {
+        !profile.api_key.is_empty() && !profile.api_key.starts_with(SECRET_SEAL_PREFIX)
+    });
+    if needs_seal {
+        // write_provider_profiles_file seals every plaintext key.
+        let _ = write_provider_profiles_file(&value);
+        // Re-read sealed form when write succeeded; keep in-memory sealed copy if re-read fails.
+        if let Ok(content) = read_bounded_text(&path, MAX_CONFIG_BYTES) {
+            if let Ok(sealed) = serde_json::from_str::<ProviderProfilesFile>(&content) {
+                return Ok(sealed);
+            }
+        }
+        // Fallback: seal in-memory for this process even if disk rewrite failed.
+        for profile in &mut value.profiles {
+            if profile.api_key.is_empty() || profile.api_key.starts_with(SECRET_SEAL_PREFIX) {
+                continue;
+            }
+            if let Ok(sealed) = seal_secret_for_storage(&profile.api_key) {
+                profile.api_key = sealed;
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// Operator support dump: versions, redacted provider summary, last-exit tail.
+/// Never includes unsealed API keys or full ~/.grok/.env contents.
+#[tauri::command]
+fn export_support_diagnostics() -> Result<String, String> {
+    let profiles = read_provider_profiles_file().unwrap_or_default();
+    let profiles_redacted: Vec<serde_json::Value> = profiles
+        .profiles
+        .iter()
+        .map(|profile| {
+            serde_json::json!({
+                "id": profile.id,
+                "name": profile.name,
+                "hasApiKey": !profile.api_key.is_empty(),
+                "apiKey": redact_secret_for_export(&profile.api_key),
+                "baseUrl": profile.base_url,
+                "apiBackend": profile.api_backend,
+                "residentModels": profile.resident_models,
+                "availableModelCount": profile.available_models.len(),
+            })
+        })
+        .collect();
+
+    let env_status = read_provider_status().ok();
+    let last_exit_tail = {
+        let path = std::env::var("LOCALAPPDATA")
+            .ok()
+            .map(|local| PathBuf::from(local).join("Grox").join("last-exit.log"));
+        match path {
+            Some(path) if path.is_file() => {
+                let text = read_bounded_text(&path, 64 * 1024).unwrap_or_default();
+                text.lines()
+                    .rev()
+                    .take(40)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            _ => String::new(),
+        }
+    };
+
+    let dump = serde_json::json!({
+        "generatedAtUnix": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "clientVersion": CLIENT_VERSION,
+        "buildCommit": GROX_BUILD_COMMIT,
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "activeProviderId": profiles.active_id,
+        "providers": profiles_redacted,
+        "providerStatus": env_status,
+        "lastExitLogTail": last_exit_tail,
+        "notes": [
+            "API keys are redacted or marked [dpapi-sealed]; never paste unredacted dumps.",
+            "Managed ~/.grok/.env secrets are not included in this export.",
+        ],
+    });
+    serde_json::to_string_pretty(&dump).map_err(|error| format!("无法序列化诊断信息：{error}"))
 }
 
 fn write_provider_profiles_file(value: &ProviderProfilesFile) -> Result<(), String> {
@@ -6542,7 +6639,7 @@ fn open_external(url: String) -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        std::process::Command::new("rundll32.exe")
+        std::process::Command::new(system32_tool("rundll32.exe"))
             .args(["url.dll,FileProtocolHandler", parsed.as_str()])
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
@@ -7126,6 +7223,7 @@ fn main() {
             refresh_provider_models,
             activate_provider_profile,
             delete_provider_profile,
+            export_support_diagnostics,
             grok_runtime_info,
             set_grok_runtime_preference,
             install_official_grok_cli,
@@ -7559,6 +7657,36 @@ api_key = "local-key"
             redact_secret_for_export("enc:v1:AAAA"),
             "[dpapi-sealed]"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system32_tool_uses_windows_dir_and_strips_path() {
+        let path = system32_tool(r"..\..\evil\powershell.exe");
+        let s = path.to_string_lossy();
+        assert!(s.ends_with("powershell.exe") || s.ends_with("powershell.EXE"));
+        assert!(s.contains("System32") || s.contains("system32"));
+        assert!(!s.contains("evil"));
+        let bare = system32_tool("rundll32.exe");
+        assert!(bare
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("rundll32.exe")));
+    }
+
+    #[test]
+    fn export_support_diagnostics_redacts_and_omits_env_secrets() {
+        let dump = export_support_diagnostics().expect("diagnostics");
+        assert!(dump.contains("clientVersion"));
+        assert!(dump.contains("providers"));
+        assert!(dump.contains("notes"));
+        // Must never dump full env secret material.
+        assert!(!dump.contains("XAI_API_KEY="));
+        // Redaction markers acceptable; raw long sk- keys should not appear if sealed.
+        if dump.contains("sk-") {
+            // If a short redacted prefix leaks, body must still use ellipsis form.
+            assert!(dump.contains('…') || dump.contains("[dpapi-sealed]") || dump.contains("********"));
+        }
     }
 
     #[test]

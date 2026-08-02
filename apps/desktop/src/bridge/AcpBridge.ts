@@ -815,6 +815,8 @@ export class AcpBridge implements GrokBridge {
   /** Crash auto-reconnect budget for the current agent life. */
   private reconnectAttempts = 0;
   private reconnectTimer: number | undefined;
+  /** True while crash auto-reconnect owns `ready` (prompt/drain must wait). */
+  private crashReconnectInFlight = false;
   /**
    * Scheme C + visit memory:
    * 1) Always prefer full-load of the active mission if unbound.
@@ -1530,6 +1532,10 @@ export class AcpBridge implements GrokBridge {
       }
       this.pending.clear();
       this.resetBindStateAfterAgentExit();
+      // Park ready on a rejected promise so send/drain cannot talk to a dead child.
+      const stopped = new Error("Grok Agent 已停止");
+      this.ready = Promise.reject(stopped);
+      void this.ready.catch(() => undefined);
       return;
     }
     const diagnostic = this.diagnostics
@@ -1557,46 +1563,73 @@ export class AcpBridge implements GrokBridge {
     for (const sessionId of bound) {
       this.emit({ type: "error", sessionId, message });
     }
-    // Unexpected crash: auto-reconnect a few times (provider switch uses suppress).
-    this.scheduleCrashReconnect(message);
+    // Park `ready` on the reconnect promise so queue drain / prompt cannot race
+    // a dead stdio child while the 800ms backoff runs (R12).
+    if (!this.crashReconnectInFlight) {
+      this.crashReconnectInFlight = true;
+      this.ready = this.runCrashReconnect(message).finally(() => {
+        this.crashReconnectInFlight = false;
+      });
+      void this.ready.catch(() => undefined);
+    }
   }
 
-  private scheduleCrashReconnect(lastMessage: string): void {
-    if (this.reconnectTimer !== undefined) return;
-    if (this.reconnectAttempts >= 2) {
+  /**
+   * Auto-reconnect after unexpected agent exit. Owns `this.ready` for the full
+   * attempt budget so concurrent prompt/drain await the live child.
+   */
+  private async runCrashReconnect(lastMessage: string): Promise<void> {
+    let lastError = lastMessage;
+    while (this.reconnectAttempts < 2) {
+      this.reconnectAttempts += 1;
+      const attempt = this.reconnectAttempts;
+      const delayMs = 800 * attempt;
       this.setAuthState({
-        required: this.authState.required,
-        inProgress: false,
-        error: `${lastMessage}（已自动重连 2 次仍失败，请重启 Grox 或检查 Grok CLI）`,
+        ...this.authState,
+        inProgress: true,
+        error: `Agent 异常退出，正在自动重连（${attempt}/2）…`,
       });
-      return;
-    }
-    this.reconnectAttempts += 1;
-    const attempt = this.reconnectAttempts;
-    const delayMs = 800 * attempt;
-    this.reconnectTimer = window.setTimeout(() => {
-      this.reconnectTimer = undefined;
-      void this.restartAgent()
-        .then(() => {
-          this.setAuthState({
-            ...this.authState,
-            error: undefined,
-            inProgress: false,
-          });
-        })
-        .catch((error) => {
-          const detail = errorText(error);
-          if (this.reconnectAttempts < 2) {
-            this.scheduleCrashReconnect(detail);
-          } else {
-            this.setAuthState({
-              required: this.authState.required,
-              inProgress: false,
-              error: `Agent 崩溃后自动重连失败：${detail}`,
-            });
-          }
+      await new Promise<void>((resolve) => {
+        this.reconnectTimer = window.setTimeout(() => {
+          this.reconnectTimer = undefined;
+          resolve();
+        }, delayMs);
+      });
+      try {
+        await this.restartAgent();
+        this.setAuthState({
+          ...this.authState,
+          error: undefined,
+          inProgress: false,
         });
-    }, delayMs);
+        // Rebind active mission in the background so the next send is cheap.
+        const active = this.activeSessionId();
+        if (active) {
+          this.enqueueBackgroundLoad(active);
+          this.emit({
+            type: "block_add",
+            sessionId: active,
+            block: {
+              type: "system",
+              id: uid(),
+              text: "Agent 已自动重连；可继续对话（首次发送会静默绑定上下文）",
+              ts: Date.now(),
+              kind: "info",
+            },
+          });
+        }
+        return;
+      } catch (error) {
+        lastError = errorText(error);
+      }
+    }
+    const finalMessage = `${lastError}（已自动重连 2 次仍失败，请重启 Grox 或检查 Grok CLI）`;
+    this.setAuthState({
+      required: this.authState.required,
+      inProgress: false,
+      error: finalMessage,
+    });
+    throw new Error(finalMessage);
   }
 
   private onLine(line: string) {
