@@ -1770,7 +1770,8 @@ fn preview_type(path: &Path) -> (&'static str, &'static str) {
         "jpg" | "jpeg" => ("image", "image/jpeg"),
         "gif" => ("image", "image/gif"),
         "webp" => ("image", "image/webp"),
-        "svg" => ("image", "image/svg+xml"),
+        // R19: SVG as text — data:image/svg+xml can be scriptable; never render as <img>.
+        "svg" => ("text", "text/plain"),
         "bmp" => ("image", "image/bmp"),
         "txt" | "log" | "json" | "jsonl" | "toml" | "yaml" | "yml" | "xml" | "css" | "js"
         | "jsx" | "ts" | "tsx" | "rs" | "py" | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "sh"
@@ -3340,6 +3341,10 @@ fn read_prompt_image_paths(cwd: String, paths: Vec<String>) -> Result<Vec<Prompt
         }
         let mime = image_mime(&bytes)
             .ok_or_else(|| "图片内容不是受支持的图片格式".to_string())?;
+        // R19: SVG is scriptable in some embedding contexts — never multimodal-attach.
+        if mime == "image/svg+xml" {
+            return Err("不支持将 SVG 作为提示图片附件".into());
+        }
         images.push(PromptPathImage {
             path,
             name: file
@@ -3549,6 +3554,43 @@ fn git_push(cwd: String) -> Result<String, String> {
 }
 
 
+/// Extensions that the OS would execute (or script) if opened as a document.
+/// R19: never hand these to the shell/default handler from the desktop UI.
+fn is_dangerous_open_extension(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "exe"
+            | "com"
+            | "bat"
+            | "cmd"
+            | "ps1"
+            | "msi"
+            | "msp"
+            | "scr"
+            | "cpl"
+            | "msc"
+            | "js"
+            | "jse"
+            | "vbs"
+            | "vbe"
+            | "wsf"
+            | "wsh"
+            | "lnk"
+            | "url"
+            | "pif"
+            | "reg"
+            | "msix"
+            | "appx"
+            | "dll"
+            | "sys"
+    )
+}
+
 /// Ask the platform to open a workspace file with its default application.
 #[tauri::command]
 fn open_file_with_default(cwd: String, path: String) -> Result<(), String> {
@@ -3556,6 +3598,9 @@ fn open_file_with_default(cwd: String, path: String) -> Result<(), String> {
     let file = checked_workspace_file(&root, &path)?;
     if !file.is_file() {
         return Err("只能使用默认应用打开文件".into());
+    }
+    if is_dangerous_open_extension(&file) {
+        return Err("出于安全考虑，不能直接打开可执行或脚本类文件".into());
     }
     #[cfg(windows)]
     std::process::Command::new(system32_tool("explorer.exe"))
@@ -3931,8 +3976,10 @@ fn checked_windows_application(requested: &str) -> Result<PathBuf, String> {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "exe" | "com" | "bat" | "cmd" | "ps1") {
-        return Err("打开应用必须是 Windows 可执行文件".into());
+    // R19: only native binaries as the *application* launcher — never bat/cmd/ps1
+    // (script hosts would run with the workspace file as argv under attacker control).
+    if !matches!(extension.as_str(), "exe" | "com") {
+        return Err("打开应用必须是 Windows 原生可执行文件（.exe/.com）".into());
     }
     let discovered = list_windows_open_applications()?;
     if !discovered.iter().any(|item| {
@@ -4270,6 +4317,10 @@ fn open_file_with_application(cwd: String, path: String, application: String) ->
     if !file.is_file() {
         return Err("只能使用应用打开文件".into());
     }
+    // R19: refuse opening executable/script *documents* (path is the file to view).
+    if is_dangerous_open_extension(&file) {
+        return Err("出于安全考虑，不能用外部应用打开可执行或脚本类文件".into());
+    }
     #[cfg(target_os = "macos")]
     {
         let application_path = checked_application_bundle(&application)?;
@@ -4354,6 +4405,9 @@ fn open_file_with_dialog(cwd: String, path: String) -> Result<(), String> {
     let file = checked_workspace_file(&root, &path)?;
     if !file.is_file() {
         return Err("只能选择文件的打开方式".into());
+    }
+    if is_dangerous_open_extension(&file) {
+        return Err("出于安全考虑，不能为可执行或脚本类文件选择打开方式".into());
     }
 
     #[cfg(windows)]
@@ -6550,6 +6604,14 @@ fn write_config_document(request: WriteConfigDocument) -> Result<ConfigDocument,
     if request.content.contains('\0') {
         return Err("配置内容不能包含空字节".into());
     }
+    // R19: reject oversized drafts before merge/write (atomic_write also caps).
+    if request.content.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(format!(
+            "配置内容过大（{} bytes，上限 {}）",
+            request.content.len(),
+            MAX_CONFIG_BYTES
+        ));
+    }
     let (path, label, language) = config_path(id, &cwd)?;
     let to_write = if id == "config" && path.is_file() {
         // R14.2 N3: fail-closed — never treat unreadable existing as empty
@@ -7081,14 +7143,26 @@ async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, S
         .await
         .map_err(|error| format!("无法获取模型列表：{error}"))?
         .error_for_status()
-        .map_err(|error| format!("模型服务返回错误：{error}"))?
-        .json::<OpenAiModelsResponse>()
+        .map_err(|error| format!("模型服务返回错误：{error}"))?;
+    // R18/R19: cap wire body before JSON parse (hostile provider memory bomb).
+    const MAX_MODELS_BODY_BYTES: usize = 4 * 1024 * 1024;
+    let body = response
+        .bytes()
         .await
+        .map_err(|error| format!("无法读取模型列表：{error}"))?;
+    if body.len() > MAX_MODELS_BODY_BYTES {
+        return Err(format!(
+            "模型列表响应过大（{} bytes，上限 {MAX_MODELS_BODY_BYTES}）",
+            body.len()
+        ));
+    }
+    let response: OpenAiModelsResponse = serde_json::from_slice(&body)
         .map_err(|error| format!("模型列表不是 OpenAI 兼容格式：{error}"))?;
     let mut models = response
         .data
         .into_iter()
         .map(|model| model.id)
+        .filter(|id| !id.is_empty() && id.chars().count() <= 200 && !id.chars().any(char::is_control))
         .collect::<Vec<_>>();
     models.sort_by_key(|model| model.to_ascii_lowercase());
     models.dedup();
@@ -8460,6 +8534,26 @@ api_key = "local-key"
         assert!(!is_safe_preview_dev_script("node --eval require('fs')"));
         assert!(!is_safe_preview_dev_script("certutil -urlcache"));
         assert!(is_safe_preview_dev_script("vite"));
+    }
+
+    #[test]
+    fn dangerous_open_extension_covers_exec_and_scripts() {
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\tool.exe")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\run.ps1")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\a.bat")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\x.lnk")));
+        assert!(!is_dangerous_open_extension(Path::new(r"C:\ws\readme.md")));
+        assert!(!is_dangerous_open_extension(Path::new(r"C:\ws\photo.png")));
+    }
+
+    #[test]
+    fn svg_preview_is_text_not_image() {
+        let (kind, mime) = preview_type(Path::new("diagram.svg"));
+        assert_eq!(kind, "text");
+        assert_eq!(mime, "text/plain");
+        let (kind, mime) = preview_type(Path::new("photo.png"));
+        assert_eq!(kind, "image");
+        assert_eq!(mime, "image/png");
     }
 
     #[test]
