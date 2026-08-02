@@ -1,4 +1,12 @@
-import { memo, type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  type CSSProperties,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import type { Session, SessionBlock } from "../../bridge/types";
 import { useDesktop } from "../../state/store";
@@ -400,7 +408,10 @@ const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
  * click "show earlier turns" just to read what was already loaded from disk.
  */
 const LIVE_TURN_WINDOW = 40;
-const STICK_BOTTOM_PX = 48;
+/** How close to the true bottom before we consider "stuck" for auto-follow. */
+const STICK_BOTTOM_PX = 80;
+/** After wheel/touch scroll, suppress follow so stream growth cannot yank the viewport. */
+const USER_UNFOLLOW_MS = 1200;
 
 /** Stable Footer type — inline `Footer: () => …` remounts Virtuoso chrome every stream tick. */
 function TimelineVirtuosoFooter() {
@@ -417,8 +428,12 @@ export function Timeline({ session }: { session: Session }) {
   const scanProgress =
     diskHistoryProgress?.id === session.id ? diskHistoryProgress : null;
   const virtuosoRef = useRef<VirtuosoHandle>(null);
+  /** When true, stream growth may pin the viewport to the last turn. */
   const followRef = useRef(true);
+  /** Timestamp until which follow is forced off after explicit user scroll. */
+  const unfollowUntilRef = useRef(0);
   const jumpTimersRef = useRef<number[]>([]);
+  const scrollerElRef = useRef<HTMLElement | null>(null);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
   /** true = show entire transcript (default for restored history). */
   const [showAll, setShowAll] = useState(true);
@@ -442,10 +457,21 @@ export function Timeline({ session }: { session: Session }) {
     }));
   }, [language, turns]);
 
+  const markUserUnfollow = useCallback(() => {
+    followRef.current = false;
+    unfollowUntilRef.current = Date.now() + USER_UNFOLLOW_MS;
+  }, []);
+
+  const canFollow = useCallback(() => {
+    if (Date.now() < unfollowUntilRef.current) return false;
+    return followRef.current;
+  }, []);
+
   // Opening / switching: always show full history (scroll sticks to bottom).
   useEffect(() => {
     setShowAll(true);
     followRef.current = true;
+    unfollowUntilRef.current = 0;
   }, [session.id]);
 
   // Offline scan / cache upgrade may add many older turns — keep them visible.
@@ -494,7 +520,7 @@ export function Timeline({ session }: { session: Session }) {
     if (!showAll && !visibleTurns.some((turn) => turn.id === id)) {
       setShowAll(true);
     }
-    followRef.current = false;
+    markUserUnfollow();
     clearJumpTimers();
     const run = () => {
       // Index against the list Virtuoso currently renders (or full after expand).
@@ -518,7 +544,7 @@ export function Timeline({ session }: { session: Session }) {
   };
 
   const scrollToBottom = (force = false) => {
-    if (!force && !followRef.current) return false;
+    if (!force && !canFollow()) return false;
     if (visibleTurns.length === 0) return false;
     virtuosoRef.current?.scrollToIndex({
       index: "LAST",
@@ -528,18 +554,61 @@ export function Timeline({ session }: { session: Session }) {
     return true;
   };
 
+  type ScrollerEl = HTMLElement & { __groxUnfollowScroll?: () => void };
+
+  const detachScroller = useCallback(
+    (node: ScrollerEl | null) => {
+      if (!node) return;
+      node.removeEventListener("wheel", markUserUnfollow);
+      node.removeEventListener("touchmove", markUserUnfollow);
+      if (node.__groxUnfollowScroll) {
+        node.removeEventListener("scroll", node.__groxUnfollowScroll);
+        delete node.__groxUnfollowScroll;
+      }
+    },
+    [markUserUnfollow],
+  );
+
+  // Attach to Virtuoso scroller: wheel/touch/scroll-up must unfollow immediately.
+  // atBottomStateChange alone is too slow / flaky while tall Computer-Use tables remeasure.
+  const scrollerRef = useCallback(
+    (el: HTMLElement | Window | null) => {
+      detachScroller(scrollerElRef.current as ScrollerEl | null);
+      const node = el instanceof HTMLElement ? (el as ScrollerEl) : null;
+      scrollerElRef.current = node;
+      if (!node) return;
+      node.addEventListener("wheel", markUserUnfollow, { passive: true });
+      node.addEventListener("touchmove", markUserUnfollow, { passive: true });
+      let lastTop = node.scrollTop;
+      const onScrollerScroll = () => {
+        const top = node.scrollTop;
+        if (top + 2 < lastTop) markUserUnfollow();
+        lastTop = top;
+      };
+      node.__groxUnfollowScroll = onScrollerScroll;
+      node.addEventListener("scroll", onScrollerScroll, { passive: true });
+    },
+    [detachScroller, markUserUnfollow],
+  );
+
+  useEffect(
+    () => () => detachScroller(scrollerElRef.current as ScrollerEl | null),
+    [detachScroller],
+  );
+
   // Stick to bottom only on open/switch — never yank on every block_add (user reading up).
   useEffect(() => {
     clearJumpTimers();
     if (!hasBlocks) return;
     followRef.current = true;
+    unfollowUntilRef.current = 0;
     scrollToBottom(true);
     // Delayed remeasure must honor unfollow if the user scrolled/jumped early.
     const t1 = window.setTimeout(() => {
-      if (followRef.current) scrollToBottom(true);
+      if (canFollow()) scrollToBottom(true);
     }, 40);
     const t2 = window.setTimeout(() => {
-      if (followRef.current) scrollToBottom(true);
+      if (canFollow()) scrollToBottom(true);
     }, 160);
     return () => {
       window.clearTimeout(t1);
@@ -658,7 +727,7 @@ export function Timeline({ session }: { session: Session }) {
               <button
                 type="button"
                 onClick={() => {
-                  followRef.current = false;
+                  markUserUnfollow();
                   setShowAll(true);
                 }}
                 className="mb-6 flex w-full items-center justify-center gap-2 rounded-md border border-line bg-raise/60 py-2 text-[12px] text-mute transition-colors hover:bg-high hover:text-fg2"
@@ -681,6 +750,7 @@ export function Timeline({ session }: { session: Session }) {
       bindElapsedSec,
       language,
       hiddenCount,
+      markUserUnfollow,
     ],
   );
 
@@ -689,6 +759,7 @@ export function Timeline({ session }: { session: Session }) {
       <Virtuoso
         key={session.id}
         ref={virtuosoRef}
+        scrollerRef={scrollerRef}
         className="h-full min-w-0 flex-1"
         data={visibleTurns}
         // Open at the end so restored history does not flash top→bottom.
@@ -697,17 +768,25 @@ export function Timeline({ session }: { session: Session }) {
             ? { index: visibleTurns.length - 1, align: "end" }
             : 0
         }
-        defaultItemHeight={280}
-        increaseViewportBy={{ top: 600, bottom: 800 }}
+        // Tall Computer-Use tables remeasure hard; underestimate less to reduce jump.
+        defaultItemHeight={360}
+        increaseViewportBy={{ top: 800, bottom: 1000 }}
         atBottomThreshold={STICK_BOTTOM_PX}
         atBottomStateChange={(atBottom) => {
+          // Never re-enable follow during the user-scroll cooldown (stream can
+          // briefly report atBottom=true while tables remeasure).
+          if (Date.now() < unfollowUntilRef.current) {
+            if (!atBottom) followRef.current = false;
+            return;
+          }
           followRef.current = atBottom;
         }}
-        followOutput={() => {
-          // Only the follow flag — atBottom alone must not re-stick after RequestRail jump.
-          if (!followRef.current) return false;
-          // Instant follow while live — "smooth" stacks animation jank under tokens.
-          return isLive ? true : "auto";
+        followOutput={(isAtBottom) => {
+          // Require BOTH sticky intent and Virtuoso's at-bottom — live `true`
+          // alone yanked tall CU tables whenever the last item grew.
+          if (!canFollow() || !isAtBottom) return false;
+          // "auto" follows without stacking smooth animations under token stream.
+          return isLive ? "auto" : false;
         }}
         computeItemKey={(_index, turn) => turn.id}
         components={virtuosoComponents}
