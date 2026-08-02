@@ -191,8 +191,60 @@ function General() {
     {runtimeError && <p className="mb-4 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{runtimeError}</p>}
     <Row label={zh ? "推理强度" : "Reasoning effort"}><div className="flex gap-1">{EFFORTS.map((item) => <button key={item} onClick={() => setEffort(item)} className={`h-7 rounded-[3px] border px-2 font-mono text-[9.5px] ${effort === item ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim"}`}>{item.toUpperCase()}</button>)}</div></Row>
     <Row label={zh ? "权限模式" : "Permission mode"} hint={zh ? "默认 Auto：按 Agent 策略少弹批。Default 每次工具都确认；Bypass 仅用于可信环境。" : "Default is Auto (fewer prompts). Default mode confirms every tool; Bypass is for trusted environments only."}><select value={permission} onChange={(event) => setPermission(event.target.value as typeof permission)} className="h-8 rounded-[4px] border border-line2 bg-void px-2 font-mono text-[9.5px] text-fg2"><option value="auto">AUTO（默认）</option><option value="default">DEFAULT</option><option value="bypass">BYPASS / YOLO</option></select></Row>
+    <SupportDiagnostics zh={zh} bridgeKind={bridgeKind} />
     <ComputerUseOptIn zh={zh} />
   </div>;
+}
+
+/** Copy redacted support dump (no raw API keys / .env) to the clipboard. */
+function SupportDiagnostics({ zh, bridgeKind }: { zh: boolean; bridgeKind: string }) {
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const copy = () => {
+    if (bridgeKind !== "acp") {
+      setError(zh ? "仅 ACP 桌面壳支持导出诊断" : "Diagnostics export requires the ACP desktop shell");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setNotice("");
+    void invoke<string>("export_support_diagnostics")
+      .then(async (dump) => {
+        try {
+          await navigator.clipboard.writeText(dump);
+          setNotice(zh ? "已复制脱敏诊断（不含 API 密钥）" : "Redacted diagnostics copied (no API keys)");
+        } catch {
+          // Clipboard may be blocked; still surface the dump length so operator knows it ran.
+          setNotice(
+            zh
+              ? `已生成诊断（${dump.length} 字符），剪贴板不可用时请从控制台粘贴`
+              : `Diagnostics ready (${dump.length} chars); clipboard unavailable`,
+          );
+          console.info("[grox] support diagnostics\n", dump);
+        }
+      })
+      .catch((cause) => {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      })
+      .finally(() => setBusy(false));
+  };
+  return (
+    <>
+      <Row
+        label={zh ? "支持诊断" : "Support diagnostics"}
+        hint={zh
+          ? "导出版本、供应商摘要（密钥已脱敏）与 last-exit 尾部。不含 ~/.grok/.env 明文。"
+          : "Export version, redacted provider summary, and last-exit tail. Never includes ~/.grok/.env secrets."}
+      >
+        <ActionButton disabled={busy || bridgeKind !== "acp"} onClick={copy}>
+          {busy ? (zh ? "导出中…" : "Exporting…") : (zh ? "复制诊断" : "Copy diagnostics")}
+        </ActionButton>
+      </Row>
+      {notice && <p className="mb-3 rounded-[4px] border border-line2 bg-raise px-3 py-2 text-[10px] text-dim">{notice}</p>}
+      {error && <p className="mb-3 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{error}</p>}
+    </>
+  );
 }
 
 function ComputerUseOptIn({ zh }: { zh: boolean }) {

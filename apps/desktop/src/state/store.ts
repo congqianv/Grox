@@ -1214,6 +1214,29 @@ export const useDesktop = create<DesktopState>((set, get) => {
           drainPromptQueue(e.sessionId);
         }, 0);
         break;
+      case "agent_reconnected": {
+        // Crash recovery finished — ensure every live session is idle and
+        // re-attempt local queue drain (prompts that started during reconnect
+        // may have failed bind; others may still be queued).
+        const live = get().sessions;
+        const next: typeof live = {};
+        for (const [id, session] of Object.entries(live)) {
+          next[id] =
+            session.status === "running" ||
+            session.status === "awaiting_permission" ||
+            session.status === "awaiting_input"
+              ? { ...session, status: "idle" }
+              : session;
+        }
+        set({ sessions: next });
+        window.setTimeout(() => {
+          for (const id of Object.keys(get().sessions)) {
+            flushPendingOfflineMerge(id);
+            drainPromptQueue(id);
+          }
+        }, 0);
+        break;
+      }
       case "prompt_queue": {
         // CLI is authoritative for known ids, but must not wipe local-only rows
         // that have not been acknowledged yet (enqueue race with queue/changed).

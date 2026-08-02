@@ -3072,8 +3072,45 @@ fn read_prompt_image_paths(cwd: String, paths: Vec<String>) -> Result<Vec<Prompt
 }
 
 
+/// Prefer absolute Git installs so a PATH-planted `git.exe` cannot run under the shell.
+fn resolve_git_executable() -> PathBuf {
+    #[cfg(windows)]
+    {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for key in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+            if let Ok(root) = std::env::var(key) {
+                let base = PathBuf::from(root);
+                candidates.push(base.join(r"Git\cmd\git.exe"));
+                candidates.push(base.join(r"Git\bin\git.exe"));
+                // Portable / user-scoped installs under LocalAppData\Programs.
+                candidates.push(base.join(r"Programs\Git\cmd\git.exe"));
+                candidates.push(base.join(r"Programs\Git\bin\git.exe"));
+            }
+        }
+        candidates.push(PathBuf::from(r"C:\Program Files\Git\cmd\git.exe"));
+        candidates.push(PathBuf::from(r"C:\Program Files\Git\bin\git.exe"));
+        candidates.push(PathBuf::from(r"C:\Program Files (x86)\Git\cmd\git.exe"));
+        for path in candidates {
+            if path.is_file() {
+                return path;
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        for path in ["/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"] {
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                return path;
+            }
+        }
+    }
+    PathBuf::from("git")
+}
+
 fn git_command(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    let mut command = std::process::Command::new("git");
+    let git = resolve_git_executable();
+    let mut command = std::process::Command::new(&git);
     command.current_dir(root).args(args);
     #[cfg(windows)]
     {
@@ -3082,7 +3119,7 @@ fn git_command(root: &Path, args: &[&str]) -> Result<std::process::Output, Strin
     }
     command
         .output()
-        .map_err(|error| format!("无法运行 Git：{error}"))
+        .map_err(|error| format!("无法运行 Git（{}）：{error}", git.display()))
 }
 
 fn git_text(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -3237,7 +3274,7 @@ fn open_file_with_default(cwd: String, path: String) -> Result<(), String> {
         return Err("只能使用默认应用打开文件".into());
     }
     #[cfg(windows)]
-    std::process::Command::new("explorer.exe")
+    std::process::Command::new(system32_tool("explorer.exe"))
         .arg(&file)
         .spawn()
         .map_err(|error| format!("无法打开默认应用：{error}"))?;
@@ -6634,6 +6671,10 @@ fn open_external(url: String) -> Result<(), String> {
     if parsed.host_str().is_none() {
         return Err("链接缺少主机名".into());
     }
+    // R13: cleartext HTTP only for loopback (preview servers); remote must be HTTPS.
+    if parsed.scheme() == "http" && !is_loopback_host(parsed.host_str()) {
+        return Err("远程链接必须使用 HTTPS；仅本机回环地址允许 HTTP".into());
+    }
 
     #[cfg(windows)]
     {
@@ -7644,6 +7685,47 @@ api_key = "local-key"
         assert!(!is_allowed_update_download_host(Some("github.com.evil.com")));
         assert!(!is_allowed_update_download_host(Some("")));
         assert!(!is_allowed_update_download_host(None));
+    }
+
+    #[test]
+    fn open_external_rejects_remote_http_and_credentials() {
+        // Validation only — do not actually spawn a browser.
+        let reject_http = {
+            let trimmed = "http://evil.example/phish";
+            let parsed = url::Url::parse(trimmed).unwrap();
+            parsed.scheme() == "http" && !is_loopback_host(parsed.host_str())
+        };
+        assert!(reject_http);
+        let allow_loopback = {
+            let parsed = url::Url::parse("http://127.0.0.1:5173/").unwrap();
+            parsed.scheme() == "http" && is_loopback_host(parsed.host_str())
+        };
+        assert!(allow_loopback);
+        let allow_https = {
+            let parsed = url::Url::parse("https://github.com/congqianv/Grox/releases").unwrap();
+            parsed.scheme() == "https" && parsed.username().is_empty() && parsed.password().is_none()
+        };
+        assert!(allow_https);
+        let reject_userinfo = {
+            let parsed = url::Url::parse("https://user:pass@evil.example/").unwrap();
+            !parsed.username().is_empty() || parsed.password().is_some()
+        };
+        assert!(reject_userinfo);
+    }
+
+    #[test]
+    fn resolve_git_executable_returns_path_like_git() {
+        let path = resolve_git_executable();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            name == "git" || name == "git.exe",
+            "unexpected git basename: {}",
+            path.display()
+        );
     }
 
     #[test]

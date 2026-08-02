@@ -408,6 +408,8 @@ export type BridgeEvent =
   | { type: "status"; sessionId: string; status: SessionStatus }
   | { type: "usage"; sessionId: string; usage: Usage }
   | { type: "error"; sessionId: string; message: string }
+  /** Agent child recovered after unexpected exit (queues may drain again). */
+  | { type: "agent_reconnected" }
   /** Authoritative prompt queue from CLI (`x.ai/queue/changed`) or bridge. */
   | { type: "prompt_queue"; sessionId: string; entries: PromptQueueEntry[] };
 

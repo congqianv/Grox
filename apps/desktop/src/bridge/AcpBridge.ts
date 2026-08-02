@@ -1618,6 +1618,8 @@ export class AcpBridge implements GrokBridge {
             },
           });
         }
+        // Let the store re-drain local queues that parked while ready was offline.
+        this.emit({ type: "agent_reconnected" });
         return;
       } catch (error) {
         lastError = errorText(error);

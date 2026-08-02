@@ -304,7 +304,11 @@ export const Markdown = memo(function Markdown({
     if (!href) return;
     try {
       const url = new URL(href);
-      if (url.protocol === "https:" || url.protocol === "http:") {
+      // Match open_external R13 policy: remote HTTPS only; loopback may use HTTP.
+      const host = url.hostname.toLowerCase();
+      const loopback =
+        host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
+      if (url.protocol === "https:" || (url.protocol === "http:" && loopback)) {
         void invoke("open_external", { url: url.toString() });
       }
     } catch {
