@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import type { Session, SessionBlock } from "../../bridge/types";
 import { useDesktop } from "../../state/store";
 import { useI18n } from "../../lib/i18n";
@@ -15,6 +15,139 @@ interface Turn {
   id: string;
   blocks: SessionBlock[];
   promptIndex: number;
+}
+
+interface RequestMarker {
+  id: string;
+  index: number;
+  position: number;
+  prompt: string;
+  response: string;
+}
+
+function compactPreview(text: string, limit: number): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= limit) return compact;
+  return `${compact.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
+}
+
+function requestPreview(
+  turn: Turn,
+  language: string,
+): Omit<RequestMarker, "index" | "position"> | undefined {
+  const user = turn.blocks.find(
+    (block): block is Extract<SessionBlock, { type: "user" }> => block.type === "user",
+  );
+  if (!user) return undefined;
+  const assistant = turn.blocks
+    .filter(
+      (block): block is Extract<SessionBlock, { type: "assistant" }> =>
+        block.type === "assistant",
+    )
+    .at(-1);
+  return {
+    id: turn.id,
+    prompt: compactPreview(user.text, 92),
+    response: assistant?.text.trim()
+      ? compactPreview(assistant.text, 128)
+      : language === "zh-CN"
+        ? "正在等待 Grok 的回复…"
+        : "Waiting for Grok's reply…",
+  };
+}
+
+/** Upstream dandandujie/Grox: left rail for quick jump between user requests. */
+function RequestRail({
+  markers,
+  language,
+  onJump,
+}: {
+  markers: RequestMarker[];
+  language: string;
+  onJump(id: string): void;
+}) {
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const markerNodes = useRef(new Map<string, HTMLButtonElement>());
+  const waveFrame = useRef<number | null>(null);
+  const pointerPosition = useRef<number | null>(null);
+
+  const updateWave = (position: number | null) => {
+    pointerPosition.current = position;
+    if (waveFrame.current !== null) return;
+    waveFrame.current = requestAnimationFrame(() => {
+      waveFrame.current = null;
+      const point = pointerPosition.current;
+      for (const marker of markers) {
+        const node = markerNodes.current.get(marker.id);
+        if (!node) continue;
+        const wave =
+          point === null ? 0 : Math.max(0, 1 - Math.abs(marker.position - point) / 17);
+        node.style.setProperty("--request-rail-wave", wave.toFixed(3));
+      }
+    });
+  };
+
+  useEffect(
+    () => () => {
+      if (waveFrame.current !== null) cancelAnimationFrame(waveFrame.current);
+    },
+    [],
+  );
+
+  if (markers.length === 0) return null;
+
+  return (
+    <nav
+      className="request-rail"
+      aria-label={language === "zh-CN" ? "请求导航" : "Request navigation"}
+      onPointerMove={(event) => {
+        const bounds = event.currentTarget.getBoundingClientRect();
+        if (bounds.height <= 0) return;
+        updateWave(Math.max(0, Math.min(100, ((event.clientY - bounds.top) / bounds.height) * 100)));
+      }}
+      onPointerLeave={() => {
+        updateWave(null);
+        setHoveredId(null);
+      }}
+    >
+      <span className="request-rail__spine" aria-hidden="true" />
+      {markers.map((marker) => {
+        const hovering = hoveredId === marker.id;
+        const style = {
+          top: `${marker.position}%`,
+          "--request-rail-hovered": hovering ? "1" : "0",
+        } as CSSProperties;
+        const label =
+          language === "zh-CN" ? `请求 ${marker.index + 1}` : `Request ${marker.index + 1}`;
+        return (
+          <button
+            key={marker.id}
+            type="button"
+            className={`request-rail__marker ${hovering ? "is-hovered" : ""}`}
+            style={style}
+            ref={(node) => {
+              if (node) markerNodes.current.set(marker.id, node);
+              else markerNodes.current.delete(marker.id);
+            }}
+            onPointerEnter={() => setHoveredId(marker.id)}
+            onFocus={() => setHoveredId(marker.id)}
+            onBlur={() => setHoveredId(null)}
+            onClick={() => onJump(marker.id)}
+            aria-label={`${label}: ${marker.prompt}`}
+          >
+            <span className="request-rail__bar" aria-hidden="true" />
+            {hovering && (
+              <span className="request-rail__tooltip" role="tooltip">
+                <span className="request-rail__tooltip-label">{label}</span>
+                <span className="request-rail__tooltip-prompt">{marker.prompt}</span>
+                <span className="request-rail__tooltip-response">{marker.response}</span>
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </nav>
+  );
 }
 
 /** True when `next` is a stream-retry twin of `prev` (same/fuller body, not new content). */
@@ -275,6 +408,7 @@ export function Timeline({ session }: { session: Session }) {
     diskHistoryProgress?.id === session.id ? diskHistoryProgress : null;
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const turnNodes = useRef(new Map<string, HTMLDivElement>());
   const followRef = useRef(true);
   /** Suppress onScroll while we programmatically pin to bottom. */
   const pinningRef = useRef(false);
@@ -289,6 +423,19 @@ export function Timeline({ session }: { session: Session }) {
   // Latest turn id — only this row uses live process chrome while the session runs.
   const lastTurnId = turns.at(-1)?.id;
   const isLive = session.status === "running";
+
+  const markers = useMemo<RequestMarker[]>(() => {
+    const requests = turns
+      .map((turn) => requestPreview(turn, language))
+      .filter((marker): marker is Omit<RequestMarker, "index" | "position"> => Boolean(marker));
+    if (requests.length === 0) return [];
+    return requests.map((marker, index) => ({
+      ...marker,
+      index,
+      // Evenly spaced navigation index (table of contents), not a pixel map.
+      position: ((index + 0.5) / requests.length) * 100,
+    }));
+  }, [language, turns]);
 
   // Opening / switching: always show full history (scroll sticks to bottom).
   useEffect(() => {
@@ -307,6 +454,20 @@ export function Timeline({ session }: { session: Session }) {
     return turns.slice(turns.length - LIVE_TURN_WINDOW);
   }, [showAll, turns, isLive]);
   const hiddenCount = turns.length - visibleTurns.length;
+
+  const jumpToTurn = (id: string) => {
+    const viewport = scrollRef.current;
+    const node = turnNodes.current.get(id);
+    if (!viewport || !node) return;
+    followRef.current = false;
+    const viewportRect = viewport.getBoundingClientRect();
+    const target =
+      viewport.scrollTop +
+      node.getBoundingClientRect().top -
+      viewportRect.top -
+      viewport.clientHeight * 0.14;
+    viewport.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
+  };
 
   const scrollToBottom = (force = false) => {
     const element = scrollRef.current;
@@ -397,88 +558,100 @@ export function Timeline({ session }: { session: Session }) {
   }
 
   return (
-    <div
-      ref={scrollRef}
-      onScroll={() => {
-        if (pinningRef.current) return;
-        const element = scrollRef.current;
-        if (!element) return;
-        followRef.current =
-          element.scrollHeight - element.scrollTop - element.clientHeight < STICK_BOTTOM_PX;
-      }}
-      className="flex-1 overflow-y-auto"
-    >
-      <div ref={contentRef} className="mx-auto max-w-[860px] px-8 py-8">
-        {loadingFullHistory && (
-          <div className="mb-4 rounded-md border border-line/80 bg-raise/50 px-3 py-2.5">
-            <div className="flex items-center justify-center gap-2 text-[11.5px] text-mute">
-              <BlackHole size={14} spin />
-              <span className="min-w-0 text-center">
-                {historyLoadMode === "disk"
-                  ? language === "zh-CN"
-                    ? scanProgress
-                      ? `正在从磁盘补全历史… ${scanProgress.percent}%` +
-                        (scanProgress.totalBytes > 0
-                          ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
-                          : "") +
-                        (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} 条` : "")
-                      : "正在从磁盘补全完整历史（工具调用等）… 可切换其他对话"
-                    : scanProgress
-                      ? `Loading history from disk… ${scanProgress.percent}%` +
-                        (scanProgress.totalBytes > 0
-                          ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
-                          : "") +
-                        (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} blocks` : "")
-                      : "Loading full history from disk… switching chats is fine"
-                  : language === "zh-CN"
-                    ? "首次发送：静默绑定 Agent 上下文中（不卡界面）… 大会话可能仍需等待 Agent 读盘"
-                    : "First send: silently binding agent context… large sessions may still wait on disk"}
-              </span>
+    <div className="relative flex min-h-0 flex-1">
+      <div
+        ref={scrollRef}
+        onScroll={() => {
+          if (pinningRef.current) return;
+          const element = scrollRef.current;
+          if (!element) return;
+          followRef.current =
+            element.scrollHeight - element.scrollTop - element.clientHeight < STICK_BOTTOM_PX;
+        }}
+        className="h-full min-w-0 flex-1 overflow-y-auto"
+      >
+        <div ref={contentRef} className="mx-auto max-w-[860px] px-8 py-8">
+          {loadingFullHistory && (
+            <div className="mb-4 rounded-md border border-line/80 bg-raise/50 px-3 py-2.5">
+              <div className="flex items-center justify-center gap-2 text-[11.5px] text-mute">
+                <BlackHole size={14} spin />
+                <span className="min-w-0 text-center">
+                  {historyLoadMode === "disk"
+                    ? language === "zh-CN"
+                      ? scanProgress
+                        ? `正在从磁盘补全历史… ${scanProgress.percent}%` +
+                          (scanProgress.totalBytes > 0
+                            ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
+                            : "") +
+                          (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} 条` : "")
+                        : "正在从磁盘补全完整历史（工具调用等）… 可切换其他对话"
+                      : scanProgress
+                        ? `Loading history from disk… ${scanProgress.percent}%` +
+                          (scanProgress.totalBytes > 0
+                            ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
+                            : "") +
+                          (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} blocks` : "")
+                        : "Loading full history from disk… switching chats is fine"
+                    : language === "zh-CN"
+                      ? "首次发送：静默绑定 Agent 上下文中（不卡界面）… 大会话可能仍需等待 Agent 读盘"
+                      : "First send: silently binding agent context… large sessions may still wait on disk"}
+                </span>
+              </div>
+              {historyLoadMode === "disk" && scanProgress && (
+                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-line/60">
+                  <div
+                    className="h-full rounded-full bg-acc/80 transition-[width] duration-200 ease-out"
+                    style={{ width: `${Math.min(100, Math.max(2, scanProgress.percent))}%` }}
+                  />
+                </div>
+              )}
+              {historyLoadMode === "disk" && (
+                <p className="mt-1.5 text-center text-[10.5px] text-faint">
+                  {language === "zh-CN"
+                    ? "可切换其他对话，不会卡住 · 完成后下次打开会更快"
+                    : "You can switch chats · next open will be faster"}
+                </p>
+              )}
             </div>
-            {historyLoadMode === "disk" && scanProgress && (
-              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-line/60">
-                <div
-                  className="h-full rounded-full bg-acc/80 transition-[width] duration-200 ease-out"
-                  style={{ width: `${Math.min(100, Math.max(2, scanProgress.percent))}%` }}
+          )}
+          {hiddenCount > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                followRef.current = false;
+                setShowAll(true);
+              }}
+              className="mb-6 flex w-full items-center justify-center gap-2 rounded-md border border-line bg-raise/60 py-2 text-[12px] text-mute transition-colors hover:bg-high hover:text-fg2"
+            >
+              {language === "zh-CN"
+                ? `显示更早的 ${hiddenCount} 轮对话`
+                : `Show ${hiddenCount} earlier turns`}
+            </button>
+          )}
+          {visibleTurns.map((turn) => {
+            const active = turn.id === lastTurnId;
+            return (
+              <div
+                key={turn.id}
+                ref={(node) => {
+                  if (node) turnNodes.current.set(turn.id, node);
+                  else turnNodes.current.delete(turn.id);
+                }}
+              >
+                <MemoTurnGroup
+                  turn={turn}
+                  sessionId={session.id}
+                  // Historical turns always "idle" for memo — live status only on active.
+                  status={active ? session.status : "idle"}
+                  active={active}
                 />
               </div>
-            )}
-            {historyLoadMode === "disk" && (
-              <p className="mt-1.5 text-center text-[10.5px] text-faint">
-                {language === "zh-CN"
-                  ? "可切换其他对话，不会卡住 · 完成后下次打开会更快"
-                  : "You can switch chats · next open will be faster"}
-              </p>
-            )}
-          </div>
-        )}
-        {hiddenCount > 0 && (
-          <button
-            type="button"
-            onClick={() => {
-              followRef.current = false;
-              setShowAll(true);
-            }}
-            className="mb-6 flex w-full items-center justify-center gap-2 rounded-md border border-line bg-raise/60 py-2 text-[12px] text-mute transition-colors hover:bg-high hover:text-fg2"
-          >
-            {language === "zh-CN" ? `显示更早的 ${hiddenCount} 轮对话` : `Show ${hiddenCount} earlier turns`}
-          </button>
-        )}
-        {visibleTurns.map((turn) => {
-          const active = turn.id === lastTurnId;
-          return (
-            <MemoTurnGroup
-              key={turn.id}
-              turn={turn}
-              sessionId={session.id}
-              // Historical turns always "idle" for memo — live status only on active.
-              status={active ? session.status : "idle"}
-              active={active}
-            />
-          );
-        })}
-        <div className="h-2" />
+            );
+          })}
+          <div className="h-2" />
+        </div>
       </div>
+      <RequestRail markers={markers} language={language} onJump={jumpToTurn} />
     </div>
   );
 }
