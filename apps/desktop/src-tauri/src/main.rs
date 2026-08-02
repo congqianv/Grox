@@ -1350,6 +1350,143 @@ fn is_loopback_host(host: Option<&str>) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+/// Provider model-list redirects: HTTPS anywhere, HTTP only on loopback (no
+/// cleartext bearer-token leak to remote HTTP after a 30x).
+fn should_follow_provider_redirect(url: &url::Url) -> bool {
+    match url.scheme() {
+        "https" => url.host_str().is_some(),
+        "http" => is_loopback_host(url.host_str()),
+        _ => false,
+    }
+}
+
+/// Update download redirects must stay on the GitHub Releases host allowlist.
+fn should_follow_update_redirect(url: &url::Url) -> bool {
+    url.scheme() == "https" && is_allowed_update_download_host(url.host_str())
+}
+
+fn provider_models_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent(format!("Grox/{CLIENT_VERSION}"))
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                return attempt.error("provider redirect limit exceeded");
+            }
+            if should_follow_provider_redirect(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("provider redirect refused (HTTPS or loopback HTTP only)")
+            }
+        }))
+        .build()
+        .map_err(|error| format!("无法创建模型目录客户端：{error}"))
+}
+
+/// In-app update download stream (macOS install path only on Windows/Linux the
+/// shell opens the browser instead of streaming the asset).
+#[cfg(target_os = "macos")]
+fn update_download_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .user_agent(format!("Grox-Desktop/{CLIENT_VERSION}"))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("update redirect limit exceeded");
+            }
+            if should_follow_update_redirect(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("update redirect host not allowed")
+            }
+        }))
+        .build()
+        .map_err(|error| format!("无法创建下载客户端：{error}"))
+}
+
+fn github_api_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(format!("Grox-Desktop/{CLIENT_VERSION}"))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                return attempt.error("github api redirect limit exceeded");
+            }
+            // Release API may bounce across api.github.com / github.com only.
+            if should_follow_update_redirect(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("github api redirect host not allowed")
+            }
+        }))
+        .build()
+        .map_err(|error| format!("无法创建 HTTP 客户端：{error}"))
+}
+
+/// Prefer absolute package-manager installs so PATH-planted shims cannot run preview.
+fn resolve_package_manager_command(manager: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let names: &[&str] = match manager {
+            "pnpm" => &["pnpm.cmd", "pnpm.exe"],
+            "yarn" => &["yarn.cmd", "yarn.exe"],
+            "bun" => &["bun.exe"],
+            _ => &["npm.cmd", "npm.exe"],
+        };
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            roots.push(PathBuf::from(pf).join("nodejs"));
+        }
+        if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+            roots.push(PathBuf::from(pf86).join("nodejs"));
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let appdata = PathBuf::from(appdata);
+            roots.push(appdata.join("npm"));
+            roots.push(appdata.join("npm").join("bin"));
+        }
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            roots.push(local.join("pnpm"));
+            roots.push(local.join(r"Yarn\bin"));
+            roots.push(local.join("bun"));
+            roots.push(local.join(r"Programs\nodejs"));
+        }
+        for root in roots {
+            for name in names {
+                let candidate = root.join(name);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+        return PathBuf::from(names[0]);
+    }
+    #[cfg(not(windows))]
+    {
+        let names: &[&str] = match manager {
+            "pnpm" => &["pnpm"],
+            "yarn" => &["yarn"],
+            "bun" => &["bun"],
+            _ => &["npm"],
+        };
+        for dir in [
+            "/usr/local/bin",
+            "/usr/bin",
+            "/opt/homebrew/bin",
+            "/home/linuxbrew/.linuxbrew/bin",
+        ] {
+            for name in names {
+                let candidate = PathBuf::from(dir).join(name);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+        PathBuf::from(names[0])
+    }
+}
+
 /// Media Studio remote HTTPS artifacts: exact host or one subdomain of allowlist entries.
 fn is_media_https_host_allowed(host: Option<&str>) -> bool {
     let Some(host) = host.map(|h| h.trim().to_ascii_lowercase()) else {
@@ -2058,17 +2195,8 @@ async fn start_project_preview(
         ));
     }
 
-    let executable = if cfg!(windows) {
-        match target.manager {
-            "pnpm" => "pnpm.cmd",
-            "yarn" => "yarn.cmd",
-            "bun" => "bun.exe",
-            _ => "npm.cmd",
-        }
-    } else {
-        target.manager
-    };
-    let mut command = Command::new(executable);
+    let executable = resolve_package_manager_command(target.manager);
+    let mut command = Command::new(&executable);
     match target.manager {
         "yarn" => {
             command.arg("dev");
@@ -2110,7 +2238,11 @@ async fn start_project_preview(
             return Ok(preview_response(
                 &target,
                 "error",
-                Some(format!("无法启动 {}：{error}", target.manager)),
+                Some(format!(
+                    "无法启动 {}（{}）：{error}",
+                    target.manager,
+                    executable.display()
+                )),
             ));
         }
     };
@@ -2327,11 +2459,7 @@ async fn download_to_file(
     url: &str,
     dest: &Path,
 ) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .user_agent(format!("Grox-Desktop/{CLIENT_VERSION}"))
-        .build()
-        .map_err(|error| format!("无法创建下载客户端：{error}"))?;
+    let client = update_download_http_client()?;
 
     let response = client
         .get(url)
@@ -2599,8 +2727,9 @@ async fn install_app_update_inner(
         return Err("更新下载链接包含非法控制字符".into());
     }
     let parsed = url::Url::parse(trimmed).map_err(|error| format!("无效下载链接：{error}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("只允许从 HTTP(S) 下载更新".into());
+    // R14: remote update assets must be HTTPS (no cleartext download).
+    if parsed.scheme() != "https" {
+        return Err("更新下载必须使用 HTTPS".into());
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("更新下载链接不能包含用户名或密码".into());
@@ -2714,11 +2843,7 @@ async fn install_app_update_inner(
 
 #[tauri::command]
 async fn check_app_update() -> Result<AppUpdateInfo, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent(format!("Grox-Desktop/{CLIENT_VERSION}"))
-        .build()
-        .map_err(|error| format!("无法创建 HTTP 客户端：{error}"))?;
+    let client = github_api_http_client()?;
 
     let response = client
         .get(GROX_RELEASES_LATEST_API)
@@ -4448,7 +4573,9 @@ fn write_hidden_projects(ids: Vec<String>) -> Result<(), String> {
     unique.dedup();
     let body = serde_json::to_string_pretty(&unique)
         .map_err(|error| format!("无法序列化隐藏项目列表：{error}"))?;
-    atomic_write(&path, &body)
+    atomic_write(&path, &body)?;
+    let _ = restrict_private_file(&path);
+    Ok(())
 }
 
 /// Local UI transcript cache — avoids waiting on full ACP `session/load` when
@@ -6016,14 +6143,22 @@ fn read_config_documents(cwd: String) -> Result<Vec<ConfigDocument>, String> {
 #[tauri::command]
 fn write_config_document(request: WriteConfigDocument) -> Result<ConfigDocument, String> {
     let cwd = checked_workspace(&request.cwd)?;
-    let (path, label, language) = config_path(&request.id, &cwd)?;
-    atomic_write(&path, &request.content)?;
+    // Validate id before any disk write (config_path also rejects unknown ids).
     let id: &'static str = match request.id.as_str() {
         "config" => "config",
         "system-prompt" => "system-prompt",
         "agents" => "agents",
         _ => return Err("未知配置文档".into()),
     };
+    if request.content.contains('\0') {
+        return Err("配置内容不能包含空字节".into());
+    }
+    let (path, label, language) = config_path(id, &cwd)?;
+    atomic_write(&path, &request.content)?;
+    // Home-scoped configs can hold routing / identity-adjacent settings — ACL like creds.
+    if matches!(id, "config" | "system-prompt") {
+        let _ = restrict_private_file(&path);
+    }
     Ok(ConfigDocument {
         id,
         label,
@@ -6479,11 +6614,7 @@ async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, S
         .ok_or("供应商档案不存在")?;
     let endpoint = compatible_models_url(&profile.base_url)?;
     let plain_key = profile_api_key_plain(&profile)?;
-    let response = reqwest::Client::builder()
-        .user_agent(format!("Grox/{CLIENT_VERSION}"))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("无法创建模型目录客户端：{error}"))?
+    let response = provider_models_http_client()?
         .get(endpoint)
         .bearer_auth(&plain_key)
         .header("Accept", "application/json")
@@ -7726,6 +7857,49 @@ api_key = "local-key"
             "unexpected git basename: {}",
             path.display()
         );
+    }
+
+    #[test]
+    fn provider_redirect_policy_blocks_remote_http() {
+        let https = url::Url::parse("https://api.example.com/v1/models").unwrap();
+        assert!(should_follow_provider_redirect(&https));
+        let loopback = url::Url::parse("http://127.0.0.1:8080/models").unwrap();
+        assert!(should_follow_provider_redirect(&loopback));
+        let remote_http = url::Url::parse("http://evil.example/models").unwrap();
+        assert!(!should_follow_provider_redirect(&remote_http));
+        let ftp = url::Url::parse("ftp://files.example/x").unwrap();
+        assert!(!should_follow_provider_redirect(&ftp));
+    }
+
+    #[test]
+    fn update_redirect_policy_stays_on_github_hosts() {
+        let gh = url::Url::parse("https://github.com/congqianv/Grox/releases/download/x/a.exe").unwrap();
+        assert!(should_follow_update_redirect(&gh));
+        let objects =
+            url::Url::parse("https://objects.githubusercontent.com/github-production-release-asset/1")
+                .unwrap();
+        assert!(should_follow_update_redirect(&objects));
+        let evil = url::Url::parse("https://evil.example/payload.exe").unwrap();
+        assert!(!should_follow_update_redirect(&evil));
+        let http_gh = url::Url::parse("http://github.com/x").unwrap();
+        assert!(!should_follow_update_redirect(&http_gh));
+    }
+
+    #[test]
+    fn resolve_package_manager_command_returns_manager_basename() {
+        for manager in ["npm", "pnpm", "yarn", "bun"] {
+            let path = resolve_package_manager_command(manager);
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            assert!(
+                name.contains(manager),
+                "manager={manager} path={}",
+                path.display()
+            );
+        }
     }
 
     #[test]

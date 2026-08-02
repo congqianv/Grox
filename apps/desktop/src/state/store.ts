@@ -1218,6 +1218,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
         // Crash recovery finished — ensure every live session is idle and
         // re-attempt local queue drain (prompts that started during reconnect
         // may have failed bind; others may still be queued).
+        // R14: drop stuck in-flight claims so drain is not permanently blocked
+        // if a sendPrompt finally never ran after agent death.
+        promptInFlightSessions.clear();
         const live = get().sessions;
         const next: typeof live = {};
         for (const [id, session] of Object.entries(live)) {
