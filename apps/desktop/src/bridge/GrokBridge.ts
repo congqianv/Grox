@@ -81,11 +81,12 @@ export interface GrokBridge {
   newSession(cwd: string): Promise<void>;
 
   /**
-   * ACP: session/load — emits session_ready with the restored transcript.
-   * `background: true` keeps the current UI (e.g. disk cache) visible and only
-   * replaces it when load finishes — no empty-shell flash.
+   * ACP: session/load — binds the session in the agent process.
+   * - `background: true` keeps current UI (disk history) until load finishes.
+   * - `silent: true` (with background) only binds agent context: drops stream
+   *   replay for UI. Required for first-send on huge sessions without freeze.
    */
-  loadSession(id: string, options?: { background?: boolean }): Promise<void>;
+  loadSession(id: string, options?: { background?: boolean; silent?: boolean }): Promise<void>;
 
   /**
    * Seed the ACP session catalogue so the next loadSession can skip a full

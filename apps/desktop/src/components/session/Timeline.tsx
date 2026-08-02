@@ -250,8 +250,8 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
 
 const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
   if (previous.active !== next.active || previous.sessionId !== next.sessionId) return false;
-  // status gates canEdit / process chrome on every turn, not only the live one
-  if (previous.status !== next.status) return false;
+  // Only the live turn needs session status (canEdit / process chrome).
+  if ((previous.active || next.active) && previous.status !== next.status) return false;
   if (previous.turn.blocks.length !== next.turn.blocks.length) return false;
   if (previous.turn.promptIndex !== next.turn.promptIndex) return false;
   return previous.turn.blocks.every((block, index) => block === next.turn.blocks[index]);
@@ -274,7 +274,9 @@ export function Timeline({ session }: { session: Session }) {
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
   const [showAll, setShowAll] = useState(false);
   const lastBlock = session.blocks.at(-1);
-  const signature = `${session.id}:${session.blocks.length}:${lastBlock?.type === "assistant" || lastBlock?.type === "thinking" ? lastBlock.text.length : lastBlock?.id ?? ""}:${session.status}`;
+  // Do not include streaming text length — ResizeObserver handles growth without
+  // forcing a signature storm every 32ms token flush.
+  const signature = `${session.id}:${session.blocks.length}:${lastBlock?.id ?? ""}:${session.status}`;
   const hasBlocks = session.blocks.length > 0;
   // Latest turn id — only this row uses live process chrome while the session runs.
   const lastTurnId = turns.at(-1)?.id;
@@ -374,8 +376,8 @@ export function Timeline({ session }: { session: Session }) {
                   ? "正在从磁盘补全完整历史（工具调用等）… 可切换其他对话，不会卡住"
                   : "Loading full history from disk (tools…)… switching chats is fine"
                 : language === "zh-CN"
-                  ? "正在连接 Agent 完整上下文（首次发送）… 可切换查看其他对话"
-                  : "Binding full agent context for first send… you can switch chats"}
+                  ? "首次发送：静默绑定 Agent 上下文中（不卡界面）… 大会话可能仍需等待 Agent 读盘"
+                  : "First send: silently binding agent context… large sessions may still wait on disk"}
             </span>
           </div>
         )}
@@ -391,15 +393,19 @@ export function Timeline({ session }: { session: Session }) {
             {language === "zh-CN" ? `显示更早的 ${hiddenCount} 轮对话` : `Show ${hiddenCount} earlier turns`}
           </button>
         )}
-        {visibleTurns.map((turn) => (
-          <MemoTurnGroup
-            key={turn.id}
-            turn={turn}
-            sessionId={session.id}
-            status={session.status}
-            active={turn.id === lastTurnId}
-          />
-        ))}
+        {visibleTurns.map((turn) => {
+          const active = turn.id === lastTurnId;
+          return (
+            <MemoTurnGroup
+              key={turn.id}
+              turn={turn}
+              sessionId={session.id}
+              // Historical turns always "idle" for memo — live status only on active.
+              status={active ? session.status : "idle"}
+              active={active}
+            />
+          );
+        })}
         <div className="h-2" />
       </div>
     </div>

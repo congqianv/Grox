@@ -87,7 +87,17 @@ function normalizeOfflineSession(raw: unknown, fallback?: Session | null): Sessi
         call: {
           ...block.call,
           status,
+          startedAt:
+            typeof block.call?.startedAt === "number" ? block.call.startedAt : ts,
+          title: block.call?.title || block.call?.rawKind || "tool",
         },
+      } as SessionBlock;
+    }
+    if (block.type === "plan") {
+      return {
+        ...block,
+        ts,
+        steps: Array.isArray(block.steps) ? block.steps : [],
       } as SessionBlock;
     }
     return { ...block, ts } as SessionBlock;
@@ -896,14 +906,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
         break;
       case "assistant_append":
       case "thinking_append":
-        withSession(e.sessionId, (s) => ({
-          ...s,
-          blocks: s.blocks.map((b) =>
-            b.id === e.blockId && (b.type === "assistant" || b.type === "thinking")
-              ? { ...b, text: b.text + e.delta }
-              : b,
-          ),
-        }), false);
+        withSession(e.sessionId, (s) => {
+          // Structural patch: keep prior block refs so MemoTurnGroup can skip history.
+          const index = s.blocks.findIndex((b) => b.id === e.blockId);
+          if (index < 0) return s;
+          const block = s.blocks[index];
+          if (block.type !== "assistant" && block.type !== "thinking") return s;
+          const next = s.blocks.slice();
+          next[index] = { ...block, text: block.text + e.delta };
+          return { ...s, blocks: next };
+        }, false);
         break;
       case "permission_request":
         withSession(e.sessionId, (s) => ({
@@ -1146,10 +1158,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
           }
 
           if (payload.done) {
+            // complete / empty / missing / error all stop re-scan loops this process.
+            // error is soft-fail: do not thrash disk on every re-open.
             if (
               payload.phase === "complete" ||
               payload.phase === "no-updates" ||
-              payload.phase === "missing"
+              payload.phase === "missing" ||
+              payload.phase === "error"
             ) {
               offlineHistoryComplete.add(payload.id);
             }
@@ -1518,7 +1533,25 @@ export const useDesktop = create<DesktopState>((set, get) => {
           return;
         }
 
-        // 2) Disk chat_history.jsonl — real conversation text, ~instant
+        // 2) Durable offline transcript (fingerprint-matched) — skip 100MB+ rescan
+        if (bridge.kind === "acp") {
+          try {
+            const raw = await invoke<string | null>("get_ui_transcript", { id });
+            if (raw) {
+              const transcript = normalizeOfflineSession(JSON.parse(raw) as Session);
+              if (transcript && transcript.id === id && transcript.blocks.length > 0) {
+                offlineHistoryComplete.add(id);
+                applyChrome(transcript, { loadingDisk: false });
+                scheduleSaveSessionCache(transcript);
+                return;
+              }
+            }
+          } catch (error) {
+            console.warn("get_ui_transcript failed", error);
+          }
+        }
+
+        // 3) Disk chat_history.jsonl — real conversation text, ~instant
         try {
           const raw = await invoke<string | null>("preview_session_from_disk", {
             id,
@@ -1538,7 +1571,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           console.warn("preview_session_from_disk failed", error);
         }
 
-        // 3) App UI cache
+        // 4) App UI cache (thin live-stream snapshot)
         const cached = await loadSessionCache(id);
         if (cached) {
           applyChrome(cached, { loadingDisk: !offlineHistoryComplete.has(id) });
@@ -1546,7 +1579,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           return;
         }
 
-        // 4) Empty shell — brand-new mission; still try offline (may only have updates)
+        // 5) Empty shell — brand-new mission; still try offline (may only have updates)
         const shell = meta
           ? {
               ...meta,
@@ -2228,20 +2261,22 @@ export const useDesktop = create<DesktopState>((set, get) => {
               queueNotice: {
                 id: uid(),
                 message:
-                  "首次发送需绑定 Agent 完整上下文，请稍候（期间可切换其他对话查看）…",
+                  "首次发送：正在静默绑定 Agent 上下文（不回放历史到界面，界面应可操作）…",
                 state: "blocked",
                 at: Date.now(),
               },
             });
-            await bridge.loadSession(session.id, { background: true });
+            // silent: drop ACP stream replay — UI already has offline history.
+            // Without silent, session/load floods the shell and freezes on send.
+            await bridge.loadSession(session.id, { background: true, silent: true });
             set({
               fullHistoryLoadingId: null,
               historyLoadMode: null,
               queueNotice: null,
             });
           }
-          // User may have switched away while binding — only prompt if still here.
-          if (get().activeId !== session.id) return;
+          // Always prompt the mission that initiated the send — switching the UI
+          // mid-bind must not orphan the already-painted user message.
           await bridge.prompt(session.id, trimmed, {
             model: composer.model,
             effort: composer.effort,

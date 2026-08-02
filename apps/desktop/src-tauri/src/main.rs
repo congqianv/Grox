@@ -66,6 +66,11 @@ struct AgentProcess {
 struct AcpState {
     process: Mutex<Option<AgentProcess>>,
     next_generation: AtomicU64,
+    /// When true, drop ACP stream notifications that only rebuild UI history
+    /// (session/update with sessionUpdate). Used during silent session/load so
+    /// first-send agent-bind does not flood the webview with 100MB+ of events.
+    /// JSON-RPC responses / requests still pass through.
+    silent_stream: AtomicBool,
 }
 
 struct PreviewProcess {
@@ -361,8 +366,18 @@ fn read_bounded_text(path: &Path, max_bytes: u64) -> Result<String, String> {
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
-    if content.len() as u64 > MAX_CONFIG_BYTES {
-        return Err("配置文档不能超过 4 MB".into());
+    atomic_write_bytes(path, content, MAX_CONFIG_BYTES)
+}
+
+/// Atomic write with an explicit size cap (session UI transcripts can exceed 4MB).
+fn atomic_write_bytes(path: &Path, content: &str, max_bytes: u64) -> Result<(), String> {
+    if content.len() as u64 > max_bytes {
+        return Err(format!(
+            "写入过大（{} bytes > {}）：{}",
+            content.len(),
+            max_bytes,
+            path.display()
+        ));
     }
     let parent = path
         .parent()
@@ -382,21 +397,35 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
             .write(true)
             .create_new(true)
             .open(&temp)
-            .map_err(|error| format!("无法创建临时配置 {}：{error}", temp.display()))?;
+            .map_err(|error| format!("无法创建临时文件 {}：{error}", temp.display()))?;
         if let Err(error) = file
             .write_all(content.as_bytes())
             .and_then(|_| file.sync_all())
         {
             drop(file);
             let _ = fs::remove_file(&temp);
-            return Err(format!("无法写入配置 {}：{error}", temp.display()));
+            return Err(format!("无法写入 {}：{error}", temp.display()));
         }
     }
     if path.exists() {
         fs::remove_file(path)
-            .map_err(|error| format!("无法替换配置 {}：{error}", path.display()))?;
+            .map_err(|error| format!("无法替换 {}：{error}", path.display()))?;
     }
-    fs::rename(&temp, path).map_err(|error| format!("无法保存配置 {}：{error}", path.display()))
+    fs::rename(&temp, path).map_err(|error| format!("无法保存 {}：{error}", path.display()))
+}
+
+fn file_size_mtime_ms(path: &Path) -> Option<(u64, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some((meta.len(), mtime))
 }
 
 #[cfg(unix)]
@@ -2217,7 +2246,97 @@ fn write_session_cache(app: tauri::AppHandle, id: String, content: String) -> Re
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("无法创建会话缓存目录：{error}"))?;
     }
-    atomic_write(&path, &content)
+    // Dedicated writer: session cache may exceed the 4MB config document cap.
+    atomic_write_bytes(&path, &content, SESSION_CACHE_MAX_BYTES)
+}
+
+/// Co-located durable offline transcript (survives app restart; fingerprint-gated).
+const UI_TRANSCRIPT_NAME: &str = "grox-ui-transcript.v1.json";
+const UI_TRANSCRIPT_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+fn ui_transcript_path(session_dir: &Path) -> PathBuf {
+    session_dir.join(UI_TRANSCRIPT_NAME)
+}
+
+fn write_ui_transcript(
+    session_dir: &Path,
+    session_id: &str,
+    session: &serde_json::Value,
+    updates_path: &Path,
+) -> Result<(), String> {
+    let (size, mtime_ms) = file_size_mtime_ms(updates_path).unwrap_or((0, 0));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let envelope = serde_json::json!({
+        "schema": 1,
+        "sessionId": session_id,
+        "writtenAtMs": now,
+        "source": {
+            "updatesSize": size,
+            "updatesMtimeMs": mtime_ms,
+        },
+        "scan": {
+            "complete": true,
+            "maxFinalBlocks": 1500,
+            "thoughtsSkipped": true,
+        },
+        "session": session,
+    });
+    let body = envelope
+        .to_string();
+    atomic_write_bytes(
+        &ui_transcript_path(session_dir),
+        &body,
+        UI_TRANSCRIPT_MAX_BYTES,
+    )
+}
+
+/// Return cached offline session JSON if fingerprint still matches updates.jsonl.
+fn read_ui_transcript_if_fresh(session_dir: &Path, session_id: &str) -> Option<serde_json::Value> {
+    let path = ui_transcript_path(session_dir);
+    let raw = match read_bounded_text(&path, UI_TRANSCRIPT_MAX_BYTES) {
+        Ok(text) if !text.trim().is_empty() => text,
+        _ => return None,
+    };
+    let env: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if env.get("schema").and_then(|v| v.as_u64()) != Some(1) {
+        return None;
+    }
+    if env.get("sessionId").and_then(|v| v.as_str()) != Some(session_id) {
+        return None;
+    }
+    if env.pointer("/scan/complete").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let updates = session_dir.join("updates.jsonl");
+    let (size, mtime_ms) = file_size_mtime_ms(&updates)?;
+    let src = env.get("source")?;
+    if src.get("updatesSize").and_then(|v| v.as_u64()) != Some(size) {
+        return None;
+    }
+    if src.get("updatesMtimeMs").and_then(|v| v.as_u64()) != Some(mtime_ms) {
+        return None;
+    }
+    env.get("session").cloned()
+}
+
+/// Fast open path: return durable offline transcript when source fingerprint matches.
+#[tauri::command]
+fn get_ui_transcript(id: String) -> Result<Option<String>, String> {
+    let safe: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(80)
+        .collect();
+    if safe.is_empty() {
+        return Ok(None);
+    }
+    let Some(dir) = find_grok_session_dir(&safe) else {
+        return Ok(None);
+    };
+    Ok(read_ui_transcript_if_fresh(&dir, &safe).map(|session| session.to_string()))
 }
 
 /// Locate `~/.grok/sessions/**/<id>/` without relying on cwd encoding details.
@@ -2617,6 +2736,24 @@ fn start_offline_session_history(
                 return;
             };
 
+            // Wave 1: durable fingerprint cache — skip multi-hundred-MB rescan.
+            if let Some(cached) = read_ui_transcript_if_fresh(&dir, &safe) {
+                if !abandoned() {
+                    let _ = app.emit(
+                        "disk-history-progress",
+                        serde_json::json!({
+                            "id": safe,
+                            "gen": gen,
+                            "done": true,
+                            "phase": "complete",
+                            "session": cached,
+                            "fromCache": true,
+                        }),
+                    );
+                }
+                return;
+            }
+
             let (mut title_s, mut cwd_s, mut model_s, mut created_at, mut updated_at) =
                 offline_history_meta(&dir);
             if let Some(t) = title.filter(|s| !s.trim().is_empty()) {
@@ -2791,25 +2928,49 @@ fn start_offline_session_history(
                             .unwrap_or("other");
                         let kind_norm = match kind_s {
                             "execute" | "terminal" | "edit" | "write" | "delete" | "move"
-                            | "read" | "search" | "fetch" | "other" => kind_s,
+                            | "read" | "search" | "fetch" | "list" | "other" => kind_s,
                             _ => "other",
                         };
-                        block_i += 1;
+                        let block_id = if tool_id.is_empty() {
+                            block_i += 1;
+                            format!("off-tool-{block_i}")
+                        } else {
+                            format!("off-tool-{tool_id}")
+                        };
+                        let input = update
+                            .get("rawInput")
+                            .or_else(|| update.pointer("/_meta/x.ai/tool/rawInput"))
+                            .map(|v| {
+                                let s = if let Some(t) = v.as_str() {
+                                    t.to_string()
+                                } else {
+                                    v.to_string()
+                                };
+                                if s.len() > 4000 {
+                                    format!("{}…", &s[..4000])
+                                } else {
+                                    s
+                                }
+                            });
+                        let mut call = serde_json::json!({
+                            "id": tool_id,
+                            "kind": kind_norm,
+                            "rawKind": title,
+                            "title": title,
+                            "status": "done",
+                            "startedAt": updated_at,
+                        });
+                        if let (Some(inp), Some(obj)) = (input, call.as_object_mut()) {
+                            obj.insert("input".into(), serde_json::Value::String(inp));
+                        }
                         blocks.push(serde_json::json!({
                             "type": "tool",
-                            "id": format!("off-tool-{block_i}"),
+                            "id": block_id,
                             "ts": updated_at,
-                            "call": {
-                                "id": tool_id,
-                                "kind": kind_norm,
-                                "rawKind": title,
-                                "title": title,
-                                "status": "done",
-                            }
+                            "call": call,
                         }));
                     }
                     "tool_call_update" => {
-                        // Mark matching tool done if present; keep title updates light.
                         let tool_id = update
                             .get("toolCallId")
                             .and_then(|v| v.as_str())
@@ -2819,6 +2980,13 @@ fn start_offline_session_history(
                             .and_then(|v| v.as_str())
                             .unwrap_or("done");
                         let title = update.get("title").and_then(|v| v.as_str());
+                        let status_norm = match status {
+                            "in_progress" | "running" | "pending" => "running",
+                            "failed" | "error" => "error",
+                            "cancelled" | "canceled" => "cancelled",
+                            "awaiting_permission" => "awaiting_permission",
+                            _ => "done",
+                        };
                         if let Some(block) = blocks.iter_mut().rev().find(|b| {
                             b.get("type").and_then(|t| t.as_str()) == Some("tool")
                                 && b.pointer("/call/id").and_then(|t| t.as_str()) == Some(tool_id)
@@ -2827,13 +2995,7 @@ fn start_offline_session_history(
                                 if let Some(obj) = call.as_object_mut() {
                                     obj.insert(
                                         "status".into(),
-                                        serde_json::Value::String(
-                                            if status == "in_progress" || status == "running" {
-                                                "running".into()
-                                            } else {
-                                                "done".into()
-                                            },
-                                        ),
+                                        serde_json::Value::String(status_norm.into()),
                                     );
                                     if let Some(t) = title {
                                         obj.insert(
@@ -2842,6 +3004,64 @@ fn start_offline_session_history(
                                         );
                                     }
                                 }
+                            }
+                        }
+                    }
+                    "plan" => {
+                        flush_user(&mut blocks, &mut user_open, updated_at);
+                        flush_asst(&mut blocks, &mut asst_open, updated_at);
+                        let entries = update
+                            .get("entries")
+                            .or_else(|| update.get("steps"))
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        let mut steps = Vec::new();
+                        for (i, entry) in entries.iter().enumerate() {
+                            let content = entry
+                                .get("content")
+                                .or_else(|| entry.get("title"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if content.is_empty() {
+                                continue;
+                            }
+                            let st = entry
+                                .get("status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("pending");
+                            let st_norm = match st {
+                                "in_progress" | "running" => "in_progress",
+                                "completed" | "done" => "completed",
+                                _ => "pending",
+                            };
+                            let sid = entry
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| format!("step-{i}"));
+                            steps.push(serde_json::json!({
+                                "id": sid,
+                                "content": content,
+                                "status": st_norm,
+                            }));
+                        }
+                        if !steps.is_empty() {
+                            if let Some(existing) = blocks.iter_mut().rev().find(|b| {
+                                b.get("type").and_then(|t| t.as_str()) == Some("plan")
+                            }) {
+                                if let Some(obj) = existing.as_object_mut() {
+                                    obj.insert("steps".into(), serde_json::Value::Array(steps));
+                                }
+                            } else {
+                                block_i += 1;
+                                blocks.push(serde_json::json!({
+                                    "type": "plan",
+                                    "id": format!("off-plan-{block_i}"),
+                                    "ts": updated_at,
+                                    "steps": steps,
+                                }));
                             }
                         }
                     }
@@ -2898,21 +3118,95 @@ fn start_offline_session_history(
                     }
                 }
             }
+            // Attach tool outputs from small chat_history.jsonl (safe; not from huge updates).
+            enrich_tools_from_chat_history(&dir, &mut blocks);
+
             // Timeline windows initial paint; 1500 blocks covers long missions.
             const MAX_FINAL_BLOCKS: usize = 1500;
             if blocks.len() > MAX_FINAL_BLOCKS {
                 blocks = blocks.split_off(blocks.len() - MAX_FINAL_BLOCKS);
             }
-            emit(
-                pack_offline_session(
-                    &safe, &title_s, &cwd_s, &model_s, created_at, updated_at, &blocks,
-                ),
-                true,
-                "complete",
+            let packed = pack_offline_session(
+                &safe, &title_s, &cwd_s, &model_s, created_at, updated_at, &blocks,
             );
+            // Durable fingerprint cache for next cold open.
+            let _ = write_ui_transcript(&dir, &safe, &packed, &updates_path);
+            emit(packed, true, "complete");
         })
         .map_err(|e| format!("无法启动离线历史线程：{e}"))?;
     Ok(())
+}
+
+/// Pull tool_result bodies from chat_history (small) onto offline tool blocks.
+fn enrich_tools_from_chat_history(dir: &Path, blocks: &mut [serde_json::Value]) {
+    let chat_path = dir.join("chat_history.jsonl");
+    let Ok(raw) = read_bounded_text(&chat_path, 8 * 1024 * 1024) else {
+        return;
+    };
+    if raw.trim().is_empty() {
+        return;
+    }
+    // toolCallId -> truncated output
+    let mut outputs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let kind = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if kind != "tool_result" && kind != "tool" {
+            continue;
+        }
+        let id = entry
+            .get("tool_call_id")
+            .or_else(|| entry.get("toolCallId"))
+            .or_else(|| entry.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if id.is_empty() {
+            continue;
+        }
+        let text = json_text_content(entry.get("content").unwrap_or(&serde_json::Value::Null));
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        const CAP: usize = 16 * 1024;
+        let clipped = if text.len() > CAP {
+            format!("{}…", &text[..CAP])
+        } else {
+            text.to_string()
+        };
+        outputs.insert(id.to_string(), clipped);
+    }
+    if outputs.is_empty() {
+        return;
+    }
+    for block in blocks.iter_mut() {
+        if block.get("type").and_then(|t| t.as_str()) != Some("tool") {
+            continue;
+        }
+        let Some(call_id) = block
+            .pointer("/call/id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+        let Some(out) = outputs.get(&call_id) else {
+            continue;
+        };
+        if let Some(call) = block.get_mut("call").and_then(|c| c.as_object_mut()) {
+            call.insert("output".into(), serde_json::Value::String(out.clone()));
+            if !call.contains_key("detail") {
+                let detail: String = out.chars().take(200).collect();
+                call.insert("detail".into(), serde_json::Value::String(detail));
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -3349,6 +3643,8 @@ async fn acp_spawn(
     state: tauri::State<'_, Arc<AcpState>>,
     cwd: String,
 ) -> Result<(), String> {
+    // New child never inherits a previous silent-load filter.
+    state.silent_stream.store(false, Ordering::Relaxed);
     let cwd = checked_workspace(&cwd)?;
 
     // Invalidate the previous readers before terminating their process. On a
@@ -3448,9 +3744,24 @@ async fn acp_spawn(
                     if stdout_state.next_generation.load(Ordering::Relaxed) != generation {
                         break;
                     }
-                    if !line.trim().is_empty() {
-                        let _ = stdout_app.emit("acp-event", line);
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
                     }
+                    // Silent agent-bind: agent still loads history in-process, but
+                    // we must not ship every sessionUpdate to the webview (that
+                    // freezes UI on multi-hundred-MB updates.jsonl). Keep responses
+                    // (have "result"/"error" + id, no sessionUpdate) and server
+                    // requests (requestPermission, etc.).
+                    if stdout_state.silent_stream.load(Ordering::Relaxed)
+                        && (line.contains("\"sessionUpdate\"")
+                            || line.contains("agent_thought_chunk")
+                            || line.contains("\"session/update\"")
+                            || line.contains("\"x.ai/session/update\""))
+                    {
+                        continue;
+                    }
+                    let _ = stdout_app.emit("acp-event", line);
                 }
                 Ok(None) => break,
                 Err(error) => {
@@ -3507,6 +3818,12 @@ async fn acp_spawn(
     });
 
     Ok(())
+}
+
+/// Enable/disable silent ACP stream filtering (see AcpState::silent_stream).
+#[tauri::command]
+fn acp_set_silent_stream(state: tauri::State<'_, Arc<AcpState>>, silent: bool) {
+    state.silent_stream.store(silent, Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -3730,6 +4047,7 @@ fn main() {
             preview_session_from_disk,
             start_offline_session_history,
             cancel_offline_session_history,
+            get_ui_transcript,
             read_provider_status,
             configure_provider,
             list_provider_profiles,
@@ -3747,6 +4065,7 @@ fn main() {
             acp_spawn,
             acp_send,
             acp_kill,
+            acp_set_silent_stream,
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {

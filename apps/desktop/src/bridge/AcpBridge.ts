@@ -769,8 +769,19 @@ export class AcpBridge implements GrokBridge {
    */
   private progressiveLoad = new Set<string>();
   private progressiveFlushTimers = new Map<string, number>();
+  /**
+   * Silent agent-bind: session/load still runs in the CLI, but we discard stream
+   * updates (UI already has offline disk history). Prevents first-send freeze.
+   */
+  private silentReplaying = new Set<string>();
   /** In-flight session/load promises — dedupe open + first-send races. */
   private loadPromises = new Map<string, Promise<void>>();
+  /**
+   * Exclusive ACP channel queue for heavy ops (session/load + session/prompt).
+   * Prevents concurrent silent binds from globally black-holing another session's
+   * live stream, and avoids stacking multi-minute rehydrates on one stdio child.
+   */
+  private channelTail: Promise<unknown> = Promise.resolve();
   /**
    * Scheme C + visit memory:
    * 1) Always prefer full-load of the active mission if unbound.
@@ -832,6 +843,10 @@ export class AcpBridge implements GrokBridge {
 
   private emit(event: BridgeEvent) {
     if ("sessionId" in event) {
+      if (this.silentReplaying.has(event.sessionId)) {
+        // Silent bind: never touch the UI timeline from load stream.
+        return;
+      }
       const replay = this.replaying.get(event.sessionId);
       if (replay) {
         // During session/load the agent can stream hundreds of thousands of
@@ -997,7 +1012,9 @@ export class AcpBridge implements GrokBridge {
 
         this.backgroundLoadInFlight = id;
         try {
-          await this.loadSession(id, { background: true });
+          // Silent bind only — offline disk history already covers viewing.
+          // Full ACP UI replay freezes on large sessions and is no longer needed.
+          await this.loadSession(id, { background: true, silent: true });
           this.backgroundLoadFailed.delete(id);
         } catch (error) {
           console.warn("background full-load failed", id, error);
@@ -1208,6 +1225,17 @@ export class AcpBridge implements GrokBridge {
   private inboundDraining = false;
 
   private enqueueInbound(line: string) {
+    // Belt-and-braces if Rust silent filter is off or a line slipped through.
+    if (this.silentReplaying.size > 0) {
+      if (
+        line.includes("sessionUpdate") ||
+        line.includes("agent_thought_chunk") ||
+        line.includes('"session/update"') ||
+        line.includes("x.ai/session/update")
+      ) {
+        return;
+      }
+    }
     this.inboundQueue.push(line);
     if (this.inboundDraining) return;
     this.inboundDraining = true;
@@ -1225,6 +1253,43 @@ export class AcpBridge implements GrokBridge {
       }
     };
     window.requestAnimationFrame(pump);
+  }
+
+  private async setSilentStream(silent: boolean): Promise<void> {
+    try {
+      await invoke("acp_set_silent_stream", { silent });
+    } catch {
+      /* older shells without the command — JS drop still applies */
+    }
+  }
+
+  /** Serialize heavy ACP ops so silent bind cannot overlap another session's live stream. */
+  private runOnChannel<T>(op: () => Promise<T>): Promise<T> {
+    const run = this.channelTail.then(op, op);
+    this.channelTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** Drop bind-state that dies with the agent child. */
+  private resetBindStateAfterAgentExit(): void {
+    this.knownSessions.clear();
+    this.loadPromises.clear();
+    this.silentReplaying.clear();
+    this.replaying.clear();
+    this.progressiveLoad.clear();
+    for (const timer of this.progressiveFlushTimers.values()) {
+      window.clearTimeout(timer);
+    }
+    this.progressiveFlushTimers.clear();
+    this.inboundQueue = [];
+    this.inboundDraining = false;
+    this.backgroundLoadInFlight = null;
+    this.backgroundLoadRunning = false;
+    this.backgroundLoadFailed.clear();
+    void this.setSilentStream(false);
   }
 
   private async connect(): Promise<void> {
@@ -1358,7 +1423,10 @@ export class AcpBridge implements GrokBridge {
       request.reject(new Error(message));
     }
     this.pending.clear();
-    for (const sessionId of this.knownSessions) {
+    const bound = [...this.knownSessions];
+    // Must clear before re-emit so first-send will re-bind after agent death.
+    this.resetBindStateAfterAgentExit();
+    for (const sessionId of bound) {
       this.emit({ type: "error", sessionId, message });
     }
   }
@@ -1445,12 +1513,14 @@ export class AcpBridge implements GrokBridge {
     if (method === "session/update" || method === "x.ai/session/update") {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
+      if (sessionId && this.silentReplaying.has(sessionId)) return;
       if (sessionId) this.handleSessionUpdate(sessionId, params?.update);
       return;
     }
     if (method === "x.ai/session_notification") {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
+      if (sessionId && this.silentReplaying.has(sessionId)) return;
       if (sessionId) this.handleXaiUpdate(sessionId, params?.update);
       return;
     }
@@ -2368,19 +2438,28 @@ export class AcpBridge implements GrokBridge {
     this.emit({ type: "session_ready", session: emptySession(meta) });
   }
 
-  async loadSession(id: string, options?: { background?: boolean }): Promise<void> {
+  async loadSession(
+    id: string,
+    options?: { background?: boolean; silent?: boolean },
+  ): Promise<void> {
     const inflight = this.loadPromises.get(id);
     if (inflight) return inflight;
 
-    const run = this.loadSessionInner(id, options).finally(() => {
+    // Channel-serialized: at most one load (and no interleaved prompt) at a time.
+    const run = this.runOnChannel(() => this.loadSessionInner(id, options)).finally(() => {
       this.loadPromises.delete(id);
     });
     this.loadPromises.set(id, run);
     return run;
   }
 
-  private async loadSessionInner(id: string, options?: { background?: boolean }): Promise<void> {
+  private async loadSessionInner(
+    id: string,
+    options?: { background?: boolean; silent?: boolean },
+  ): Promise<void> {
     const background = options?.background === true;
+    // Silent agent-bind: CLI rehydrates context; UI keeps offline disk history.
+    const silentBind = options?.silent === true;
     let meta = this.catalogue.get(id);
     if (!meta) {
       // Expensive: paginated x.ai/session/list. Prefer rememberSessionMeta() first.
@@ -2389,33 +2468,52 @@ export class AcpBridge implements GrokBridge {
     }
     if (!meta) throw new Error(`找不到会话：${id}`);
 
-    // Foreground: paint empty shell immediately. Background: keep whatever the
-    // UI already shows (chat_history preview / cache) until full load finishes.
-    if (!background) {
+    // Foreground non-silent: paint empty shell. Background/silent: keep UI.
+    if (!background && !silentBind) {
       this.emit({ type: "session_ready", session: emptySession(meta) });
     }
 
     this.cursors.set(id, { toolBlocks: new Map() });
     this.replaying.set(id, emptySession(meta));
-    if (!background) {
+    if (silentBind) {
+      this.silentReplaying.add(id);
+      await this.setSilentStream(true);
+    } else if (!background) {
       this.progressiveLoad.add(id);
     }
+
     try {
       const metaRequest = await this.sessionMeta(meta.cwd);
-      const response = await this.request(ACP_METHODS.sessionLoad, {
-        sessionId: id,
-        cwd: meta.cwd,
-        mcpServers: [],
-        _meta: metaRequest,
-      }, 2 * 60_000);
+      // Large sessions can take several minutes for the agent to rehydrate.
+      const response = await this.request(
+        ACP_METHODS.sessionLoad,
+        {
+          sessionId: id,
+          cwd: meta.cwd,
+          mcpServers: [],
+          _meta: metaRequest,
+        },
+        silentBind ? 10 * 60_000 : 2 * 60_000,
+      );
       this.flushStreamAppends(id);
       this.flushToolPatches(id);
       this.captureModelState(response);
-      // Session info is nice-to-have; do not block the final paint on it.
       void this.refreshSessionInfo(id).catch(() => {
         /* non-fatal */
       });
+
       const replayed = this.replaying.get(id) ?? emptySession(meta);
+      this.clearProgressiveLoad(id);
+      this.replaying.delete(id);
+      this.silentReplaying.delete(id);
+      this.knownSessions.add(id);
+      await this.setSilentStream(this.silentReplaying.size > 0);
+
+      if (silentBind) {
+        // Bound for prompt; do not overwrite offline disk history with empty replay.
+        return;
+      }
+
       const finalized: Session = {
         ...replayed,
         usage: this.usage.get(id) ?? replayed.usage,
@@ -2428,20 +2526,19 @@ export class AcpBridge implements GrokBridge {
               : block,
         ),
       };
-      this.clearProgressiveLoad(id);
-      this.replaying.delete(id);
-      this.knownSessions.add(id);
       this.emit({ type: "session_ready", session: finalized });
     } catch (error) {
       this.clearProgressiveLoad(id);
       this.replaying.delete(id);
+      this.silentReplaying.delete(id);
+      await this.setSilentStream(this.silentReplaying.size > 0);
       throw error;
     }
   }
 
   async interject(sessionId: string, text: string, options: PromptOptions): Promise<InterjectResult> {
     await this.ready;
-    this.knownSessions.add(sessionId);
+    // Do not optimistically mark bound — only session/new or successful session/load.
     const trimmed = text.trim();
     const interjectionId = crypto.randomUUID();
     const content = promptContent(trimmed, options.attachments ?? []);
@@ -2501,7 +2598,6 @@ export class AcpBridge implements GrokBridge {
     queueOptions: { promptId?: string; sendNow?: boolean } = {},
   ): Promise<QueueOperationReceipt> {
     await this.ready;
-    this.knownSessions.add(sessionId);
     const trimmed = text.trim();
     const promptId = queueOptions.promptId ?? uid();
     const sendNow = queueOptions.sendNow === true;
@@ -2600,7 +2696,11 @@ export class AcpBridge implements GrokBridge {
 
   async prompt(sessionId: string, text: string, options: PromptOptions): Promise<void> {
     await this.ready;
-    this.knownSessions.add(sessionId);
+    // Channel-serialized with session/load so silent bind cannot overlap live turns.
+    return this.runOnChannel(() => this.promptInner(sessionId, text, options));
+  }
+
+  private async promptInner(sessionId: string, text: string, options: PromptOptions): Promise<void> {
     this.closeUser(sessionId);
     // Fresh turn: drop retry/replace state so a prior interrupted stream cannot
     // hijack the next reply into the old bubble.
