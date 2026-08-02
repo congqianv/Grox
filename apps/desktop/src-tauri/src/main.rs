@@ -880,10 +880,28 @@ fn is_denied_cli_env_key(key: &str) -> bool {
             | "NODE_OPTIONS"
             | "PYTHONPATH"
             | "PYTHONHOME"
+            | "OPENSSL_CONF"
+            | "SSL_CERT_FILE"
+            | "SSL_CERT_DIR"
+            | "CURL_CA_BUNDLE"
+            | "REQUESTS_CA_BUNDLE"
+            | "PSMODULEPATH"
+            | "JAVA_TOOL_OPTIONS"
+            | "JDK_JAVA_OPTIONS"
+            | "DOTNET_STARTUP_HOOKS"
+            | "GIT_SSH_COMMAND"
+            | "GIT_CONFIG_GLOBAL"
+            | "GIT_CONFIG_SYSTEM"
     ) || upper.starts_with("LD_")
         || upper.starts_with("DYLD_")
         || upper.starts_with("PYTHON")
         || upper.starts_with("NODE_")
+        || upper.starts_with("DOTNET_")
+        || upper.starts_with("JAVA_")
+        || upper.starts_with("JDK_")
+        || upper.starts_with("GIT_")
+        || upper.starts_with("SSL_")
+        || upper.starts_with("OPENSSL_")
 }
 
 /// Same provider resolution used by `acp_spawn`: full ~/.grok/.env, then the
@@ -4644,6 +4662,10 @@ fn start_offline_session_history(
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let abandoned = || OFFLINE_HISTORY_GEN.load(Ordering::SeqCst) != gen;
             let clear_active = || {
+                // Gen-scoped: a restarted scan for the same id must keep ACTIVE_ID.
+                if OFFLINE_HISTORY_GEN.load(Ordering::SeqCst) != gen {
+                    return;
+                }
                 if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
                     if guard.as_str() == safe {
                         guard.clear();
@@ -4830,6 +4852,12 @@ fn start_offline_session_history(
             let mut offline_id_seen: std::collections::HashMap<u64, u32> =
                 std::collections::HashMap::new();
             let mut line_i = 0usize;
+            const MAX_SCAN_BLOCKS: usize = 1500;
+            let trim_blocks = |blocks: &mut Vec<serde_json::Value>| {
+                if blocks.len() > MAX_SCAN_BLOCKS {
+                    *blocks = blocks.split_off(blocks.len() - MAX_SCAN_BLOCKS);
+                }
+            };
             let mut last_progress_lines = 0usize;
             let mut last_progress_bytes = 0u64;
             let mut last_progress_at = Instant::now();
@@ -4855,6 +4883,7 @@ fn start_offline_session_history(
                             "text": text,
                             "ts": updated_at,
                         }));
+                        trim_blocks(blocks);
                     }
                 }
             };
@@ -4872,6 +4901,7 @@ fn start_offline_session_history(
                             "streaming": false,
                             "ts": updated_at,
                         }));
+                        trim_blocks(blocks);
                     }
                 }
             };
@@ -5114,11 +5144,7 @@ fn start_offline_session_history(
                             "ts": updated_at,
                             "call": call,
                         }));
-                        // Continuous cap — avoid multi-hundred-MB peaks before final pack.
-                        const MAX_SCAN: usize = 1500;
-                        if blocks.len() > MAX_SCAN {
-                            blocks = blocks.split_off(blocks.len() - MAX_SCAN);
-                        }
+                        trim_blocks(&mut blocks);
                     }
                     "tool_call_update" => {
                         let tool_id = update
@@ -5229,6 +5255,7 @@ fn start_offline_session_history(
                                     "ts": updated_at,
                                     "steps": steps,
                                 }));
+                                trim_blocks(&mut blocks);
                             }
                         }
                     }

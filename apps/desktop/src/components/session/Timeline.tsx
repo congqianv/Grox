@@ -400,7 +400,7 @@ const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
  * click "show earlier turns" just to read what was already loaded from disk.
  */
 const LIVE_TURN_WINDOW = 40;
-const STICK_BOTTOM_PX = 120;
+const STICK_BOTTOM_PX = 48;
 
 export function Timeline({ session }: { session: Session }) {
   const { language } = useI18n();
@@ -597,6 +597,7 @@ export function Timeline({ session }: { session: Session }) {
   return (
     <div className="relative flex min-h-0 flex-1">
       <Virtuoso
+        key={session.id}
         ref={virtuosoRef}
         className="h-full min-w-0 flex-1"
         data={visibleTurns}
@@ -606,7 +607,7 @@ export function Timeline({ session }: { session: Session }) {
             ? { index: visibleTurns.length - 1, align: "end" }
             : 0
         }
-        defaultItemHeight={180}
+        defaultItemHeight={280}
         increaseViewportBy={{ top: 600, bottom: 800 }}
         atBottomThreshold={STICK_BOTTOM_PX}
         atBottomStateChange={(atBottom) => {
@@ -615,7 +616,8 @@ export function Timeline({ session }: { session: Session }) {
         followOutput={() => {
           // Only the follow flag — atBottom alone must not re-stick after RequestRail jump.
           if (!followRef.current) return false;
-          return isLive ? "smooth" : "auto";
+          // Instant follow while live — "smooth" stacks animation jank under tokens.
+          return isLive ? true : "auto";
         }}
         computeItemKey={(_index, turn) => turn.id}
         components={{

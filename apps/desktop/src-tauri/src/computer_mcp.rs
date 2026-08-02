@@ -1084,15 +1084,34 @@ mod platform {
             "grok build desktop",
             "grok-build-desktop",
             "chatgpt",
+            // Shells / consoles — Computer Use must not type into these.
             "powershell",
             "pwsh",
             "cmd",
             "windowsterminal",
             "wt",
             "conhost",
+            "openconsole",
+            "powershell_ise",
+            "bash",
+            "sh",
+            "zsh",
+            "fish",
+            "mintty",
+            "wsl",
+            "wslhost",
+            "ubuntu",
+            "debian",
+            "kali",
+            "alacritty",
+            "wezterm",
+            "wezterm-gui",
+            "hyper",
+            "tabby",
+            "windowsterminal.exe",
         ]
         .iter()
-        .any(|value| process == *value)
+        .any(|value| process == *value || process.starts_with(&format!("{value}.")))
             || [
                 "grox",
                 "grok build desktop",

@@ -1332,7 +1332,7 @@ export class AcpBridge implements GrokBridge {
           return;
         }
         for (const sessionId of leaseSessions) {
-          void this.emergencyStopComputer(sessionId);
+          void this.emergencyStopComputer(sessionId).catch(() => {});
         }
       }),
     );
@@ -1373,7 +1373,12 @@ export class AcpBridge implements GrokBridge {
     this.interactions.clear();
     this.cursors.clear();
     this.sessionOptions.clear();
-    this.knownSessions.clear();
+    // Match agent-exit cleanup so silent bind / computer leases cannot leak.
+    this.resetBindStateAfterAgentExit();
+    this.computerLeases.clear();
+    this.activeComputerSessions.clear();
+    this.activeComputerToolCalls.clear();
+    this.channelTail = Promise.resolve();
     this.authMethodId = undefined;
     this.modelState = { models: MODELS, currentId: MODELS[0].id };
     const next = this.initializeAgent();
@@ -2672,19 +2677,14 @@ export class AcpBridge implements GrokBridge {
 
   async interject(sessionId: string, text: string, options: PromptOptions): Promise<InterjectResult> {
     await this.ready;
-    // Channel-serialize with load/prompt so Computer attach silent-stream cannot
-    // black-hole a live turn's sessionUpdate lines (R3).
-    return this.runOnChannel(() => this.interjectInner(sessionId, text, options));
-  }
-
-  private async interjectInner(
-    sessionId: string,
-    text: string,
-    options: PromptOptions,
-  ): Promise<InterjectResult> {
     // Do not optimistically mark bound — only session/new or successful session/load.
     const trimmed = text.trim();
-    await this.ensureComputerAttachedForPrompt(sessionId, trimmed);
+    // Computer attach must be channel-serialized (silent stream is process-global).
+    // The interject RPC itself must NOT wait behind an in-flight session/prompt
+    // (that would block mid-turn 插话 until the turn ends — R3 regression).
+    if (this.promptRequestsComputer(trimmed) && !this.computerLeases.has(sessionId)) {
+      await this.runOnChannel(() => this.ensureComputerAttachedForPrompt(sessionId, trimmed));
+    }
     const interjectionId = crypto.randomUUID();
     const content = promptContent(trimmed, options.attachments ?? []);
     try {
@@ -2748,20 +2748,23 @@ export class AcpBridge implements GrokBridge {
     const sendNow = queueOptions.sendNow === true;
     const content = promptContent(trimmed, options.attachments ?? []);
 
-    // Concurrent session/prompt with queue meta — CLI owns execution when supported.
-    void this.requestRaw(
-      ACP_METHODS.sessionPrompt,
-      {
-        sessionId,
-        prompt: content,
-        _meta: {
-          promptId,
-          sendNow,
-          clientIdentifier: "grox-desktop",
+    // Must not race silent bind: process-global silent_stream drops all sessionUpdates.
+    // Queue the wire write behind the same channel as load/prompt (R3-strict).
+    void this.runOnChannel(async () => {
+      await this.requestRaw(
+        ACP_METHODS.sessionPrompt,
+        {
+          sessionId,
+          prompt: content,
+          _meta: {
+            promptId,
+            sendNow,
+            clientIdentifier: "grox-desktop",
+          },
         },
-      },
-      1_800_000,
-    ).catch((error) => {
+        1_800_000,
+      );
+    }).catch((error) => {
       this.emit({
         type: "error",
         sessionId,
@@ -3090,10 +3093,14 @@ export class AcpBridge implements GrokBridge {
 
   async emergencyStopComputer(sessionId: string): Promise<void> {
     const leaseId = this.computerLeases.get(sessionId);
-    if (leaseId) {
-      await invoke("computer_emergency_stop", { leaseId });
+    try {
+      if (leaseId) {
+        await invoke("computer_emergency_stop", { leaseId });
+      }
+    } finally {
+      // Always cancel the turn even if invoke fails (hotkey fail-closed).
+      this.cancel(sessionId);
     }
-    this.cancel(sessionId);
   }
 
   /**

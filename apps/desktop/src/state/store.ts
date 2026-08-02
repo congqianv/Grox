@@ -1391,6 +1391,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
             if (next && !offlineHistoryDeleted.has(payload.id)) {
               window.setTimeout(() => {
                 if (offlineHistoryDeleted.has(payload.id)) return;
+                if (promptInFlightSessions.has(payload.id)) return;
+                const cur = get().sessions[payload.id];
+                // Never clobber a longer live transcript with a late offline scan.
+                if (cur && cur.blocks.length > next.blocks.length) return;
+                if (
+                  cur &&
+                  (cur.status === "running" ||
+                    cur.status === "awaiting_permission" ||
+                    cur.status === "awaiting_input")
+                ) {
+                  return;
+                }
                 set({
                   sessions: { ...get().sessions, [payload.id]: next },
                 });
@@ -1771,7 +1783,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         };
 
         const applyChrome = (session?: Session | null, opts?: { loadingDisk?: boolean }) => {
-          if (!stillThisOpen()) return;
+          if (!stillThisOpen() || offlineHistoryDeleted.has(id)) return;
           const crossProject = meta && !samePath(meta.cwd, get().workspace);
           const projects =
             meta && crossProject
@@ -2419,8 +2431,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
     closePreview: () => set({ previewOpen: false, previewFile: null, previewError: null }),
 
     async deleteSession(id) {
-      // Tombstone first so late offline scan cannot re-insert the body.
+      // Tombstone first so late offline scan / in-flight openSession cannot resurrect.
       offlineHistoryDeleted.add(id);
+      openSessionGeneration += 1;
       offlineHistoryScanning.delete(id);
       offlineHistoryComplete.delete(id);
       if (get().fullHistoryLoadingId === id || get().diskHistoryProgress?.id === id) {
