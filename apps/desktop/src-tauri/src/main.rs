@@ -906,11 +906,22 @@ fn parse_env_file(path: &Path) -> BTreeMap<String, String> {
             } else {
                 value
             };
+            // R20: never inject control chars / multi-line values into CLI env.
+            if !is_safe_cli_env_value(value) {
+                return None;
+            }
             Some((key.to_string(), value.to_string()))
         })
         .collect()
 }
 
+/// Values that may cross into a Grok CLI child env must stay single-line and bounded.
+fn is_safe_cli_env_value(value: &str) -> bool {
+    if value.len() > 16 * 1024 {
+        return false;
+    }
+    !value.chars().any(|c| c.is_control())
+}
 
 fn parse_grox_managed_provider_env(path: &Path) -> BTreeMap<String, String> {
     let Ok(content) = read_bounded_text(path, MAX_CONFIG_BYTES) else {
@@ -949,6 +960,9 @@ fn parse_grox_managed_provider_env(path: &Path) -> BTreeMap<String, String> {
             } else {
                 value
             };
+            if !is_safe_cli_env_value(value) {
+                return None;
+            }
             Some((key.to_string(), value.to_string()))
         })
         .collect()
@@ -3362,7 +3376,8 @@ fn read_prompt_image_paths(cwd: String, paths: Vec<String>) -> Result<Vec<Prompt
 
 
 /// Prefer absolute Git installs so a PATH-planted `git.exe` cannot run under the shell.
-fn resolve_git_executable() -> PathBuf {
+/// R20: fail-closed — never fall back to bare `git` via `%PATH%` (same class as R18 PM).
+fn resolve_git_executable() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         let mut candidates: Vec<PathBuf> = Vec::new();
@@ -3381,24 +3396,27 @@ fn resolve_git_executable() -> PathBuf {
         candidates.push(PathBuf::from(r"C:\Program Files (x86)\Git\cmd\git.exe"));
         for path in candidates {
             if path.is_file() {
-                return path;
+                return Some(path);
             }
         }
+        return None;
     }
     #[cfg(unix)]
     {
         for path in ["/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"] {
             let path = PathBuf::from(path);
             if path.is_file() {
-                return path;
+                return Some(path);
             }
         }
+        None
     }
-    PathBuf::from("git")
 }
 
 fn git_command(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    let git = resolve_git_executable();
+    let git = resolve_git_executable().ok_or_else(|| {
+        "未找到 Git 的绝对安装路径（已拒绝 %PATH% 裸名回落，防劫持）".to_string()
+    })?;
     let mut command = std::process::Command::new(&git);
     command.current_dir(root).args(args);
     #[cfg(windows)]
@@ -4352,24 +4370,9 @@ fn open_file_with_application(cwd: String, path: String, application: String) ->
     {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // R19/R20: checked_windows_application only allows .exe/.com — spawn directly.
         let target = checked_windows_application(&application)?;
-        let extension = target
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let mut command = if matches!(extension.as_str(), "bat" | "cmd") {
-            let mut command = std::process::Command::new(system32_tool("cmd.exe"));
-            command.args(["/D", "/C"]).arg(&target);
-            command
-        } else if extension == "ps1" {
-            let mut command = std::process::Command::new(system32_tool("powershell.exe"));
-            command.args(["-NoProfile", "-File"]).arg(&target);
-            command
-        } else {
-            std::process::Command::new(&target)
-        };
-        command
+        std::process::Command::new(&target)
             .arg(&file)
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
@@ -4862,6 +4865,12 @@ fn write_session_cache(app: tauri::AppHandle, id: String, content: String) -> Re
             "会话缓存过大（{} bytes），已跳过写入",
             content.len()
         ));
+    }
+    // R20: only JSON objects — refuse raw scripts / HTML planted via compromised webview.
+    let parsed: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|error| format!("会话缓存必须是 JSON：{error}"))?;
+    if !parsed.is_object() {
+        return Err("会话缓存必须是 JSON 对象".into());
     }
     let path = session_cache_path(&app, &id)?;
     if let Some(parent) = path.parent() {
@@ -8460,18 +8469,46 @@ api_key = "local-key"
     }
 
     #[test]
-    fn resolve_git_executable_returns_path_like_git() {
-        let path = resolve_git_executable();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        assert!(
-            name == "git" || name == "git.exe",
-            "unexpected git basename: {}",
-            path.display()
-        );
+    fn resolve_git_executable_is_absolute_or_none() {
+        match resolve_git_executable() {
+            Some(path) => {
+                assert!(path.is_absolute(), "git must be absolute: {}", path.display());
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                assert!(
+                    name == "git" || name == "git.exe",
+                    "unexpected git basename: {}",
+                    path.display()
+                );
+            }
+            None => {
+                // Fail-closed when no known install root has git — OK.
+            }
+        }
+    }
+
+    #[test]
+    fn safe_cli_env_value_rejects_control_and_oversize() {
+        assert!(is_safe_cli_env_value("sk-abc123"));
+        assert!(is_safe_cli_env_value("https://api.example.com/v1"));
+        assert!(!is_safe_cli_env_value("line1\nline2"));
+        assert!(!is_safe_cli_env_value("a\0b"));
+        assert!(!is_safe_cli_env_value(&"x".repeat(16 * 1024 + 1)));
+    }
+
+    #[test]
+    fn session_cache_json_object_gate() {
+        // Predicate surface used by write_session_cache before disk write.
+        assert!(serde_json::from_str::<serde_json::Value>(r#"{"id":"s1"}"#)
+            .ok()
+            .is_some_and(|v| v.is_object()));
+        assert!(!serde_json::from_str::<serde_json::Value>(r#"[1,2,3]"#)
+            .ok()
+            .is_some_and(|v| v.is_object()));
+        assert!(serde_json::from_str::<serde_json::Value>("not-json").is_err());
     }
 
     #[test]

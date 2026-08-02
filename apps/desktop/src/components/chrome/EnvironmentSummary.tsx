@@ -4,6 +4,7 @@ import { useDesktop } from "../../state/store";
 import { MAX_ATTACHMENTS, prepareAttachment, validateAttachmentSet } from "../../lib/attachments";
 import { baseName } from "../../lib/format";
 import { useI18n } from "../../lib/i18n";
+import { isSafeMarkdownOpenUrl } from "../../lib/markdown";
 import { Icon } from "../fx/Icon";
 
 interface GitSummary {
@@ -27,6 +28,18 @@ interface SummarySource {
 }
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
+
+/** Dual-gate source/compare URLs before open_external (R20). */
+function openSafeExternal(raw: string) {
+  try {
+    const url = new URL(raw);
+    if (!isSafeMarkdownOpenUrl(url)) return;
+    if (inTauri()) void invoke("open_external", { url: url.toString() });
+    else window.open(url.toString(), "_blank", "noopener,noreferrer");
+  } catch {
+    // invalid URL — ignore
+  }
+}
 
 const githubBaseUrl = (remote?: string) => {
   if (!remote) return null;
@@ -188,8 +201,7 @@ export function EnvironmentSummary() {
     const branch = summary?.branch;
     if (!base || !branch) return;
     const target = `${base}/compare/${encodeURIComponent(summary?.defaultBranch ?? "main")}...${encodeURIComponent(branch)}`;
-    if (inTauri()) void invoke("open_external", { url: target });
-    else window.open(target, "_blank", "noopener,noreferrer");
+    openSafeExternal(target);
   };
 
   const addSources = async (files: FileList | null) => {
@@ -350,7 +362,7 @@ export function EnvironmentSummary() {
                   <button
                     key={source.id}
                     disabled={!source.url}
-                    onClick={() => source.url && (inTauri() ? void invoke("open_external", { url: source.url }) : window.open(source.url, "_blank", "noopener,noreferrer"))}
+                    onClick={() => source.url && openSafeExternal(source.url)}
                     className="summary-row w-full disabled:cursor-default"
                     title={source.label}
                   >
