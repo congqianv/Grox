@@ -1109,25 +1109,32 @@ async fn install_official_grok_cli(
     };
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let status = tokio::time::timeout(Duration::from_secs(300), command.status())
+
+    let output = tokio::time::timeout(Duration::from_secs(300), command.output())
         .await
         .map_err(|_| "官方 Grok CLI 安装超过 5 分钟，已停止等待".to_string())?
         .map_err(|error| format!("无法启动官方 Grok CLI 安装程序：{error}"))?;
-    if !status.success() {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "官方 Grok CLI 安装失败（退出码 {}）",
-            status
-                .code()
-                .map_or_else(|| "unknown".into(), |code| code.to_string())
+            "官方 Grok CLI 安装失败（退出码 {}）：\n{}",
+            output.status.code().map_or_else(|| "unknown".into(), |code| code.to_string()),
+            stderr
         ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("already installed") || stdout.contains("up to date") {
+        // Treat as success even if no-op
+    } else if !stdout.trim().is_empty() {
+        // Optionally log, but since UI, perhaps emit later
     }
     write_runtime_preference(&app, "system")?;
     let runtime = configured_grok_command(&app);
@@ -2612,9 +2619,8 @@ async fn acp_spawn(
     let command_path = PathBuf::from(&runtime.path);
     let mut command = Command::new(&command_path);
     command
-        .args(["agent", "stdio"])
+        .args(["agent", "--leader", "--reasoning-effort", "high", "stdio"])
         .current_dir(&cwd)
-        .env("GROK_CLIENT_VERSION", CLIENT_VERSION)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
