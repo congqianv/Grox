@@ -1379,11 +1379,56 @@ fn is_loopback_host(host: Option<&str>) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-/// Provider model-list redirects: HTTPS anywhere, HTTP only on loopback (no
-/// cleartext bearer-token leak to remote HTTP after a 30x).
+/// Cloud metadata / link-local targets — never call as provider base_url or open.
+/// R16: belt against SSRF to 169.254.169.254 and metadata DNS names.
+fn is_blocked_ssrf_host(host: Option<&str>) -> bool {
+    let Some(host) = host.map(|h| h.trim().trim_start_matches('[').trim_end_matches(']')) else {
+        return true;
+    };
+    let host = host.to_ascii_lowercase();
+    if host.is_empty() {
+        return true;
+    }
+    if host == "metadata"
+        || host == "metadata.google.internal"
+        || host.ends_with(".metadata.google.internal")
+        || host == "instance-data"
+        || host == "kubernetes.default"
+        || host == "kubernetes.default.svc"
+    {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if v4.is_unspecified() {
+                    return true;
+                }
+                let o = v4.octets();
+                // 169.254.0.0/16 link-local (AWS/GCP/Azure IMDS)
+                if o[0] == 169 && o[1] == 254 {
+                    return true;
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                if v6.is_unspecified() {
+                    return true;
+                }
+                // fe80::/10 link-local
+                let seg0 = v6.segments()[0];
+                if (seg0 & 0xffc0) == 0xfe80 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Provider model-list redirects: HTTPS (non-metadata) or loopback HTTP only.
 fn should_follow_provider_redirect(url: &url::Url) -> bool {
     match url.scheme() {
-        "https" => url.host_str().is_some(),
+        "https" => url.host_str().is_some() && !is_blocked_ssrf_host(url.host_str()),
         "http" => is_loopback_host(url.host_str()),
         _ => false,
     }
@@ -1628,6 +1673,10 @@ fn checked_service_url(value: &str, label: &str) -> Result<String, String> {
     let local_http = parsed.scheme() == "http" && is_loopback_host(parsed.host_str());
     if !secure && !local_http {
         return Err(format!("{label}必须使用 HTTPS；仅本机回环地址允许 HTTP"));
+    }
+    // R16: refuse cloud IMDS / link-local even over HTTPS.
+    if is_blocked_ssrf_host(parsed.host_str()) {
+        return Err(format!("{label}不能指向链路本地或云元数据地址"));
     }
     // Use url's serialized representation instead of the original input.
     // URL parsers may tolerate ASCII whitespace that would otherwise become a
@@ -4656,7 +4705,10 @@ fn write_session_cache(app: tauri::AppHandle, id: String, content: String) -> Re
         fs::create_dir_all(parent).map_err(|error| format!("无法创建会话缓存目录：{error}"))?;
     }
     // Dedicated writer: session cache may exceed the 4MB config document cap.
-    atomic_write_bytes(&path, &content, SESSION_CACHE_MAX_BYTES)
+    atomic_write_bytes(&path, &content, SESSION_CACHE_MAX_BYTES)?;
+    // R16: transcripts can hold sensitive chat content — tighten ACL when possible.
+    let _ = restrict_private_file(&path);
+    Ok(())
 }
 
 /// Co-located durable offline transcript (survives app restart; fingerprint-gated).
@@ -7081,8 +7133,8 @@ fn configure_provider(request: ProviderConfig) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn open_external(url: String) -> Result<(), String> {
+/// Parse and validate a browser-open URL (shared by open_external variants).
+fn parse_browser_url(url: &str) -> Result<url::Url, String> {
     let trimmed = url.trim();
     if trimmed.is_empty() || trimmed.len() > 8_192 {
         return Err("链接长度无效".into());
@@ -7097,7 +7149,6 @@ fn open_external(url: String) -> Result<(), String> {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("链接不能包含用户名或密码".into());
     }
-    // Reject scheme-smuggling and host-less oddities after parse.
     if parsed.host_str().is_none() {
         return Err("链接缺少主机名".into());
     }
@@ -7105,7 +7156,14 @@ fn open_external(url: String) -> Result<(), String> {
     if parsed.scheme() == "http" && !is_loopback_host(parsed.host_str()) {
         return Err("远程链接必须使用 HTTPS；仅本机回环地址允许 HTTP".into());
     }
+    // R16: never open IMDS / link-local targets.
+    if is_blocked_ssrf_host(parsed.host_str()) {
+        return Err("不允许打开链路本地或云元数据地址".into());
+    }
+    Ok(parsed)
+}
 
+fn spawn_system_browser(parsed: &url::Url) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -7130,6 +7188,36 @@ fn open_external(url: String) -> Result<(), String> {
         .map_err(|error| format!("无法打开浏览器：{error}"))?;
 
     Ok(())
+}
+
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    let parsed = parse_browser_url(&url)?;
+    spawn_system_browser(&parsed)
+}
+
+/// Media Studio remote artifacts — HTTPS hosts must be on the media allowlist.
+#[tauri::command]
+fn open_media_external(url: String) -> Result<(), String> {
+    let parsed = parse_browser_url(&url)?;
+    if parsed.scheme() == "https" {
+        if !is_media_https_host_allowed(parsed.host_str()) {
+            return Err("媒体链接域名不在允许列表中".into());
+        }
+    } else if !(parsed.scheme() == "http" && is_loopback_host(parsed.host_str())) {
+        return Err("媒体链接必须是 HTTPS 允许域或本机 HTTP".into());
+    }
+    spawn_system_browser(&parsed)
+}
+
+/// Project preview — only loopback (dev servers bound to 127.0.0.1).
+#[tauri::command]
+fn open_preview_external(url: String) -> Result<(), String> {
+    let parsed = parse_browser_url(&url)?;
+    if !is_loopback_host(parsed.host_str()) {
+        return Err("预览只允许在本机回环地址打开".into());
+    }
+    spawn_system_browser(&parsed)
 }
 
 /// Start a fresh ACP child and stream each stdout JSON-RPC line to the webview.
@@ -7699,6 +7787,8 @@ fn main() {
             set_grok_runtime_preference,
             install_official_grok_cli,
             open_external,
+            open_media_external,
+            open_preview_external,
             computer_session_extensions,
             computer_use_env_enabled_cmd,
             computer_emergency_stop,
@@ -8120,27 +8210,40 @@ api_key = "local-key"
     #[test]
     fn open_external_rejects_remote_http_and_credentials() {
         // Validation only — do not actually spawn a browser.
-        let reject_http = {
-            let trimmed = "http://evil.example/phish";
-            let parsed = url::Url::parse(trimmed).unwrap();
-            parsed.scheme() == "http" && !is_loopback_host(parsed.host_str())
-        };
-        assert!(reject_http);
-        let allow_loopback = {
-            let parsed = url::Url::parse("http://127.0.0.1:5173/").unwrap();
-            parsed.scheme() == "http" && is_loopback_host(parsed.host_str())
-        };
-        assert!(allow_loopback);
-        let allow_https = {
-            let parsed = url::Url::parse("https://github.com/congqianv/Grox/releases").unwrap();
-            parsed.scheme() == "https" && parsed.username().is_empty() && parsed.password().is_none()
-        };
-        assert!(allow_https);
-        let reject_userinfo = {
-            let parsed = url::Url::parse("https://user:pass@evil.example/").unwrap();
-            !parsed.username().is_empty() || parsed.password().is_some()
-        };
-        assert!(reject_userinfo);
+        assert!(parse_browser_url("http://evil.example/phish").is_err());
+        assert!(parse_browser_url("http://127.0.0.1:5173/").is_ok());
+        assert!(parse_browser_url("https://github.com/congqianv/Grox/releases").is_ok());
+        assert!(parse_browser_url("https://user:pass@evil.example/").is_err());
+        assert!(parse_browser_url("https://169.254.169.254/latest/meta-data/").is_err());
+        assert!(parse_browser_url("https://metadata.google.internal/").is_err());
+    }
+
+    #[test]
+    fn blocked_ssrf_hosts_cover_imds() {
+        assert!(is_blocked_ssrf_host(Some("169.254.169.254")));
+        assert!(is_blocked_ssrf_host(Some("metadata.google.internal")));
+        assert!(is_blocked_ssrf_host(Some("METADATA.GOOGLE.INTERNAL")));
+        assert!(!is_blocked_ssrf_host(Some("127.0.0.1")));
+        assert!(!is_blocked_ssrf_host(Some("api.openai.com")));
+        assert!(!is_blocked_ssrf_host(Some("10.0.0.5"))); // LAN proxies still allowed
+    }
+
+    #[test]
+    fn checked_service_url_rejects_imds() {
+        assert!(checked_service_url("https://169.254.169.254/v1", "服务地址").is_err());
+        assert!(checked_service_url("https://api.example.com/v1", "服务地址").is_ok());
+        assert!(checked_service_url("http://127.0.0.1:8000/v1", "服务地址").is_ok());
+    }
+
+    #[test]
+    fn media_external_host_gate_matches_allowlist() {
+        assert!(is_media_https_host_allowed(Some("cdn.x.ai")));
+        assert!(!is_media_https_host_allowed(Some("evil.example")));
+        // parse_browser_url + media allowlist composition
+        let ok = parse_browser_url("https://cdn.x.ai/a.png").unwrap();
+        assert!(is_media_https_host_allowed(ok.host_str()));
+        let bad = parse_browser_url("https://evil.example/a.png").unwrap();
+        assert!(!is_media_https_host_allowed(bad.host_str()));
     }
 
     #[test]

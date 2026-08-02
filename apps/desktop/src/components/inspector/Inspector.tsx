@@ -258,7 +258,7 @@ function PreviewTab() {
         </button>
         <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="http://localhost:5173" className="h-6 min-w-0 flex-1 rounded-[3px] border border-line bg-raise px-2 font-mono text-[9.5px] text-fg2 outline-none focus:border-line3" />
         {preview.url && (
-          <button type="button" onClick={() => void invoke("open_external", { url: preview.url })} className="flex h-6 w-6 items-center justify-center text-dim hover:text-fg" title={zh ? "在浏览器打开" : "Open in browser"}>
+          <button type="button" onClick={() => void invoke("open_preview_external", { url: preview.url })} className="flex h-6 w-6 items-center justify-center text-dim hover:text-fg" title={zh ? "在浏览器打开" : "Open in browser"}>
             <Icon name="external" size={11} />
           </button>
         )}
