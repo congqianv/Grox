@@ -2602,8 +2602,61 @@ fn preview_session_from_disk(
 
 /// Generation token: switching missions abandons the previous offline scan.
 static OFFLINE_HISTORY_GEN: AtomicU64 = AtomicU64::new(0);
-/// Session id currently being scanned (empty = idle). Prevents re-entry restart storms.
+/// Session id currently being scanned (empty = idle).
 static OFFLINE_HISTORY_ACTIVE_ID: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Pollable scan progress (event-driven progress freezes the webview under load).
+static SCAN_BYTES: AtomicU64 = AtomicU64::new(0);
+static SCAN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SCAN_LINES: AtomicU64 = AtomicU64::new(0);
+static SCAN_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static SCAN_DONE: AtomicU64 = AtomicU64::new(1); // 1=idle/done, 0=running
+// 0=idle 1=scanning 2=complete 3=error 4=missing 5=no-updates 6=cancelled
+static SCAN_PHASE_CODE: AtomicU64 = AtomicU64::new(0);
+
+fn phase_code(phase: &str) -> u64 {
+    match phase {
+        "scanning" => 1,
+        "complete" => 2,
+        "error" => 3,
+        "missing" => 4,
+        "no-updates" => 5,
+        "cancelled" => 6,
+        _ => 0,
+    }
+}
+
+fn phase_name(code: u64) -> &'static str {
+    match code {
+        1 => "scanning",
+        2 => "complete",
+        3 => "error",
+        4 => "missing",
+        5 => "no-updates",
+        6 => "cancelled",
+        _ => "idle",
+    }
+}
+
+fn scan_progress_reset(total: u64) {
+    SCAN_BYTES.store(0, Ordering::Relaxed);
+    SCAN_TOTAL.store(total, Ordering::Relaxed);
+    SCAN_LINES.store(0, Ordering::Relaxed);
+    SCAN_BLOCKS.store(0, Ordering::Relaxed);
+    SCAN_DONE.store(0, Ordering::Relaxed);
+    SCAN_PHASE_CODE.store(1, Ordering::Relaxed);
+}
+
+fn scan_progress_set(bytes: u64, lines: u64, blocks: u64) {
+    SCAN_BYTES.store(bytes, Ordering::Relaxed);
+    SCAN_LINES.store(lines, Ordering::Relaxed);
+    SCAN_BLOCKS.store(blocks, Ordering::Relaxed);
+}
+
+fn scan_progress_finish(phase: &str) {
+    SCAN_DONE.store(1, Ordering::Relaxed);
+    SCAN_PHASE_CODE.store(phase_code(phase), Ordering::Relaxed);
+}
 
 /// Bump generation so any in-flight offline history worker exits without emitting.
 #[tauri::command]
@@ -2612,6 +2665,39 @@ fn cancel_offline_session_history() {
     if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
         guard.clear();
     }
+    scan_progress_finish("cancelled");
+}
+
+/// Frontend polls this every ~250ms — never depends on high-frequency emit.
+#[tauri::command]
+fn get_offline_scan_progress() -> serde_json::Value {
+    let bytes = SCAN_BYTES.load(Ordering::Relaxed);
+    let total = SCAN_TOTAL.load(Ordering::Relaxed);
+    let lines = SCAN_LINES.load(Ordering::Relaxed);
+    let blocks = SCAN_BLOCKS.load(Ordering::Relaxed);
+    let done = SCAN_DONE.load(Ordering::Relaxed) != 0;
+    let phase = phase_name(SCAN_PHASE_CODE.load(Ordering::Relaxed));
+    let active = OFFLINE_HISTORY_ACTIVE_ID
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let percent = if done && phase == "complete" {
+        100
+    } else if total > 0 {
+        ((bytes.saturating_mul(100)) / total).min(99)
+    } else {
+        0
+    };
+    serde_json::json!({
+        "id": active,
+        "done": done,
+        "phase": phase,
+        "percent": percent,
+        "bytesRead": bytes,
+        "totalBytes": total,
+        "lines": lines,
+        "blocks": blocks,
+    })
 }
 
 fn offline_history_meta(dir: &Path) -> (String, String, String, u64, u64) {
@@ -2706,17 +2792,26 @@ fn start_offline_session_history(
     if safe.is_empty() {
         return Err("无效的会话 ID".into());
     }
-    // Same-id re-entry: do NOT bump gen / restart — that was freezing the bar at
-    // ~5% (old worker killed, UI stuck on last tick while a new scan restarts).
-    if let Ok(guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
+    // Same-id re-entry while truly running: join. If ACTIVE_ID is stale (worker
+    // died without clear), allow restart so the bar cannot stick forever.
+    if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
         if guard.as_str() == safe {
-            return Ok(());
+            if SCAN_DONE.load(Ordering::Relaxed) == 0 {
+                return Ok(());
+            }
+            guard.clear();
         }
     }
     let gen = OFFLINE_HISTORY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
         *guard = safe.clone();
     }
+    // Mark running immediately so poll never treats a stale "done" as finished.
+    SCAN_DONE.store(0, Ordering::Relaxed);
+    SCAN_PHASE_CODE.store(1, Ordering::Relaxed);
+    SCAN_BYTES.store(0, Ordering::Relaxed);
+    SCAN_LINES.store(0, Ordering::Relaxed);
+    SCAN_BLOCKS.store(0, Ordering::Relaxed);
     std::thread::Builder::new()
         .name(format!("offline-hist-{safe}"))
         .spawn(move || {
@@ -2728,37 +2823,33 @@ fn start_offline_session_history(
                     }
                 }
             };
-            let emit_progress = |session: Option<serde_json::Value>,
-                                 done: bool,
-                                 phase: &str,
-                                 bytes_read: u64,
-                                 total_bytes: u64,
-                                 lines: usize,
-                                 block_count: usize| {
+            // Only emit session on terminal events — mid-scan progress is polled via
+            // get_offline_scan_progress (atomics). Emitting every tick freezes WebView.
+            let emit_done = |session: Option<serde_json::Value>, phase: &str| {
                 if abandoned() {
                     return;
                 }
-                let percent = if total_bytes > 0 {
-                    ((bytes_read.saturating_mul(100)) / total_bytes).min(if done {
-                        100
-                    } else {
-                        99
-                    })
-                } else if done {
+                let bytes = SCAN_BYTES.load(Ordering::Relaxed);
+                let total = SCAN_TOTAL.load(Ordering::Relaxed);
+                let lines = SCAN_LINES.load(Ordering::Relaxed);
+                let blocks = SCAN_BLOCKS.load(Ordering::Relaxed);
+                let percent = if phase == "complete" {
                     100
+                } else if total > 0 {
+                    ((bytes.saturating_mul(100)) / total).min(99)
                 } else {
                     0
                 };
                 let mut payload = serde_json::json!({
                     "id": safe,
                     "gen": gen,
-                    "done": done,
+                    "done": true,
                     "phase": phase,
-                    "bytesRead": bytes_read,
-                    "totalBytes": total_bytes,
+                    "bytesRead": bytes,
+                    "totalBytes": total,
                     "percent": percent,
                     "lines": lines,
-                    "blocks": block_count,
+                    "blocks": blocks,
                 });
                 if let Some(session) = session {
                     if let Some(obj) = payload.as_object_mut() {
@@ -2767,21 +2858,13 @@ fn start_offline_session_history(
                 }
                 let _ = app.emit("disk-history-progress", payload);
             };
-            let emit = |session: serde_json::Value, done: bool, phase: &str| {
-                emit_progress(Some(session), done, phase, 0, 0, 0, 0);
+            let emit = |session: serde_json::Value, _done: bool, phase: &str| {
+                emit_done(Some(session), phase);
             };
 
             let Some(dir) = find_grok_session_dir(&safe) else {
-                let _ = app.emit(
-                    "disk-history-progress",
-                    serde_json::json!({
-                        "id": safe,
-                        "gen": gen,
-                        "done": true,
-                        "phase": "missing",
-                        "session": null,
-                    }),
-                );
+                scan_progress_finish("missing");
+                emit_done(None, "missing");
                 clear_active();
                 return;
             };
@@ -2794,22 +2877,22 @@ fn start_offline_session_history(
                         .and_then(|v| v.as_array())
                         .map(|a| a.len())
                         .unwrap_or(0);
-                    let _ = app.emit(
-                        "disk-history-progress",
-                        serde_json::json!({
-                            "id": safe,
-                            "gen": gen,
-                            "done": true,
-                            "phase": "complete",
-                            "session": cached,
-                            "fromCache": true,
-                            "percent": 100,
-                            "bytesRead": 0,
-                            "totalBytes": 0,
-                            "lines": 0,
-                            "blocks": blocks_n,
-                        }),
-                    );
+                    scan_progress_set(0, 0, blocks_n as u64);
+                    scan_progress_finish("complete");
+                    let payload = serde_json::json!({
+                        "id": safe,
+                        "gen": gen,
+                        "done": true,
+                        "phase": "complete",
+                        "session": cached,
+                        "fromCache": true,
+                        "percent": 100,
+                        "bytesRead": 0,
+                        "totalBytes": 0,
+                        "lines": 0,
+                        "blocks": blocks_n,
+                    });
+                    let _ = app.emit("disk-history-progress", payload);
                 }
                 clear_active();
                 return;
@@ -2842,6 +2925,7 @@ fn start_offline_session_history(
             // Phase 2: stream updates.jsonl for full tool + message fidelity.
             let updates_path = dir.join("updates.jsonl");
             if !updates_path.is_file() {
+                scan_progress_finish("no-updates");
                 emit(
                     pack_offline_session(
                         &safe, &title_s, &cwd_s, &model_s, created_at, updated_at, &[],
@@ -2856,6 +2940,7 @@ fn start_offline_session_history(
             let file = match File::open(&updates_path) {
                 Ok(f) => f,
                 Err(e) => {
+                    scan_progress_finish("error");
                     let _ = app.emit(
                         "disk-history-progress",
                         serde_json::json!({
@@ -2893,8 +2978,8 @@ fn start_offline_session_history(
             // blocks + React re-render freezes the webview for many seconds, so progress
             // events pile up and the bar looks "stuck" even though the worker advances.
 
-            // Immediate 0% so UI can show a bar before the first tick.
-            emit_progress(None, false, "scanning", 0, total_bytes, 0, 0);
+            // Pollable progress (frontend setInterval) — no mid-scan IPC flood.
+            scan_progress_reset(total_bytes);
 
             let flush_user = |blocks: &mut Vec<serde_json::Value>,
                              user_open: &mut Option<(String, String)>,
@@ -2945,11 +3030,10 @@ fn start_offline_session_history(
                 line_i += 1;
                 bytes_read = bytes_read.saturating_add(read_n as u64);
 
-                // Heartbeat: every 256KB OR 200ms OR 400 lines — never stall the bar
-                // while draining multi-MB thought regions.
-                let need_tick = bytes_read.saturating_sub(last_progress_bytes) >= 256 * 1024
-                    || last_progress_at.elapsed() >= Duration::from_millis(200)
-                    || line_i.saturating_sub(last_progress_lines) >= 400;
+                // Update atomics often; UI polls them — no emit, no main-thread block.
+                let need_tick = bytes_read.saturating_sub(last_progress_bytes) >= 128 * 1024
+                    || last_progress_at.elapsed() >= Duration::from_millis(100)
+                    || line_i.saturating_sub(last_progress_lines) >= 200;
                 if need_tick {
                     last_progress_lines = line_i;
                     last_progress_bytes = bytes_read;
@@ -2959,17 +3043,11 @@ fn start_offline_session_history(
                     } else {
                         bytes_read
                     };
-                    emit_progress(
-                        None,
-                        false,
-                        "scanning",
-                        shown,
-                        total_bytes,
-                        line_i,
-                        blocks.len(),
-                    );
+                    scan_progress_set(shown, line_i as u64, blocks.len() as u64);
                 }
                 if line_i & 0xFFF == 0 && abandoned() {
+                    scan_progress_finish("cancelled");
+                    clear_active();
                     return;
                 }
 
@@ -3216,6 +3294,7 @@ fn start_offline_session_history(
             }
 
             if abandoned() {
+                scan_progress_finish("cancelled");
                 clear_active();
                 return;
             }
@@ -3249,18 +3328,19 @@ fn start_offline_session_history(
             );
             // Durable fingerprint cache for next cold open.
             let _ = write_ui_transcript(&dir, &safe, &packed, &updates_path);
-            emit_progress(
-                Some(packed),
-                true,
-                "complete",
-                total_bytes.max(bytes_read),
-                total_bytes.max(bytes_read),
-                line_i,
-                blocks.len(),
-            );
+            let final_bytes = total_bytes.max(bytes_read);
+            scan_progress_set(final_bytes, line_i as u64, blocks.len() as u64);
+            scan_progress_finish("complete");
+            emit_done(Some(packed), "complete");
             clear_active();
         })
-        .map_err(|e| format!("无法启动离线历史线程：{e}"))?;
+        .map_err(|e| {
+            scan_progress_finish("error");
+            if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
+                guard.clear();
+            }
+            format!("无法启动离线历史线程：{e}")
+        })?;
     Ok(())
 }
 
@@ -4240,6 +4320,7 @@ fn main() {
             start_offline_session_history,
             cancel_offline_session_history,
             get_ui_transcript,
+            get_offline_scan_progress,
             read_provider_status,
             configure_provider,
             list_provider_profiles,
