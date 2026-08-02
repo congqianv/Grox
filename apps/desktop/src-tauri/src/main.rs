@@ -6197,75 +6197,117 @@ fn redact_config_document_secrets(content: &str) -> String {
         .join("\n")
 }
 
-/// When the operator saves a redacted draft, keep prior secret values from disk.
-fn merge_config_secrets_from_existing(existing: &str, incoming: &str) -> String {
-    let mut prior_api_keys: Vec<String> = Vec::new();
-    let mut prior_env: BTreeMap<String, String> = BTreeMap::new();
-    for line in existing.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("api_key") {
-            let rest = rest.trim_start();
-            if let Some(val) = rest.strip_prefix('=') {
-                let val = val.trim().trim_matches('"').trim_matches('\'');
-                if !is_redacted_config_secret(val) {
-                    prior_api_keys.push(val.to_string());
-                }
-            }
+/// TOML table header line? e.g. `[model.foo]` or `[model."grok-4.5"]` (not array `[[`).
+fn is_toml_table_header(trimmed: &str) -> bool {
+    let t = trimmed.trim();
+    t.starts_with('[') && t.ends_with(']') && !t.starts_with("[[")
+}
+
+fn parse_toml_api_key_value(trimmed: &str) -> Option<&str> {
+    let rest = trimmed
+        .strip_prefix("api_key")
+        .or_else(|| trimmed.strip_prefix("API_KEY"))?;
+    let rest = rest.trim_start();
+    let val = rest.strip_prefix('=')?.trim();
+    let val = val.trim_matches('"').trim_matches('\'');
+    Some(val)
+}
+
+/// Map TOML table header → real api_key (R14.2: never positional).
+fn collect_api_keys_by_table(content: &str) -> BTreeMap<String, String> {
+    let mut table = String::new();
+    let mut map = BTreeMap::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if is_toml_table_header(trimmed) {
+            table = trimmed.to_string();
+            continue;
         }
-        if let Some((key, raw)) = trimmed.split_once('=') {
-            let key = key.trim();
-            if key.eq_ignore_ascii_case("XAI_API_KEY")
-                || key.eq_ignore_ascii_case("OPENAI_API_KEY")
-                || key.eq_ignore_ascii_case("ANTHROPIC_API_KEY")
-            {
-                let val = raw.trim().trim_matches('"').trim_matches('\'');
-                if !is_redacted_config_secret(val) {
-                    prior_env.insert(key.to_string(), val.to_string());
-                }
+        if let Some(val) = parse_toml_api_key_value(trimmed) {
+            if !is_redacted_config_secret(val) {
+                map.insert(table.clone(), val.to_string());
             }
         }
     }
-    let mut api_idx = 0usize;
-    incoming
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim_start();
-            if let Some(rest) = trimmed.strip_prefix("api_key") {
-                let rest = rest.trim_start();
-                if let Some(val) = rest.strip_prefix('=') {
-                    let val = val.trim().trim_matches('"').trim_matches('\'');
-                    if is_redacted_config_secret(val) {
-                        if let Some(real) = prior_api_keys.get(api_idx) {
-                            api_idx += 1;
-                            let indent_len = line.len() - trimmed.len();
-                            let indent = &line[..indent_len];
-                            return format!("{indent}api_key = {}", toml_string(real));
-                        }
-                    } else {
-                        api_idx += 1;
-                    }
+    map
+}
+
+fn collect_env_style_secrets(content: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let Some((key, raw)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if !(key.eq_ignore_ascii_case("XAI_API_KEY")
+            || key.eq_ignore_ascii_case("OPENAI_API_KEY")
+            || key.eq_ignore_ascii_case("ANTHROPIC_API_KEY"))
+        {
+            continue;
+        }
+        let val = raw.trim().trim_matches('"').trim_matches('\'');
+        if !is_redacted_config_secret(val) {
+            // Normalize key to uppercase so restore is case-insensitive.
+            map.insert(key.to_ascii_uppercase(), val.to_string());
+        }
+    }
+    map
+}
+
+/// When the operator saves a redacted draft, restore secrets **by table header**.
+/// Fail-closed if a redacted `api_key` has no matching table on disk (avoids
+/// wrong-key rebinding after delete/reorder — R14.2 N1).
+fn merge_config_secrets_from_existing(existing: &str, incoming: &str) -> Result<String, String> {
+    let prior_api = collect_api_keys_by_table(existing);
+    let prior_env = collect_env_style_secrets(existing);
+    let mut table = String::new();
+    let mut out: Vec<String> = Vec::new();
+    for line in incoming.lines() {
+        let trimmed = line.trim();
+        if is_toml_table_header(trimmed) {
+            table = trimmed.to_string();
+            out.push(line.to_string());
+            continue;
+        }
+        if let Some(val) = parse_toml_api_key_value(trimmed) {
+            if is_redacted_config_secret(val) {
+                let Some(real) = prior_api.get(&table) else {
+                    return Err(format!(
+                        "无法安全恢复密钥：表 {table} 在磁盘上没有对应 api_key（可能已删改模型段）。请重新输入该表的 API Key。"
+                    ));
+                };
+                let indent_len = line.len() - line.trim_start().len();
+                let indent = &line[..indent_len];
+                out.push(format!("{indent}api_key = {}", toml_string(real)));
+                continue;
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        if let Some((key, raw)) = trimmed.split_once('=') {
+            let key_trim = key.trim();
+            if key_trim.eq_ignore_ascii_case("XAI_API_KEY")
+                || key_trim.eq_ignore_ascii_case("OPENAI_API_KEY")
+                || key_trim.eq_ignore_ascii_case("ANTHROPIC_API_KEY")
+            {
+                let val = raw.trim().trim_matches('"').trim_matches('\'');
+                if is_redacted_config_secret(val) {
+                    let Some(real) = prior_env.get(&key_trim.to_ascii_uppercase()) else {
+                        return Err(format!(
+                            "无法安全恢复环境变量密钥 {key_trim}：磁盘上没有对应明文。请重新输入。"
+                        ));
+                    };
+                    let indent_len = line.len() - line.trim_start().len();
+                    let indent = &line[..indent_len];
+                    out.push(format!("{indent}{key_trim}={}", env_value(real)));
+                    continue;
                 }
             }
-            if let Some((key, raw)) = trimmed.split_once('=') {
-                let key_trim = key.trim();
-                if key_trim.eq_ignore_ascii_case("XAI_API_KEY")
-                    || key_trim.eq_ignore_ascii_case("OPENAI_API_KEY")
-                    || key_trim.eq_ignore_ascii_case("ANTHROPIC_API_KEY")
-                {
-                    let val = raw.trim().trim_matches('"').trim_matches('\'');
-                    if is_redacted_config_secret(val) {
-                        if let Some(real) = prior_env.get(key_trim) {
-                            let indent_len = line.len() - trimmed.len();
-                            let indent = &line[..indent_len];
-                            return format!("{indent}{key_trim}={}", env_value(real));
-                        }
-                    }
-                }
-            }
-            line.to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        }
+        out.push(line.to_string());
+    }
+    Ok(out.join("\n"))
 }
 
 #[tauri::command]
@@ -6314,8 +6356,23 @@ fn write_config_document(request: WriteConfigDocument) -> Result<ConfigDocument,
     }
     let (path, label, language) = config_path(id, &cwd)?;
     let to_write = if id == "config" && path.is_file() {
-        let existing = read_bounded_text(&path, MAX_CONFIG_BYTES).unwrap_or_default();
-        merge_config_secrets_from_existing(&existing, &request.content)
+        // R14.2 N3: fail-closed — never treat unreadable existing as empty
+        // (would flush ******** and wipe real keys).
+        let existing = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
+        merge_config_secrets_from_existing(&existing, &request.content)?
+    } else if id == "config" {
+        // Brand-new config file: refuse pure-redacted placeholders with no disk prior.
+        for line in request.content.lines() {
+            if let Some(val) = parse_toml_api_key_value(line.trim()) {
+                if is_redacted_config_secret(val) {
+                    return Err(
+                        "新配置不能只含脱敏占位符：请填写真实 API Key，或先激活供应商档案。"
+                            .into(),
+                    );
+                }
+            }
+        }
+        request.content.clone()
     } else {
         request.content.clone()
     };
@@ -8119,10 +8176,47 @@ base_url = "https://api.example.com"
 api_key = "********"
 base_url = "https://api.example.com/v2"
 "#;
-        let merged = merge_config_secrets_from_existing(existing, incoming);
+        let merged = merge_config_secrets_from_existing(existing, incoming).expect("merge");
         assert!(merged.contains("sk-real-key-on-disk"));
         assert!(merged.contains("/v2"));
         assert!(!merged.contains(CONFIG_SECRET_REDACTED));
+    }
+
+    #[test]
+    fn merge_config_secrets_is_table_keyed_not_positional() {
+        let existing = r#"
+[model.local]
+api_key = "local-key"
+base_url = "http://127.0.0.1:8000/v1"
+
+[model."grok-4.5"]
+api_key = "sk-prod-real"
+base_url = "https://api.example.com/v1"
+"#;
+        // Operator deleted [model.local] — remaining redacted key must NOT
+        // pick up local-key by position.
+        let incoming = r#"
+[model."grok-4.5"]
+api_key = "********"
+base_url = "https://api.example.com/v1"
+"#;
+        let merged = merge_config_secrets_from_existing(existing, incoming).expect("merge");
+        assert!(merged.contains("sk-prod-real"));
+        assert!(!merged.contains("local-key"));
+    }
+
+    #[test]
+    fn merge_config_secrets_fails_when_table_missing_on_disk() {
+        let existing = r#"
+[model.foo]
+api_key = "sk-foo"
+"#;
+        let incoming = r#"
+[model.bar]
+api_key = "********"
+"#;
+        let err = merge_config_secrets_from_existing(existing, incoming).unwrap_err();
+        assert!(err.contains("model.bar") || err.contains("无法安全恢复"));
     }
 
     #[test]

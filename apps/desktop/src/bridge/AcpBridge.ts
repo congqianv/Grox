@@ -812,8 +812,6 @@ export class AcpBridge implements GrokBridge {
   private restartTail: Promise<void> = Promise.resolve();
   /** True while we intentionally replace the agent (suppress stale exit noise). */
   private suppressExitHandling = false;
-  /** Crash auto-reconnect budget for the current agent life. */
-  private reconnectAttempts = 0;
   private reconnectTimer: number | undefined;
   /** Resolve the in-flight reconnect delay when cancelled (provider switch etc.). */
   private reconnectDelayResolve: (() => void) | null = null;
@@ -1492,8 +1490,11 @@ export class AcpBridge implements GrokBridge {
         this.ready = next;
       }
       await next;
-      this.reconnectAttempts = 0;
-      this.reconnectChildDied = false;
+      // R14.2: never clear childDied on crash spawns — flag is owned by
+      // runCrashReconnect (infinite-loop fix when child flaps after handshake).
+      if (!fromCrash) {
+        this.reconnectChildDied = false;
+      }
     } finally {
       this.suppressExitHandling = false;
     }
@@ -1629,13 +1630,12 @@ export class AcpBridge implements GrokBridge {
    */
   private async runCrashReconnect(lastMessage: string, epoch: number): Promise<void> {
     let lastError = lastMessage;
-    while (this.reconnectAttempts < 2) {
+    // Local budget — independent of restartAgentInner (must not be zeroed mid-loop).
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
       if (this.reconnectEpoch !== epoch) {
         // Intentional restart took over ready — exit quietly.
         return;
       }
-      this.reconnectAttempts += 1;
-      const attempt = this.reconnectAttempts;
       const delayMs = 800 * attempt;
       this.setAuthState({
         ...this.authState,
@@ -1665,10 +1665,20 @@ export class AcpBridge implements GrokBridge {
         } finally {
           this.restartFromCrashReconnect = false;
         }
+        // R14.2: re-check epoch + liveness immediately before publishing ready
+        // (intentional restart / second death can land during await).
         if (this.reconnectEpoch !== epoch) {
           return;
         }
-        // Child exited again before we published success — count as failed attempt.
+        if (this.reconnectChildDied) {
+          lastError = "Agent 在重连后再次退出";
+          this.reconnectChildDied = false;
+          continue;
+        }
+        // Final TOCTOU belt: still the same epoch and no late death flag.
+        if (this.reconnectEpoch !== epoch) {
+          return;
+        }
         if (this.reconnectChildDied) {
           lastError = "Agent 在重连后再次退出";
           this.reconnectChildDied = false;
@@ -1679,7 +1689,10 @@ export class AcpBridge implements GrokBridge {
           error: undefined,
           inProgress: false,
         });
-        // Publish a settled ready marker (outer promise is about to resolve too).
+        // Only claim ready if we still own the reconnect epoch.
+        if (this.reconnectEpoch !== epoch) {
+          return;
+        }
         this.ready = Promise.resolve();
         // Rebind active mission in the background so the next send is cheap.
         const active = this.activeSessionId();
