@@ -9,6 +9,7 @@ import { listen } from "@tauri-apps/api/event";
 import { bridge } from "../bridge";
 import { DEFAULT_PERMISSION_MODE, MODELS, readStoredPermissionMode } from "../bridge/types";
 import { COMPUTER_USE_OPT_IN_REFUSE_MESSAGE } from "../lib/computerUse";
+import { isSafeMarkdownOpenUrl } from "../lib/openUrlSafety";
 import type {
   AgentMode,
   AccountInfo,
@@ -1701,19 +1702,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
     async openAppUpdateDownload() {
       const info = get().appUpdate;
       const url = info?.downloadUrl || info?.releaseUrl || "https://github.com/congqianv/Grox/releases";
-      // R21: dual-gate with Rust open_external (HTTPS + non-metadata only).
+      // R22: reuse shared dual-gate (HTTPS + non-metadata) before open_external.
       try {
         const parsed = new URL(url);
-        if (parsed.protocol !== "https:" || parsed.username || parsed.password) return;
-        const host = parsed.hostname.toLowerCase();
-        if (
-          host === "169.254.169.254"
-          || host.startsWith("169.254.")
-          || host === "metadata.google.internal"
-          || host === "100.100.100.200"
-        ) {
-          return;
-        }
+        if (parsed.protocol !== "https:" || !isSafeMarkdownOpenUrl(parsed)) return;
         await invoke("open_external", { url: parsed.toString() });
       } catch {
         // invalid URL — ignore

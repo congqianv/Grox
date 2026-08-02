@@ -4,7 +4,7 @@ import { useDesktop } from "../../state/store";
 import { MAX_ATTACHMENTS, prepareAttachment, validateAttachmentSet } from "../../lib/attachments";
 import { baseName } from "../../lib/format";
 import { useI18n } from "../../lib/i18n";
-import { isSafeMarkdownOpenUrl } from "../../lib/markdown";
+import { isSafeMarkdownOpenUrl } from "../../lib/openUrlSafety";
 import { Icon } from "../fx/Icon";
 
 interface GitSummary {

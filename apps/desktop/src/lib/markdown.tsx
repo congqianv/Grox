@@ -12,41 +12,12 @@ import { invoke } from "@tauri-apps/api/core";
 import type { MouseEvent } from "react";
 import { memo, useEffect, useId, useMemo, useRef } from "react";
 import "katex/dist/katex.min.css";
+import { isSafeMarkdownOpenUrl } from "./openUrlSafety";
+
+export { isSafeMarkdownOpenUrl } from "./openUrlSafety";
 
 const ESCAPES: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
 const escapeHtml = (text: string) => text.replace(/[&<>"]/g, (char) => ESCAPES[char]);
-
-/** Dual-gate with Rust `open_external` / SSRF policy (R13–R19). Exported for tests. */
-export function isSafeMarkdownOpenUrl(url: URL): boolean {
-  if (url.username || url.password) return false;
-  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (!host) return false;
-  // Cloud metadata / link-local (Rust is_blocked_ssrf_host).
-  if (
-    host === "metadata"
-    || host === "metadata.google.internal"
-    || host.endsWith(".metadata.google.internal")
-    || host === "instance-data"
-    || host === "instance-data.ec2.internal"
-    || host === "metadata.azure.com"
-    || host === "169.254.169.254"
-    || host === "100.100.100.200"
-    || host.startsWith("169.254.")
-    || host === "::ffff:169.254.169.254"
-    || host.startsWith("::ffff:169.254.")
-  ) {
-    return false;
-  }
-  const loopback =
-    host === "localhost"
-    || host === "127.0.0.1"
-    || host === "::1"
-    || host === "0:0:0:0:0:0:0:1"
-    || host === "::ffff:127.0.0.1";
-  if (url.protocol === "https:") return true;
-  if (url.protocol === "http:" && loopback) return true;
-  return false;
-}
 
 function renderKatex(tex: string, displayMode: boolean): string {
   try {

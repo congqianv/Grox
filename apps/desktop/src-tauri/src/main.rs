@@ -1432,11 +1432,16 @@ fn is_blocked_ssrf_v4(v4: std::net::Ipv4Addr) -> bool {
 /// Cloud metadata / link-local targets — never call as provider base_url or open.
 /// R16: belt against SSRF to 169.254.169.254 and metadata DNS names.
 /// R17: IPv4-mapped IPv6 (::ffff:169.254.169.254), extra hostnames, Aliyun IMDS.
+/// R22 review-close: strip trailing-dot FQDN so denylist + IpAddr parse cannot be bypassed.
 fn is_blocked_ssrf_host(host: Option<&str>) -> bool {
     let Some(host) = host.map(|h| h.trim().trim_start_matches('[').trim_end_matches(']')) else {
         return true;
     };
-    let host = host.to_ascii_lowercase();
+    let mut host = host.to_ascii_lowercase();
+    // Trailing dots are valid FQDN syntax but break exact-match denylists and IpAddr::parse.
+    while host.ends_with('.') {
+        host.pop();
+    }
     if host.is_empty() {
         return true;
     }
@@ -1445,7 +1450,7 @@ fn is_blocked_ssrf_host(host: Option<&str>) -> bool {
         || host.ends_with(".metadata.google.internal")
         || host == "instance-data"
         || host == "instance-data.ec2.internal"
-        || host.ends_with(".ec2.internal") && host.contains("instance-data")
+        || (host.ends_with(".ec2.internal") && host.contains("instance-data"))
         || host == "kubernetes.default"
         || host == "kubernetes.default.svc"
         || host.ends_with(".kubernetes.default.svc")
@@ -1673,9 +1678,37 @@ fn should_drop_silent_history_line(state: &AcpState, line: &str) -> bool {
     false
 }
 
+/// Normalize Windows `*.exe` suffixes so denylist tokens match `node.exe -e`.
+fn normalize_preview_script_for_scan(script: &str) -> String {
+    let mut s = script.trim().to_ascii_lowercase();
+    for (from, to) in [
+        ("nodejs.exe", "node"),
+        ("node.exe", "node"),
+        ("python3.exe", "python3"),
+        ("python.exe", "python"),
+        ("py.exe", "python"),
+        ("bun.exe", "bun"),
+        ("deno.exe", "deno"),
+        ("mshta.exe", "mshta"),
+        ("wscript.exe", "wscript"),
+        ("cscript.exe", "cscript"),
+        ("powershell.exe", "powershell"),
+        ("pwsh.exe", "powershell"),
+        ("cmd.exe", "cmd"),
+        ("curl.exe", "curl"),
+        ("wget.exe", "wget"),
+        ("certutil.exe", "certutil"),
+        ("bitsadmin.exe", "bitsadmin"),
+    ] {
+        s = s.replace(from, to);
+    }
+    s
+}
+
 /// Allow only known frontend dev script shapes (no shell chaining).
 fn is_safe_preview_dev_script(script: &str) -> bool {
-    let s = script.trim().to_ascii_lowercase();
+    // R22 review-close: strip `.exe` so `node.exe -e` cannot bypass `node -e`.
+    let s = normalize_preview_script_for_scan(script);
     if s.is_empty() {
         return false;
     }
@@ -1693,7 +1726,6 @@ fn is_safe_preview_dev_script(script: &str) -> bool {
         || s.contains("curl ")
         || s.contains("wget ")
         || s.contains("powershell")
-        || s.contains("cmd.exe")
         || s.contains("cmd ")
         || s.contains("rm ")
         || s.contains("del ")
@@ -3581,6 +3613,7 @@ fn git_push(cwd: String) -> Result<String, String> {
 
 /// Extensions that the OS would execute (or script) if opened as a document.
 /// R19: never hand these to the shell/default handler from the desktop UI.
+/// R22 review-close: .hta and other classic Windows script-host associations.
 fn is_dangerous_open_extension(path: &Path) -> bool {
     let ext = path
         .extension()
@@ -3601,18 +3634,36 @@ fn is_dangerous_open_extension(path: &Path) -> bool {
             | "msc"
             | "js"
             | "jse"
+            | "mjs"
+            | "cjs"
             | "vbs"
             | "vbe"
             | "wsf"
             | "wsh"
+            | "ws"
+            | "wsc"
+            | "hta"
+            | "htc"
             | "lnk"
             | "url"
             | "pif"
             | "reg"
             | "msix"
             | "appx"
+            | "appref-ms"
             | "dll"
             | "sys"
+            | "jar"
+            | "jnlp"
+            | "scf"
+            | "search-ms"
+            | "searchconnector-ms"
+            | "chm"
+            | "inf"
+            | "ins"
+            | "isp"
+            | "job"
+            | "cab"
     )
 }
 
@@ -8443,6 +8494,11 @@ api_key = "local-key"
         assert!(is_blocked_ssrf_host(Some("::ffff:169.254.169.254")));
         assert!(is_blocked_ssrf_host(Some("[::ffff:169.254.169.254]")));
         assert!(is_blocked_ssrf_host(Some("::ffff:100.100.100.200")));
+        // R22: trailing-dot FQDN must not bypass denylist / IpAddr parse.
+        assert!(is_blocked_ssrf_host(Some("169.254.169.254.")));
+        assert!(is_blocked_ssrf_host(Some("metadata.google.internal.")));
+        assert!(is_blocked_ssrf_host(Some("instance-data.ec2.internal.")));
+        assert!(is_blocked_ssrf_host(Some("100.100.100.200.")));
         assert!(!is_blocked_ssrf_host(Some("127.0.0.1")));
         assert!(!is_blocked_ssrf_host(Some("::ffff:127.0.0.1"))); // loopback mapped still not IMDS
         assert!(!is_blocked_ssrf_host(Some("api.openai.com")));
@@ -8459,6 +8515,8 @@ api_key = "local-key"
     #[test]
     fn checked_service_url_rejects_imds() {
         assert!(checked_service_url("https://169.254.169.254/v1", "服务地址").is_err());
+        assert!(checked_service_url("https://169.254.169.254./v1", "服务地址").is_err());
+        assert!(checked_service_url("https://metadata.google.internal./", "服务地址").is_err());
         assert!(checked_service_url("https://api.example.com/v1", "服务地址").is_ok());
         assert!(checked_service_url("http://127.0.0.1:8000/v1", "服务地址").is_ok());
     }
@@ -8576,6 +8634,11 @@ api_key = "local-key"
         assert!(!is_safe_preview_dev_script("vite && mshta evil.hta"));
         assert!(!is_safe_preview_dev_script("node --eval require('fs')"));
         assert!(!is_safe_preview_dev_script("certutil -urlcache"));
+        // R22: Windows exe suffix must not bypass denylist while still matching vite.
+        assert!(!is_safe_preview_dev_script(
+            "node.exe -e \"require('child_process').execSync('calc')\" /* vite */"
+        ));
+        assert!(!is_safe_preview_dev_script("python.exe -c \"print(1)\" vite"));
         assert!(is_safe_preview_dev_script("vite"));
     }
 
@@ -8585,6 +8648,10 @@ api_key = "local-key"
         assert!(is_dangerous_open_extension(Path::new(r"C:\ws\run.ps1")));
         assert!(is_dangerous_open_extension(Path::new(r"C:\ws\a.bat")));
         assert!(is_dangerous_open_extension(Path::new(r"C:\ws\x.lnk")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\payload.hta")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\x.jar")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\x.scf")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\x.mjs")));
         assert!(!is_dangerous_open_extension(Path::new(r"C:\ws\readme.md")));
         assert!(!is_dangerous_open_extension(Path::new(r"C:\ws\photo.png")));
     }

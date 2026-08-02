@@ -149,6 +149,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// R21: parse Content-Length when present (fail closed on garbage / oversize).
+/// R22 review-close: conflicting duplicate Content-Length headers → reject.
 fn parse_content_length(headers: &str) -> Result<Option<usize>, ()> {
     const MAX_BODY: usize = 512 * 1024;
     let mut found = None;
@@ -163,9 +164,27 @@ fn parse_content_length(headers: &str) -> Result<Option<usize>, ()> {
         if n > MAX_BODY {
             return Err(());
         }
+        if let Some(prev) = found {
+            if prev != n {
+                return Err(());
+            }
+        }
         found = Some(n);
     }
     Ok(found)
+}
+
+/// Truncate `s` to at most `n` bytes without panicking on mid-char UTF-8 indices.
+fn safe_str_byte_prefix(s: &str, n: usize) -> &str {
+    let n = n.min(s.len());
+    if s.is_char_boundary(n) {
+        return &s[..n];
+    }
+    let mut i = n;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    &s[..i]
 }
 
 fn handle_http(mut stream: TcpStream, state: Arc<Mutex<ComputerState>>) {
@@ -195,11 +214,14 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<ComputerState>>) {
         Err(()) => false,
     };
     let request_line = headers.lines().next().unwrap_or_default();
-    let post_mcp = request_line.starts_with("POST ")
-        && (request_line.contains(" /mcp ")
-            || request_line.starts_with("POST /mcp ")
-            || request_line.contains(" /mcp?")
-            || request_line == "POST /mcp");
+    // R22: parse origin-form path (accept /mcp and /mcp/).
+    let post_mcp = {
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default();
+        let target = parts.next().unwrap_or_default();
+        let path = target.split('?').next().unwrap_or(target);
+        method.eq_ignore_ascii_case("POST") && (path == "/mcp" || path == "/mcp/")
+    };
     let (status, reason, response) = if !authorized {
         (401, "Unauthorized", Some(json!({"error":"Unauthorized"})))
     } else if !content_length_ok {
@@ -207,8 +229,9 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<ComputerState>>) {
     } else if !post_mcp {
         (405, "Method Not Allowed", Some(json!({"error":"Method Not Allowed"})))
     } else {
+        // R22: never panic-slice mid-UTF-8 (Content-Length is bytes, not chars).
         let body = match parse_content_length(headers).ok().flatten() {
-            Some(n) => &body[..n.min(body.len())],
+            Some(n) => safe_str_byte_prefix(body, n),
             None => body,
         };
         match serde_json::from_str::<Value>(body.trim()) {
@@ -1896,6 +1919,25 @@ mod tests {
         assert_eq!(parse_content_length("POST /mcp HTTP/1.1\r\n"), Ok(None));
         assert!(parse_content_length("Content-Length: not-a-number\r\n").is_err());
         assert!(parse_content_length("Content-Length: 99999999\r\n").is_err());
+        // Conflicting duplicates fail closed.
+        assert!(parse_content_length(
+            "Content-Length: 10\r\nContent-Length: 11\r\n"
+        )
+        .is_err());
+        // Identical duplicates ok.
+        assert_eq!(
+            parse_content_length("Content-Length: 10\r\nContent-Length: 10\r\n"),
+            Ok(Some(10))
+        );
+    }
+
+    #[test]
+    fn safe_str_byte_prefix_never_panics_mid_char() {
+        let s = "éabc"; // first char is 2 bytes
+        assert_eq!(safe_str_byte_prefix(s, 0), "");
+        assert_eq!(safe_str_byte_prefix(s, 1), ""); // mid first char → floor
+        assert_eq!(safe_str_byte_prefix(s, 2), "é");
+        assert_eq!(safe_str_byte_prefix(s, 100), s);
     }
 
     #[test]
