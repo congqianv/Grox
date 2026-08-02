@@ -51,6 +51,7 @@ const kindMeta: Partial<Record<ToolKind, { icon: IconProps["name"]; tone: string
   video_gen: { icon: "play", tone: "text-acc" },
   image_to_video: { icon: "play", tone: "text-acc" },
   reference_to_video: { icon: "play", tone: "text-acc" },
+  computer: { icon: "terminal", tone: "text-gold" },
   think: { icon: "bolt", tone: "text-dim" },
   switch_mode: { icon: "refresh", tone: "text-gold" },
   other: { icon: "bolt", tone: "text-dim" },

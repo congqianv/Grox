@@ -851,6 +851,42 @@ fn apply_grox_provider_environment(command: &mut Command) {
     }
 }
 
+/// Same provider resolution used by `acp_spawn`: full ~/.grok/.env, then the
+/// active provider profile (authoritative), then privacy env. Media generation
+/// must match the agent so Settings profiles work for image/video studio.
+fn apply_cli_provider_environment(command: &mut Command) {
+    if let Ok(home) = grok_home() {
+        for (key, value) in parse_env_file(&home.join(".env")) {
+            command.env(key, value);
+        }
+    }
+    apply_grox_provider_environment(command);
+    if let Ok(profiles) = read_provider_profiles_file() {
+        if let Some(profile) = profiles.active_id.as_deref().and_then(|active_id| {
+            profiles
+                .profiles
+                .iter()
+                .find(|profile| profile.id == active_id)
+        }) {
+            if let Ok(base) = checked_service_url(&profile.base_url, "服务地址") {
+                if let Ok(list_url) = compatible_models_url(&base) {
+                    command
+                        .env("XAI_API_KEY", &profile.api_key)
+                        .env("GROK_MODELS_BASE_URL", &base)
+                        .env("GROK_MODELS_LIST_URL", list_url)
+                        .env(
+                            "GROK_MODELS_API_BACKEND",
+                            profile.api_backend.resolved(&profile.name, &base),
+                        );
+                }
+            }
+        }
+    }
+    for (key, value) in GROX_PRIVACY_ENV {
+        command.env(key, value);
+    }
+}
+
 fn checked_media_prompt(request: &MediaGenerationRequest) -> Result<String, String> {
     let prompt = request.prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 4_000 {
@@ -893,6 +929,9 @@ fn extract_media_artifacts(output: &str, cwd: &Path) -> Result<Vec<MediaArtifact
             }));
         }
     }
+    let workspace = cwd
+        .canonicalize()
+        .unwrap_or_else(|_| cwd.to_path_buf());
     let mut artifacts = Vec::new();
     for candidate in candidates {
         let clean = candidate.trim().trim_matches('"');
@@ -927,18 +966,24 @@ fn extract_media_artifacts(output: &str, cwd: &Path) -> Result<Vec<MediaArtifact
         } else {
             cwd.join(path)
         };
-        if path.is_file() {
-            let display = path_for_webview(&path);
-            if !artifacts
-                .iter()
-                .any(|item| item.path.as_deref() == Some(&display))
-            {
-                artifacts.push(MediaArtifact {
-                    path: Some(display),
-                    url: None,
-                    mime: mime.into(),
-                });
-            }
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        // Never promote arbitrary absolute paths outside the workspace into the
+        // asset-protocol allowlist (CLI stdout can mention unrelated local files).
+        if !canonical.starts_with(&workspace) || !canonical.is_file() {
+            continue;
+        }
+        let display = path_for_webview(&canonical);
+        if !artifacts
+            .iter()
+            .any(|item| item.path.as_deref() == Some(&display))
+        {
+            artifacts.push(MediaArtifact {
+                path: Some(display),
+                url: None,
+                mime: mime.into(),
+            });
         }
     }
     Ok(artifacts)
@@ -3762,6 +3807,8 @@ fn save_media_reference(cwd: String, name: String, data: String) -> Result<Strin
     if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
         return Err("参考图片仅支持 PNG、JPEG 或 WebP".into());
     }
+    // Bound the base64 wire form (~32 MiB ≈ 24 MiB decoded) then enforce the
+    // real decoded size so callers cannot sneak larger binaries past the check.
     if data.len() > 32 * 1024 * 1024 {
         return Err("参考图片不能超过 24 MB".into());
     }
@@ -3772,6 +3819,9 @@ fn save_media_reference(cwd: String, name: String, data: String) -> Result<Strin
     let bytes = BASE64
         .decode(payload)
         .map_err(|error| format!("参考图片编码无效：{error}"))?;
+    if bytes.len() > 24 * 1024 * 1024 {
+        return Err("参考图片不能超过 24 MB".into());
+    }
     let directory = cwd.join(".grox").join("media-input");
     fs::create_dir_all(&directory).map_err(|error| format!("无法创建媒体输入目录：{error}"))?;
     let path = directory.join(format!(
@@ -3809,11 +3859,9 @@ async fn generate_media(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // Keep media generation on the same authentication path as a terminal
-    // invocation. API variables are added only for the provider explicitly
-    // managed by Grox; OAuth gets a clean official CLI environment.
+    // Match acp_spawn auth: managed .env + active provider profile + privacy.
     command.env("GROK_CLIENT_NAME", UPSTREAM_CLI_CLIENT_NAME);
-    apply_grox_provider_environment(&mut command);
+    apply_cli_provider_environment(&mut command);
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -5735,14 +5783,10 @@ async fn acp_spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if let Ok(home) = grok_home() {
-        for (key, value) in parse_env_file(&home.join(".env")) {
-            command.env(key, value);
-        }
-    }
-    // Provider profiles are authoritative at process start. This also migrates
-    // profiles saved by older Grox versions whose managed .env block predates
-    // GROK_MODELS_API_BACKEND, without exposing or rewriting the stored key.
+    apply_cli_provider_environment(&mut command);
+    // Keep config.toml in lockstep with the active profile so a restart after
+    // editing resident models still routes away from stale local [model.*]
+    // base_url overrides without requiring a manual re-activate.
     if let Ok(profiles) = read_provider_profiles_file() {
         if let Some(profile) = profiles.active_id.as_deref().and_then(|active_id| {
             profiles
@@ -5750,26 +5794,8 @@ async fn acp_spawn(
                 .iter()
                 .find(|profile| profile.id == active_id)
         }) {
-            let base = checked_service_url(&profile.base_url, "服务地址")?;
-            command
-                .env("XAI_API_KEY", &profile.api_key)
-                .env("GROK_MODELS_BASE_URL", &base)
-                .env("GROK_MODELS_LIST_URL", compatible_models_url(&base)?)
-                .env(
-                    "GROK_MODELS_API_BACKEND",
-                    profile.api_backend.resolved(&profile.name, &base),
-                );
-            // Keep config.toml in lockstep with the active profile so a restart
-            // after editing resident models still routes away from stale local
-            // [model.*] base_url overrides without requiring a manual re-activate.
             let _ = apply_compatible_provider_to_config(profile);
         }
-    }
-    // This is deliberately applied after the user environment so neither a
-    // stale config nor a server-controlled flag can re-enable background data
-    // collection in the Grox-bundled agent.
-    for (key, value) in GROX_PRIVACY_ENV {
-        command.env(key, value);
     }
 
     #[cfg(windows)]

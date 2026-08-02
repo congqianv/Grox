@@ -4,7 +4,7 @@ use std::{
     io::{self, BufRead, Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     thread,
 };
 
@@ -13,33 +13,89 @@ pub struct HttpEndpoint {
     pub token: String,
 }
 
+/// Process-wide Computer Use MCP HTTP surface. One listener is enough: rotating
+/// the lease/token invalidates prior sessions without leaking accept threads.
+struct SharedHttpServer {
+    url: String,
+    auth: Mutex<HttpAuth>,
+    state: Arc<Mutex<ComputerState>>,
+}
+
+struct HttpAuth {
+    token: String,
+    lease_id: String,
+}
+
+static HTTP_SERVER: OnceLock<SharedHttpServer> = OnceLock::new();
+
+/// Start (or reuse) the localhost MCP HTTP server and bind it to `lease_id`.
+/// Subsequent calls keep the same port and only rotate token + lease state.
 pub fn serve_http(lease_id: String) -> Result<HttpEndpoint, String> {
     let token = uuid_token();
-    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| format!("无法启动 Computer Use MCP：{error}"))?;
+    if let Some(shared) = HTTP_SERVER.get() {
+        rotate_http_auth(shared, &lease_id, &token)?;
+        return Ok(HttpEndpoint {
+            url: shared.url.clone(),
+            token,
+        });
+    }
+
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).map_err(|error| format!("无法启动 Computer Use MCP：{error}"))?;
     let address = listener.local_addr().map_err(|error| error.to_string())?;
+    let url = format!("http://{address}/mcp");
     let state = Arc::new(Mutex::new(ComputerState {
         lease_id: Some(lease_id.clone()),
         ..ComputerState::default()
     }));
-    let expected = token.clone();
-    let session_id = lease_id.clone();
+    let shared = SharedHttpServer {
+        url: url.clone(),
+        auth: Mutex::new(HttpAuth {
+            token: token.clone(),
+            lease_id: lease_id.clone(),
+        }),
+        state: Arc::clone(&state),
+    };
+    // Two threads may race the first start; the loser reuses the winner.
+    if HTTP_SERVER.set(shared).is_err() {
+        return serve_http(lease_id);
+    }
+    let accept_state = Arc::clone(
+        &HTTP_SERVER
+            .get()
+            .ok_or_else(|| "Computer Use MCP 启动失败".to_string())?
+            .state,
+    );
     thread::Builder::new()
         .name("grox-computer-mcp-http".into())
         .spawn(move || {
             for stream in listener.incoming().flatten() {
-                let state = Arc::clone(&state);
-                let token = expected.clone();
-                let session_id = session_id.clone();
+                let state = Arc::clone(&accept_state);
                 let _ = thread::Builder::new()
                     .name("grox-computer-mcp-request".into())
-                    .spawn(move || handle_http(stream, &token, &session_id, state));
+                    .spawn(move || handle_http(stream, state));
             }
         })
         .map_err(|error| format!("无法启动 Computer Use MCP 线程：{error}"))?;
-    Ok(HttpEndpoint {
-        url: format!("http://{address}/mcp"),
-        token,
-    })
+    Ok(HttpEndpoint { url, token })
+}
+
+fn rotate_http_auth(shared: &SharedHttpServer, lease_id: &str, token: &str) -> Result<(), String> {
+    {
+        let mut auth = shared
+            .auth
+            .lock()
+            .map_err(|_| "Computer Use 认证状态锁定失败".to_string())?;
+        auth.token = token.to_string();
+        auth.lease_id = lease_id.to_string();
+    }
+    if let Ok(mut state) = shared.state.lock() {
+        *state = ComputerState {
+            lease_id: Some(lease_id.to_string()),
+            ..ComputerState::default()
+        };
+    }
+    Ok(())
 }
 
 fn uuid_token() -> String {
@@ -48,18 +104,22 @@ fn uuid_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn handle_http(
-    mut stream: TcpStream,
-    token: &str,
-    session_id: &str,
-    state: Arc<Mutex<ComputerState>>,
-) {
+fn current_http_auth() -> Option<(String, String)> {
+    let shared = HTTP_SERVER.get()?;
+    let auth = shared.auth.lock().ok()?;
+    Some((auth.token.clone(), auth.lease_id.clone()))
+}
+
+fn handle_http(mut stream: TcpStream, state: Arc<Mutex<ComputerState>>) {
     let mut buffer = vec![0_u8; 1024 * 1024];
     let Ok(size) = stream.read(&mut buffer) else { return };
     let request = String::from_utf8_lossy(&buffer[..size]);
     let mut parts = request.split("\r\n\r\n");
     let headers = parts.next().unwrap_or_default();
     let body = parts.next().unwrap_or_default();
+    let Some((token, session_id)) = current_http_auth() else {
+        return;
+    };
     let authorized = headers.lines().any(|line| {
         line.to_ascii_lowercase().starts_with("authorization: bearer ")
             && line.trim()["authorization: bearer ".len()..].trim() == token

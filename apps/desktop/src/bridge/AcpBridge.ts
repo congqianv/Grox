@@ -2455,6 +2455,7 @@ export class AcpBridge implements GrokBridge {
     const preferredModel = localStorage.getItem("grok.model")?.trim();
     const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
     let responseValue: unknown;
+    let attachedComputer = computer.mcpServers.length > 0 || computer.pluginDirs.length > 0;
     try {
       responseValue = await this.request(ACP_METHODS.sessionNew, {
         cwd,
@@ -2466,8 +2467,18 @@ export class AcpBridge implements GrokBridge {
         },
       });
     } catch (error) {
-      // Older Grok CLIs reject Computer Use session extensions — fall back.
-      if (computer.mcpServers.length === 0 && computer.pluginDirs.length === 0) throw error;
+      // Older Grok CLIs reject Computer Use session extensions — fall back only
+      // when we actually tried to attach them (not for unrelated failures).
+      if (!attachedComputer) throw error;
+      const message = errorText(error).toLowerCase();
+      const looksLikeExtensionReject =
+        message.includes("mcp") ||
+        message.includes("plugin") ||
+        message.includes("unknown") ||
+        message.includes("invalid") ||
+        message.includes("unsupported");
+      if (!looksLikeExtensionReject) throw error;
+      attachedComputer = false;
       responseValue = await this.request(ACP_METHODS.sessionNew, {
         cwd,
         mcpServers: [],
@@ -2477,7 +2488,7 @@ export class AcpBridge implements GrokBridge {
     const response = record(responseValue);
     const sessionId = string(response?.sessionId);
     if (!sessionId) throw new Error("session/new 未返回 sessionId");
-    this.computerLeases.set(sessionId, computer.leaseId);
+    if (attachedComputer) this.computerLeases.set(sessionId, computer.leaseId);
     this.captureModelState(response);
     const detail = record(record(response?._meta)?.["x.ai/sessionDetail"]);
     const now = Date.now();
@@ -2542,22 +2553,51 @@ export class AcpBridge implements GrokBridge {
 
     try {
       const metaRequest = await this.sessionMeta(meta.cwd);
-      const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+      // Silent/background loads are for offline history + first-send bind only.
+      // Starting Computer Use MCP there leaks localhost listeners on every visit
+      // and adds bind latency that fights the offline-history path.
+      const attachComputer = !silentBind && !background;
+      let computer: ComputerSessionExtensions | null = null;
+      if (attachComputer) {
+        computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+      }
       // Large sessions can take several minutes for the agent to rehydrate.
       let response: unknown;
-      try {
-        response = await this.request(
-          ACP_METHODS.sessionLoad,
-          {
-            sessionId: id,
-            cwd: meta.cwd,
-            mcpServers: computer.mcpServers,
-            _meta: { ...metaRequest, pluginDirs: computer.pluginDirs },
-          },
-          silentBind ? 10 * 60_000 : 2 * 60_000,
-        );
-      } catch (error) {
-        if (computer.mcpServers.length === 0 && computer.pluginDirs.length === 0) throw error;
+      if (computer && (computer.mcpServers.length > 0 || computer.pluginDirs.length > 0)) {
+        try {
+          response = await this.request(
+            ACP_METHODS.sessionLoad,
+            {
+              sessionId: id,
+              cwd: meta.cwd,
+              mcpServers: computer.mcpServers,
+              _meta: { ...metaRequest, pluginDirs: computer.pluginDirs },
+            },
+            2 * 60_000,
+          );
+        } catch (error) {
+          // Older CLIs may reject Computer Use extensions — retry bare load.
+          const message = errorText(error).toLowerCase();
+          const looksLikeExtensionReject =
+            message.includes("mcp") ||
+            message.includes("plugin") ||
+            message.includes("unknown") ||
+            message.includes("invalid") ||
+            message.includes("unsupported");
+          if (!looksLikeExtensionReject) throw error;
+          response = await this.request(
+            ACP_METHODS.sessionLoad,
+            {
+              sessionId: id,
+              cwd: meta.cwd,
+              mcpServers: [],
+              _meta: metaRequest,
+            },
+            2 * 60_000,
+          );
+          computer = null;
+        }
+      } else {
         response = await this.request(
           ACP_METHODS.sessionLoad,
           {
@@ -2569,11 +2609,15 @@ export class AcpBridge implements GrokBridge {
           silentBind ? 10 * 60_000 : 2 * 60_000,
         );
       }
-      const previousLease = this.computerLeases.get(id);
-      if (previousLease && previousLease !== computer.leaseId) {
-        await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(() => {});
+      if (computer) {
+        const previousLease = this.computerLeases.get(id);
+        if (previousLease && previousLease !== computer.leaseId) {
+          await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(
+            () => {},
+          );
+        }
+        this.computerLeases.set(id, computer.leaseId);
       }
-      this.computerLeases.set(id, computer.leaseId);
       this.flushStreamAppends(id);
       this.flushToolPatches(id);
       this.captureModelState(response);

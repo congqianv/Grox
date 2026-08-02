@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { Icon } from "../fx/Icon";
 import { openFileWithConfiguredApplication } from "../../lib/defaultOpen";
@@ -36,6 +36,17 @@ export function MediaStudio({ mode }: { mode: MediaMode }) {
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [reference, setReference] = useState<{ name: string; path: string; preview: string } | null>(null);
   const selected = selectedIndex === null ? undefined : results[selectedIndex];
+
+  // Image ⇄ video reuses this component instance from Home; reset cross-mode state.
+  useEffect(() => {
+    setAspect(mode === "image" ? "1:1" : "16:9");
+    setResults([]);
+    setSelectedIndex(null);
+    setReference(null);
+    setError("");
+    setActionError("");
+    setBusy(false);
+  }, [mode]);
 
   const runArtifactAction = async (action: () => Promise<void>) => {
     setActionError("");
