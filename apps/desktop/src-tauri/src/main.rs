@@ -2602,11 +2602,16 @@ fn preview_session_from_disk(
 
 /// Generation token: switching missions abandons the previous offline scan.
 static OFFLINE_HISTORY_GEN: AtomicU64 = AtomicU64::new(0);
+/// Session id currently being scanned (empty = idle). Prevents re-entry restart storms.
+static OFFLINE_HISTORY_ACTIVE_ID: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 /// Bump generation so any in-flight offline history worker exits without emitting.
 #[tauri::command]
 fn cancel_offline_session_history() {
     OFFLINE_HISTORY_GEN.fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
+        guard.clear();
+    }
 }
 
 fn offline_history_meta(dir: &Path) -> (String, String, String, u64, u64) {
@@ -2701,11 +2706,28 @@ fn start_offline_session_history(
     if safe.is_empty() {
         return Err("无效的会话 ID".into());
     }
+    // Same-id re-entry: do NOT bump gen / restart — that was freezing the bar at
+    // ~5% (old worker killed, UI stuck on last tick while a new scan restarts).
+    if let Ok(guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
+        if guard.as_str() == safe {
+            return Ok(());
+        }
+    }
     let gen = OFFLINE_HISTORY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
+        *guard = safe.clone();
+    }
     std::thread::Builder::new()
         .name(format!("offline-hist-{safe}"))
         .spawn(move || {
             let abandoned = || OFFLINE_HISTORY_GEN.load(Ordering::SeqCst) != gen;
+            let clear_active = || {
+                if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
+                    if guard.as_str() == safe {
+                        guard.clear();
+                    }
+                }
+            };
             let emit_progress = |session: Option<serde_json::Value>,
                                  done: bool,
                                  phase: &str,
@@ -2760,6 +2782,7 @@ fn start_offline_session_history(
                         "session": null,
                     }),
                 );
+                clear_active();
                 return;
             };
 
@@ -2788,6 +2811,7 @@ fn start_offline_session_history(
                         }),
                     );
                 }
+                clear_active();
                 return;
             }
 
@@ -2825,6 +2849,7 @@ fn start_offline_session_history(
                     true,
                     "no-updates",
                 );
+                clear_active();
                 return;
             }
 
@@ -2842,6 +2867,7 @@ fn start_offline_session_history(
                             "session": null,
                         }),
                     );
+                    clear_active();
                     return;
                 }
             };
@@ -2859,11 +2885,13 @@ fn start_offline_session_history(
             let mut asst_open: Option<(String, String)> = None;
             let mut block_i = 0usize;
             let mut line_i = 0usize;
-            let mut last_emit_lines = 0usize;
             let mut last_progress_lines = 0usize;
             let mut last_progress_bytes = 0u64;
             let mut last_progress_at = Instant::now();
             let mut bytes_read = 0u64;
+            // NOTE: Do NOT emit full session snapshots mid-scan. Serializing hundreds of
+            // blocks + React re-render freezes the webview for many seconds, so progress
+            // events pile up and the bar looks "stuck" even though the worker advances.
 
             // Immediate 0% so UI can show a bar before the first tick.
             emit_progress(None, false, "scanning", 0, total_bytes, 0, 0);
@@ -2996,11 +3024,26 @@ fn start_offline_session_history(
                         let delta = json_text_content(
                             update.get("content").unwrap_or(&serde_json::Value::Null),
                         );
+                        // Cap offline assistant body — unbounded append freezes pack/emit.
+                        const ASST_CAP: usize = 48 * 1024;
                         if let Some((_, ref mut text)) = asst_open {
-                            text.push_str(&delta);
+                            if text.len() < ASST_CAP {
+                                let room = ASST_CAP - text.len();
+                                if delta.len() <= room {
+                                    text.push_str(&delta);
+                                } else {
+                                    text.push_str(&delta[..room]);
+                                    text.push('…');
+                                }
+                            }
                         } else {
                             block_i += 1;
-                            asst_open = Some((format!("off-asst-{block_i}"), delta));
+                            let clipped = if delta.len() > ASST_CAP {
+                                format!("{}…", &delta[..ASST_CAP])
+                            } else {
+                                delta
+                            };
+                            asst_open = Some((format!("off-asst-{block_i}"), clipped));
                         }
                     }
                     "tool_call" => {
@@ -3169,45 +3212,11 @@ fn start_offline_session_history(
                     _ => {}
                 }
 
-                // Session snapshot every ~8000 kept lines — rare enough not to thrash React.
-                if line_i - last_emit_lines >= 8000 {
-                    last_emit_lines = line_i;
-                    flush_user(&mut blocks, &mut user_open, updated_at);
-                    flush_asst(&mut blocks, &mut asst_open, updated_at);
-                    let view_blocks: Vec<serde_json::Value> = if blocks.len() > 600 {
-                        blocks[blocks.len() - 600..].to_vec()
-                    } else {
-                        blocks.clone()
-                    };
-                    let shown = if total_bytes > 0 {
-                        bytes_read.min(total_bytes)
-                    } else {
-                        bytes_read
-                    };
-                    emit_progress(
-                        Some(pack_offline_session(
-                            &safe,
-                            &title_s,
-                            &cwd_s,
-                            &model_s,
-                            created_at,
-                            updated_at,
-                            &view_blocks,
-                        )),
-                        false,
-                        "scanning",
-                        shown,
-                        total_bytes,
-                        line_i,
-                        blocks.len(),
-                    );
-                    last_progress_lines = line_i;
-                    last_progress_bytes = bytes_read;
-                    last_progress_at = Instant::now();
-                }
+                // Progress-only during scan (no mid-scan session payloads).
             }
 
             if abandoned() {
+                clear_active();
                 return;
             }
             flush_user(&mut blocks, &mut user_open, updated_at);
@@ -3249,6 +3258,7 @@ fn start_offline_session_history(
                 line_i,
                 blocks.len(),
             );
+            clear_active();
         })
         .map_err(|e| format!("无法启动离线历史线程：{e}"))?;
     Ok(())

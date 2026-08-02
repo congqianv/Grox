@@ -43,6 +43,11 @@ import { loadSessionCache, scheduleSaveSessionCache } from "../lib/sessionCache"
 
 /** Missions whose offline disk history scan finished this process lifetime. */
 const offlineHistoryComplete = new Set<string>();
+/** Missions with an in-flight offline scan (avoid re-invoke restart storms). */
+const offlineHistoryScanning = new Set<string>();
+/** Coalesce progress UI updates to one per animation frame. */
+let diskProgressRaf: number | null = null;
+let diskProgressPending: DiskHistoryScanProgress | null = null;
 
 export type HistoryLoadMode = "disk" | "agent" | null;
 
@@ -1145,6 +1150,37 @@ export const useDesktop = create<DesktopState>((set, get) => {
         void listen<DiskHistoryProgress>("disk-history-progress", (event) => {
           const payload = event.payload;
           if (!payload?.id) return;
+
+          // Progress-only updates: coalesce to rAF so the webview never freezes
+          // under a flood of ticks (was the main "bar stuck for 10s" cause when
+          // combined with mid-scan full-session React replacements).
+          if (!payload.done && payload.session == null) {
+            offlineHistoryScanning.add(payload.id);
+            if (
+              get().activeId === payload.id ||
+              get().fullHistoryLoadingId === payload.id
+            ) {
+              diskProgressPending = {
+                id: payload.id,
+                percent: Math.min(100, Math.max(0, Number(payload.percent) || 0)),
+                bytesRead: Number(payload.bytesRead) || 0,
+                totalBytes: Number(payload.totalBytes) || 0,
+                lines: Number(payload.lines) || 0,
+                blocks: Number(payload.blocks) || 0,
+                fromCache: Boolean(payload.fromCache),
+              };
+              if (diskProgressRaf == null) {
+                diskProgressRaf = window.requestAnimationFrame(() => {
+                  diskProgressRaf = null;
+                  const pending = diskProgressPending;
+                  diskProgressPending = null;
+                  if (pending) set({ diskHistoryProgress: pending });
+                });
+              }
+            }
+            return;
+          }
+
           const existing = get().sessions[payload.id];
           // Don't clobber an in-flight live turn with a partial offline paint.
           const liveBusy =
@@ -1153,29 +1189,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
               existing.status === "awaiting_permission" ||
               existing.status === "awaiting_input") &&
             !payload.done;
-
-          // Always surface percent for the active mission's disk scan banner.
-          if (
-            !payload.done &&
-            (get().activeId === payload.id || get().fullHistoryLoadingId === payload.id)
-          ) {
-            set({
-              diskHistoryProgress: {
-                id: payload.id,
-                percent: Math.min(100, Math.max(0, Number(payload.percent) || 0)),
-                bytesRead: Number(payload.bytesRead) || 0,
-                totalBytes: Number(payload.totalBytes) || 0,
-                lines: Number(payload.lines) || 0,
-                blocks: Number(payload.blocks) || 0,
-                fromCache: Boolean(payload.fromCache),
-              },
-            });
-          }
-
           if (liveBusy) {
             return;
           }
 
+          // Apply session only on terminal payloads (complete/cache) — never mid-scan.
           const next = payload.session
             ? normalizeOfflineSession(payload.session, existing)
             : null;
@@ -1184,22 +1202,23 @@ export const useDesktop = create<DesktopState>((set, get) => {
               payload.done ||
               !existing ||
               next.blocks.length >= existing.blocks.length ||
-              // Prefer offline tool-rich transcripts over thin chat_history previews.
-              next.blocks.some((b) => b.type === "tool") &&
-                !existing.blocks.some((b) => b.type === "tool");
+              (next.blocks.some((b) => b.type === "tool") &&
+                !existing.blocks.some((b) => b.type === "tool"));
             if (shouldApply) {
-              set({
-                sessions: { ...get().sessions, [payload.id]: next },
-              });
-              if (payload.done && next.blocks.length > 0) {
-                scheduleSaveSessionCache(next);
-              }
+              // Defer heavy normalize+render off the progress event turn.
+              window.setTimeout(() => {
+                set({
+                  sessions: { ...get().sessions, [payload.id]: next },
+                });
+                if (next.blocks.length > 0) {
+                  scheduleSaveSessionCache(next);
+                }
+              }, 0);
             }
           }
 
           if (payload.done) {
-            // complete / empty / missing / error all stop re-scan loops this process.
-            // error is soft-fail: do not thrash disk on every re-open.
+            offlineHistoryScanning.delete(payload.id);
             if (
               payload.phase === "complete" ||
               payload.phase === "no-updates" ||
@@ -1466,12 +1485,15 @@ export const useDesktop = create<DesktopState>((set, get) => {
       try {
         const current = get();
         if (current.activeId === id && current.sessions[id] && current.view === "session") {
-          // Still upgrade offline history if we never finished for this mission.
+          // Still upgrade offline history if we never finished — but never restart
+          // an in-flight scan (that killed the worker and froze the progress bar).
           if (
             bridge.kind === "acp" &&
             !offlineHistoryComplete.has(id) &&
+            !offlineHistoryScanning.has(id) &&
             current.historyLoadMode !== "disk"
           ) {
+            offlineHistoryScanning.add(id);
             set({ fullHistoryLoadingId: id, historyLoadMode: "disk" });
             void invoke("start_offline_session_history", {
               id,
@@ -1480,10 +1502,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
               model: current.sessions[id]?.model ?? null,
             }).catch((error) => {
               console.warn("start_offline_session_history failed", error);
+              offlineHistoryScanning.delete(id);
               if (get().fullHistoryLoadingId === id && get().historyLoadMode === "disk") {
-                set({ fullHistoryLoadingId: null, historyLoadMode: null });
+                set({ fullHistoryLoadingId: null, historyLoadMode: null, diskHistoryProgress: null });
               }
             });
+          } else if (offlineHistoryScanning.has(id) || current.historyLoadMode === "disk") {
+            set({ fullHistoryLoadingId: id, historyLoadMode: "disk" });
           }
           return;
         }
@@ -1505,6 +1530,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
         const kickOfflineHistory = (session?: Session | null) => {
           if (bridge.kind !== "acp") return;
           if (offlineHistoryComplete.has(id)) return;
+          // Already scanning this id — do not re-invoke (would kill the worker).
+          if (offlineHistoryScanning.has(id)) {
+            set({ fullHistoryLoadingId: id, historyLoadMode: "disk" });
+            return;
+          }
+          offlineHistoryScanning.add(id);
           set({ fullHistoryLoadingId: id, historyLoadMode: "disk" });
           void invoke("start_offline_session_history", {
             id,
@@ -1513,8 +1544,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
             model: session?.model ?? meta?.model ?? null,
           }).catch((error) => {
             console.warn("start_offline_session_history failed", error);
+            offlineHistoryScanning.delete(id);
             if (get().fullHistoryLoadingId === id && get().historyLoadMode === "disk") {
-              set({ fullHistoryLoadingId: null, historyLoadMode: null });
+              set({ fullHistoryLoadingId: null, historyLoadMode: null, diskHistoryProgress: null });
             }
           });
         };
