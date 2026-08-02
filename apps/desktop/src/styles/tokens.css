@@ -205,8 +205,8 @@ html:not([data-theme="light"]) {
   box-shadow: 0 0 0 1px var(--color-line3);
 }
 
-/* Virtuoso owns virtualization for the session timeline — do not also set
-   content-visibility here (double estimate → jump/stick mis-measure). */
+/* Timeline is a plain overflow-y list (R25). Avoid content-visibility on
+   turns — it reintroduces height-estimate jumps similar to virtualization. */
 
 .animate-orbit,
 .animate-orbit-slow,

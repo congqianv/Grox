@@ -1,13 +1,15 @@
 import {
   memo,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type WheelEvent as ReactWheelEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
-import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import type { Session, SessionBlock } from "../../bridge/types";
 import { useDesktop } from "../../state/store";
 import { useI18n } from "../../lib/i18n";
@@ -408,13 +410,8 @@ const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
  * click "show earlier turns" just to read what was already loaded from disk.
  */
 const LIVE_TURN_WINDOW = 40;
-/** How close to the true bottom before Virtuoso reports atBottom (chrome only). */
-const STICK_BOTTOM_PX = 64;
-
-/** Stable Footer type — inline `Footer: () => …` remounts Virtuoso chrome every stream tick. */
-function TimelineVirtuosoFooter() {
-  return <div className="h-8" />;
-}
+/** Distance from bottom (px) that still counts as "stuck" for auto-follow. */
+const STICK_BOTTOM_PX = 80;
 
 export function Timeline({ session }: { session: Session }) {
   const { language } = useI18n();
@@ -425,23 +422,21 @@ export function Timeline({ session }: { session: Session }) {
   const loadingFullHistory = fullHistoryLoadingId === session.id;
   const scanProgress =
     diskHistoryProgress?.id === session.id ? diskHistoryProgress : null;
-  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
   /**
-   * Sticky follow flag. Once the user scrolls *up*, this stays false until they
-   * click "Jump to latest" (or open/switch session). Never auto re-stick from
-   * near-bottom / atBottom / scroll-down — tall CU tables remeasure and would
-   * yank the viewport back (R23 regressor → R24 hard unfollow).
+   * R25: plain overflow list (no Virtuoso). Tall markdown / CU tables destroy
+   * virtual-list height estimates (defaultItemHeight ≪ real), so remeasure
+   * rubber-bands the viewport even with followOutput=false. Native scroll keeps
+   * scrollTop stable when content below grows; we only pin when follow is on.
    */
   const followRef = useRef(true);
   const jumpTimersRef = useRef<number[]>([]);
-  const scrollerElRef = useRef<HTMLElement | null>(null);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
   /** true = show entire transcript (default for restored history). */
   const [showAll, setShowAll] = useState(true);
   const [bindElapsedSec, setBindElapsedSec] = useState(0);
-  /** UI: show "jump to latest" when user has unfollowed a live stream. */
+  /** UI: show "jump to latest" when user has unfollowed. */
   const [showJumpLatest, setShowJumpLatest] = useState(false);
-  // Streaming text length intentionally omitted — Virtuoso followOutput covers growth.
   const hasBlocks = session.blocks.length > 0;
   // Latest turn id — only this row uses live process chrome while the session runs.
   const lastTurnId = turns.at(-1)?.id;
@@ -451,6 +446,19 @@ export function Timeline({ session }: { session: Session }) {
     session.status === "running" ||
     session.status === "awaiting_permission" ||
     session.status === "awaiting_input";
+
+  /** Fingerprint of list growth / stream tokens so follow pin can re-run. */
+  const stickKey = useMemo(() => {
+    const last = session.blocks.at(-1);
+    if (!last) return "0";
+    if (last.type === "assistant" || last.type === "thinking" || last.type === "user") {
+      return `${session.blocks.length}:${last.id}:${last.text.length}`;
+    }
+    if (last.type === "tool") {
+      return `${session.blocks.length}:${last.id}:${last.call.status}:${last.call.output?.length ?? 0}`;
+    }
+    return `${session.blocks.length}:${last.id}:${last.type}`;
+  }, [session.blocks]);
 
   const markers = useMemo<RequestMarker[]>(() => {
     const requests = turns
@@ -466,6 +474,11 @@ export function Timeline({ session }: { session: Session }) {
   }, [language, turns]);
 
   const markUserUnfollow = useCallback(() => {
+    if (!followRef.current) {
+      // Already free — still ensure chrome is visible after first leave-bottom.
+      setShowJumpLatest((v) => (v ? v : true));
+      return;
+    }
     followRef.current = false;
     setShowJumpLatest(true);
   }, []);
@@ -475,7 +488,13 @@ export function Timeline({ session }: { session: Session }) {
     setShowJumpLatest(false);
   }, []);
 
-  const canFollow = useCallback(() => followRef.current, []);
+  const scrollToBottom = useCallback((force = false) => {
+    if (!force && !followRef.current) return false;
+    const el = scrollerRef.current;
+    if (!el) return false;
+    el.scrollTop = el.scrollHeight;
+    return true;
+  }, []);
 
   // Opening / switching: always show full history (scroll sticks to bottom).
   useEffect(() => {
@@ -533,121 +552,39 @@ export function Timeline({ session }: { session: Session }) {
     markUserUnfollow();
     clearJumpTimers();
     const run = () => {
-      // Index against the list Virtuoso currently renders (or full after expand).
-      const list = showAll || turns.length <= LIVE_TURN_WINDOW ? turns : visibleTurns;
-      // After setShowAll, prefer full turns once expanded data commits.
-      const target = turns.findIndex((turn) => turn.id === id);
-      const index = target >= 0 && (showAll || turns.length <= LIVE_TURN_WINDOW)
-        ? target
-        : list.findIndex((turn) => turn.id === id);
-      if (index < 0) return;
-      virtuosoRef.current?.scrollToIndex({
-        index,
-        align: "start",
-        behavior: "auto",
-        offset: -48,
-      });
+      const root = scrollerRef.current;
+      if (!root) return;
+      const node = root.querySelector<HTMLElement>(`[data-turn-id="${CSS.escape(id)}"]`);
+      if (!node) return;
+      // Offset for sticky chrome: leave a little air above the turn.
+      const rootRect = root.getBoundingClientRect();
+      const nodeRect = node.getBoundingClientRect();
+      root.scrollTop += nodeRect.top - rootRect.top - 48;
     };
     run();
     jumpTimersRef.current.push(window.setTimeout(run, 40));
     jumpTimersRef.current.push(window.setTimeout(run, 160));
   };
 
-  const scrollToBottom = (force = false) => {
-    if (!force && !canFollow()) return false;
-    if (visibleTurns.length === 0) return false;
-    virtuosoRef.current?.scrollToIndex({
-      index: "LAST",
-      align: "end",
-      behavior: force ? "auto" : "smooth",
-    });
-    return true;
-  };
+  // Pin to bottom only while follow is on (live stream / session open).
+  useLayoutEffect(() => {
+    if (!hasBlocks) return;
+    if (!followRef.current) return;
+    scrollToBottom(true);
+  }, [session.id, stickKey, visibleTurns.length, hasBlocks, scrollToBottom]);
 
-  type ScrollerEl = HTMLElement & {
-    __groxUnfollowScroll?: () => void;
-    __groxUnfollowKey?: (e: KeyboardEvent) => void;
-    __groxWheel?: (e: WheelEvent) => void;
-  };
-
-  const detachScroller = useCallback((node: ScrollerEl | null) => {
-    if (!node) return;
-    if (node.__groxWheel) {
-      node.removeEventListener("wheel", node.__groxWheel);
-      delete node.__groxWheel;
-    }
-    if (node.__groxUnfollowKey) {
-      node.removeEventListener("keydown", node.__groxUnfollowKey);
-      delete node.__groxUnfollowKey;
-    }
-    if (node.__groxUnfollowScroll) {
-      node.removeEventListener("scroll", node.__groxUnfollowScroll);
-      delete node.__groxUnfollowScroll;
-    }
-  }, []);
-
-  // Attach to Virtuoso scroller.
-  // R24 hard unfollow: only *upward* motion freezes follow. Downward scroll is
-  // free and never re-enables follow — user must click "Jump to latest".
-  // (R23 re-stick on near-bottom / atBottom+downIntent yanks when CU tables grow.)
-  const scrollerRef = useCallback(
-    (el: HTMLElement | Window | null) => {
-      detachScroller(scrollerElRef.current as ScrollerEl | null);
-      const node = el instanceof HTMLElement ? (el as ScrollerEl) : null;
-      scrollerElRef.current = node;
-      if (!node) return;
-      const onWheel = (event: WheelEvent) => {
-        // deltaY < 0 → fingers/trackpad scroll content upward (read history).
-        if (event.deltaY < 0) markUserUnfollow();
-      };
-      node.addEventListener("wheel", onWheel, { passive: true });
-      const onKeyUnfollow = (event: KeyboardEvent) => {
-        // Page/home/arrow-up must not lose place when the stream keeps growing.
-        if (
-          event.key === "PageUp" ||
-          event.key === "Home" ||
-          event.key === "ArrowUp" ||
-          (event.key === " " && event.shiftKey)
-        ) {
-          markUserUnfollow();
-        }
-      };
-      node.addEventListener("keydown", onKeyUnfollow);
-      let lastTop = node.scrollTop;
-      const onScrollerScroll = () => {
-        const top = node.scrollTop;
-        if (top + 2 < lastTop) {
-          // Upward motion freezes follow until Jump to latest.
-          markUserUnfollow();
-        }
-        lastTop = top;
-      };
-      node.__groxUnfollowScroll = onScrollerScroll;
-      node.__groxUnfollowKey = onKeyUnfollow;
-      node.__groxWheel = onWheel;
-      node.addEventListener("scroll", onScrollerScroll, { passive: true });
-    },
-    [detachScroller, markUserUnfollow],
-  );
-
-  useEffect(
-    () => () => detachScroller(scrollerElRef.current as ScrollerEl | null),
-    [detachScroller],
-  );
-
-  // Stick to bottom only on open/switch — never yank on every block_add (user reading up).
+  // Session open: force follow + bottom after late layout (images/fonts).
   useEffect(() => {
     clearJumpTimers();
     if (!hasBlocks) return;
     markFollowLatest();
     scrollToBottom(true);
-    // Delayed remeasure must honor unfollow if the user scrolled/jumped early.
     const t1 = window.setTimeout(() => {
-      if (canFollow()) scrollToBottom(true);
+      if (followRef.current) scrollToBottom(true);
     }, 40);
     const t2 = window.setTimeout(() => {
-      if (canFollow()) scrollToBottom(true);
-    }, 160);
+      if (followRef.current) scrollToBottom(true);
+    }, 200);
     return () => {
       window.clearTimeout(t1);
       window.clearTimeout(t2);
@@ -656,9 +593,38 @@ export function Timeline({ session }: { session: Session }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: session open only
   }, [session.id]);
 
-  // agentBindLabel + virtuosoComponents MUST stay above any early return.
-  // Empty session (new mission) → hasBlocks false → early UI; first prompt adds
-  // blocks and would otherwise call one more useMemo → React #310 hooks mismatch.
+  const onScrollerScroll = useCallback(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (dist > STICK_BOTTOM_PX) {
+      markUserUnfollow();
+    }
+  }, [markUserUnfollow]);
+
+  const onScrollerWheel = useCallback(
+    (event: ReactWheelEvent<HTMLDivElement>) => {
+      // deltaY < 0 → scroll content up (read history) — freeze follow immediately.
+      if (event.deltaY < 0) markUserUnfollow();
+    },
+    [markUserUnfollow],
+  );
+
+  const onScrollerKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (
+        event.key === "PageUp" ||
+        event.key === "Home" ||
+        event.key === "ArrowUp" ||
+        (event.key === " " && event.shiftKey)
+      ) {
+        markUserUnfollow();
+      }
+    },
+    [markUserUnfollow],
+  );
+
+  // agentBindLabel MUST stay above any early return (hooks order).
   const agentBindLabel =
     language === "zh-CN"
       ? bindElapsedSec > 0
@@ -667,92 +633,6 @@ export function Timeline({ session }: { session: Session }) {
       : bindElapsedSec > 0
         ? `First send: binding agent context… ${bindElapsedSec}s elapsed`
         : "First send: silently binding agent context…";
-
-  // Stable component types for Virtuoso chrome — only rebuild when banner inputs change
-  // (not on every streaming block_patch).
-  const virtuosoComponents = useMemo(
-    () => ({
-      Header: function TimelineListHeader() {
-        return (
-          <div className="mx-auto max-w-[860px] px-8 pt-8">
-            {loadingFullHistory && (
-              <div className="mb-4 rounded-md border border-line/80 bg-raise/50 px-3 py-2.5">
-                <div className="flex items-center justify-center gap-2 text-[11.5px] text-mute">
-                  <BlackHole size={14} spin />
-                  <span className="min-w-0 text-center">
-                    {historyLoadMode === "disk"
-                      ? language === "zh-CN"
-                        ? scanProgress
-                          ? `正在从磁盘补全历史… ${scanProgress.percent}%` +
-                            (scanProgress.totalBytes > 0
-                              ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
-                              : "") +
-                            (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} 条` : "")
-                          : "正在从磁盘补全完整历史（工具调用等）… 可切换其他对话"
-                        : scanProgress
-                          ? `Loading history from disk… ${scanProgress.percent}%` +
-                            (scanProgress.totalBytes > 0
-                              ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
-                              : "") +
-                            (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} blocks` : "")
-                          : "Loading full history from disk… switching chats is fine"
-                      : agentBindLabel}
-                  </span>
-                </div>
-                {historyLoadMode === "disk" && scanProgress && (
-                  <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-line/60">
-                    <div
-                      className="h-full rounded-full bg-acc/80 transition-[width] duration-200 ease-out"
-                      style={{ width: `${Math.min(100, Math.max(2, scanProgress.percent))}%` }}
-                    />
-                  </div>
-                )}
-                {historyLoadMode === "agent" && bindElapsedSec >= 3 && (
-                  <p className="mt-1.5 text-center text-[10.5px] text-faint">
-                    {language === "zh-CN"
-                      ? "大会话绑定可能较久 · 界面仍可滚动与切换对话"
-                      : "Large sessions can take a while · UI stays interactive"}
-                  </p>
-                )}
-                {historyLoadMode === "disk" && (
-                  <p className="mt-1.5 text-center text-[10.5px] text-faint">
-                    {language === "zh-CN"
-                      ? "可切换其他对话，不会卡住 · 完成后下次打开会更快"
-                      : "You can switch chats · next open will be faster"}
-                  </p>
-                )}
-              </div>
-            )}
-            {hiddenCount > 0 && (
-              <button
-                type="button"
-                onClick={() => {
-                  markUserUnfollow();
-                  setShowAll(true);
-                }}
-                className="mb-6 flex w-full items-center justify-center gap-2 rounded-md border border-line bg-raise/60 py-2 text-[12px] text-mute transition-colors hover:bg-high hover:text-fg2"
-              >
-                {language === "zh-CN"
-                  ? `显示更早的 ${hiddenCount} 轮对话`
-                  : `Show ${hiddenCount} earlier turns`}
-              </button>
-            )}
-          </div>
-        );
-      },
-      Footer: TimelineVirtuosoFooter,
-    }),
-    [
-      loadingFullHistory,
-      historyLoadMode,
-      scanProgress,
-      agentBindLabel,
-      bindElapsedSec,
-      language,
-      hiddenCount,
-      markUserUnfollow,
-    ],
-  );
 
   if (!hasBlocks) {
     if (loadingFullHistory && historyLoadMode === "disk") {
@@ -797,66 +677,109 @@ export function Timeline({ session }: { session: Session }) {
 
   return (
     <div className="relative flex min-h-0 flex-1">
-      <Virtuoso
+      <div
         key={session.id}
-        ref={virtuosoRef}
-        scrollerRef={scrollerRef}
-        className="h-full min-w-0 flex-1"
-        data={visibleTurns}
-        // Open at the end so restored history does not flash top→bottom.
-        initialTopMostItemIndex={
-          visibleTurns.length > 0
-            ? { index: visibleTurns.length - 1, align: "end" }
-            : 0
-        }
-        // Tall Computer-Use tables remeasure hard; underestimate less to reduce jump.
-        defaultItemHeight={360}
-        increaseViewportBy={{ top: 800, bottom: 1000 }}
-        atBottomThreshold={STICK_BOTTOM_PX}
-        atBottomStateChange={(atBottom) => {
-          // Hard unfollow: never set followRef=true from Virtuoso chrome.
-          // Tall markdown / CU tables remeasure and falsely report atBottom.
-          // Re-stick only via Jump-to-latest button (markFollowLatest).
-          if (!followRef.current) {
-            if (isLive) setShowJumpLatest(true);
-            return;
-          }
-          // While following: only surface jump chrome if we leave the bottom.
-          if (atBottom) setShowJumpLatest(false);
-          else if (isLive) setShowJumpLatest(true);
-        }}
-        followOutput={(isAtBottom) => {
-          // Hard gate: user unfollow freezes pin even if isAtBottom flickers true.
-          if (!canFollow()) return false;
-          if (!isAtBottom) return false;
-          // "auto" follows without stacking smooth animations under token stream.
-          return isLive ? "auto" : false;
-        }}
-        computeItemKey={(_index, turn) => turn.id}
-        components={virtuosoComponents}
-        itemContent={(_index, turn) => {
-          const active = turn.id === lastTurnId;
-          return (
-            <div className="mx-auto max-w-[860px] px-8">
-              <MemoTurnGroup
-                turn={turn}
-                sessionId={session.id}
-                // Historical turns always "idle" for memo — live status only on active.
-                status={active ? session.status : "idle"}
-                active={active}
-              />
+        ref={scrollerRef}
+        className="h-full min-w-0 flex-1 overflow-y-auto overflow-x-hidden outline-none"
+        // CSS scroll anchoring can fight intentional follow pin; we manage pin ourselves.
+        style={{ overflowAnchor: "none" }}
+        tabIndex={0}
+        onScroll={onScrollerScroll}
+        onWheel={onScrollerWheel}
+        onKeyDown={onScrollerKeyDown}
+      >
+        <div className="mx-auto max-w-[860px] px-8 pt-8">
+          {loadingFullHistory && (
+            <div className="mb-4 rounded-md border border-line/80 bg-raise/50 px-3 py-2.5">
+              <div className="flex items-center justify-center gap-2 text-[11.5px] text-mute">
+                <BlackHole size={14} spin />
+                <span className="min-w-0 text-center">
+                  {historyLoadMode === "disk"
+                    ? language === "zh-CN"
+                      ? scanProgress
+                        ? `正在从磁盘补全历史… ${scanProgress.percent}%` +
+                          (scanProgress.totalBytes > 0
+                            ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
+                            : "") +
+                          (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} 条` : "")
+                        : "正在从磁盘补全完整历史（工具调用等）… 可切换其他对话"
+                      : scanProgress
+                        ? `Loading history from disk… ${scanProgress.percent}%` +
+                          (scanProgress.totalBytes > 0
+                            ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
+                            : "") +
+                          (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} blocks` : "")
+                        : "Loading full history from disk… switching chats is fine"
+                    : agentBindLabel}
+                </span>
+              </div>
+              {historyLoadMode === "disk" && scanProgress && (
+                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-line/60">
+                  <div
+                    className="h-full rounded-full bg-acc/80 transition-[width] duration-200 ease-out"
+                    style={{ width: `${Math.min(100, Math.max(2, scanProgress.percent))}%` }}
+                  />
+                </div>
+              )}
+              {historyLoadMode === "agent" && bindElapsedSec >= 3 && (
+                <p className="mt-1.5 text-center text-[10.5px] text-faint">
+                  {language === "zh-CN"
+                    ? "大会话绑定可能较久 · 界面仍可滚动与切换对话"
+                    : "Large sessions can take a while · UI stays interactive"}
+                </p>
+              )}
+              {historyLoadMode === "disk" && (
+                <p className="mt-1.5 text-center text-[10.5px] text-faint">
+                  {language === "zh-CN"
+                    ? "可切换其他对话，不会卡住 · 完成后下次打开会更快"
+                    : "You can switch chats · next open will be faster"}
+                </p>
+              )}
             </div>
-          );
-        }}
-      />
+          )}
+          {hiddenCount > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                markUserUnfollow();
+                setShowAll(true);
+              }}
+              className="mb-6 flex w-full items-center justify-center gap-2 rounded-md border border-line bg-raise/60 py-2 text-[12px] text-mute transition-colors hover:bg-high hover:text-fg2"
+            >
+              {language === "zh-CN"
+                ? `显示更早的 ${hiddenCount} 轮对话`
+                : `Show ${hiddenCount} earlier turns`}
+            </button>
+          )}
+          {visibleTurns.map((turn) => {
+            const active = turn.id === lastTurnId;
+            return (
+              <div key={turn.id} data-turn-id={turn.id}>
+                <MemoTurnGroup
+                  turn={turn}
+                  sessionId={session.id}
+                  // Historical turns always "idle" for memo — live status only on active.
+                  status={active ? session.status : "idle"}
+                  active={active}
+                />
+              </div>
+            );
+          })}
+          <div className="h-8" aria-hidden="true" />
+        </div>
+      </div>
       <RequestRail markers={markers} language={language} onJump={jumpToTurn} />
-      {showJumpLatest && isLive && (
+      {showJumpLatest && (
         <button
           type="button"
           className="absolute bottom-4 left-1/2 z-30 -translate-x-1/2 rounded-full border border-line2 bg-raise/95 px-3.5 py-1.5 text-[11.5px] text-fg2 shadow-[var(--shadow-float)] backdrop-blur-sm transition-colors hover:bg-high hover:text-fg"
           onClick={() => {
             markFollowLatest();
-            scrollToBottom(true);
+            // Double rAF so layout after follow flip settles before pin.
+            requestAnimationFrame(() => {
+              scrollToBottom(true);
+              requestAnimationFrame(() => scrollToBottom(true));
+            });
           }}
         >
           {language === "zh-CN" ? "↓ 回到最新" : "↓ Jump to latest"}
