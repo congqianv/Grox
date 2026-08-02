@@ -1252,6 +1252,11 @@ export class AcpBridge implements GrokBridge {
     if (shouldDropSilentInbound(line, this.silentReplaying)) {
       return;
     }
+    // Bound memory if a non-silent flood arrives (broken filter / huge replay).
+    const MAX_INBOUND_LINES = 20_000;
+    if (this.inboundQueue.length >= MAX_INBOUND_LINES) {
+      this.inboundQueue.splice(0, Math.floor(MAX_INBOUND_LINES / 4));
+    }
     this.inboundQueue.push(line);
     if (this.inboundDraining) return;
     this.inboundDraining = true;
@@ -2836,29 +2841,32 @@ export class AcpBridge implements GrokBridge {
     const sendNow = queueOptions.sendNow === true;
     const content = promptContent(trimmed, options.attachments ?? []);
 
-    // Must not race silent bind: process-global silent_stream drops all sessionUpdates.
-    // Queue the wire write behind the same channel as load/prompt (R3-strict).
-    void this.runOnChannel(async () => {
-      await this.requestRaw(
-        ACP_METHODS.sessionPrompt,
-        {
-          sessionId,
-          prompt: content,
-          _meta: {
-            promptId,
-            sendNow,
-            clientIdentifier: "grox-desktop",
+    // Must not race silent bind: serialize behind the same channel as load/prompt.
+    // Await the wire write so callers keep `source: local` on failure (R7).
+    try {
+      await this.runOnChannel(async () => {
+        await this.requestRaw(
+          ACP_METHODS.sessionPrompt,
+          {
+            sessionId,
+            prompt: content,
+            _meta: {
+              promptId,
+              sendNow,
+              clientIdentifier: "grox-desktop",
+            },
           },
-        },
-        1_800_000,
-      );
-    }).catch((error) => {
+          1_800_000,
+        );
+      });
+    } catch (error) {
       this.emit({
         type: "error",
         sessionId,
         message: `队列消息失败：${errorText(error)}`,
       });
-    });
+      throw error instanceof Error ? error : new Error(errorText(error));
+    }
 
     return {
       operationId: uid(),

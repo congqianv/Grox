@@ -41,6 +41,7 @@ import type {
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
 import { mergeOfflineWithLive } from "../lib/offlineMerge";
+import { mergeCliQueueWithLocal, nextLocalDrainIndex } from "../lib/promptQueue";
 import {
   cancelSaveSessionCache,
   loadSessionCache,
@@ -1207,9 +1208,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         }, 0);
         break;
       case "prompt_queue": {
-        // CLI is authoritative: merge text/state/version, keep local attachment payloads by id.
+        // CLI is authoritative for known ids, but must not wipe local-only rows
+        // that have not been acknowledged yet (enqueue race with queue/changed).
         const previous = get().promptQueues[e.sessionId] ?? [];
-        const nextQueue: QueuedPrompt[] = e.entries.map((entry) => {
+        const fromCli: QueuedPrompt[] = e.entries.map((entry) => {
           const prior = previous.find((item) => item.id === entry.id);
           return {
             id: entry.id,
@@ -1221,6 +1223,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             source: "cli" as const,
           };
         });
+        const nextQueue = mergeCliQueueWithLocal(fromCli, previous);
         set({
           promptQueues: {
             ...get().promptQueues,
@@ -1238,12 +1241,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
     const state = get();
     const session = state.sessions[sessionId];
     const queue = state.promptQueues[sessionId] ?? [];
-    if (!session || session.status !== "idle" || queue.length === 0) return;
+    // Idle + not mid first-send bind (status can still be idle briefly while in-flight).
+    if (
+      !session ||
+      session.status !== "idle" ||
+      queue.length === 0 ||
+      promptInFlightSessions.has(sessionId)
+    ) {
+      return;
+    }
 
-    // Prefer interjected, then first local-owned entry.
-    const localIndex = queue.findIndex(
-      (item) => item.source !== "cli" && item.state !== "sending",
-    );
+    // Prefer interjected, then first local-owned entry (see nextLocalDrainIndex).
+    const localIndex = nextLocalDrainIndex(queue);
     if (localIndex < 0) {
       // Only CLI entries remain — clear sending ones the server already took.
       const remaining = queue.filter((item) => item.state !== "sending");

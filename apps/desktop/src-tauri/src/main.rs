@@ -2439,15 +2439,46 @@ async fn install_app_update(
     }
 }
 
+/// Only GitHub release asset hosts (and our known API/CDN shapes) may be used
+/// for in-app update downloads — blocks arbitrary URL → install chains.
+fn is_allowed_update_download_host(host: Option<&str>) -> bool {
+    let Some(host) = host.map(|h| h.trim().to_ascii_lowercase()) else {
+        return false;
+    };
+    if host.is_empty() || host.contains('@') {
+        return false;
+    }
+    host == "github.com"
+        || host == "api.github.com"
+        || host == "objects.githubusercontent.com"
+        || host == "release-assets.githubusercontent.com"
+        || host.ends_with(".githubusercontent.com")
+        || host.ends_with(".github.com")
+}
+
 async fn install_app_update_inner(
     app: &tauri::AppHandle,
     download_url: String,
     asset_name: Option<String>,
 ) -> Result<AppUpdateInstallResult, String> {
-    let parsed = url::Url::parse(&download_url).map_err(|error| format!("无效下载链接：{error}"))?;
+    let trimmed = download_url.trim();
+    if trimmed.is_empty() || trimmed.len() > 8_192 {
+        return Err("更新下载链接长度无效".into());
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("更新下载链接包含非法控制字符".into());
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|error| format!("无效下载链接：{error}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("只允许从 HTTP(S) 下载更新".into());
     }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("更新下载链接不能包含用户名或密码".into());
+    }
+    if !is_allowed_update_download_host(parsed.host_str()) {
+        return Err("更新下载只允许来自 GitHub Releases 官方域名".into());
+    }
+    let download_url = parsed.as_str().to_string();
 
     #[cfg(not(target_os = "macos"))]
     {
@@ -7146,6 +7177,18 @@ api_key = "local-key"
         assert!(is_denied_cli_env_key("RUSTFLAGS"));
         assert!(!is_denied_cli_env_key("XAI_API_KEY"));
         assert!(!is_denied_cli_env_key("GROK_MODELS_BASE_URL"));
+    }
+
+    #[test]
+    fn update_download_host_allowlist() {
+        assert!(is_allowed_update_download_host(Some("github.com")));
+        assert!(is_allowed_update_download_host(Some("objects.githubusercontent.com")));
+        assert!(is_allowed_update_download_host(Some("release-assets.githubusercontent.com")));
+        assert!(is_allowed_update_download_host(Some("api.github.com")));
+        assert!(!is_allowed_update_download_host(Some("evil.com")));
+        assert!(!is_allowed_update_download_host(Some("github.com.evil.com")));
+        assert!(!is_allowed_update_download_host(Some("")));
+        assert!(!is_allowed_update_download_host(None));
     }
 
     #[test]
