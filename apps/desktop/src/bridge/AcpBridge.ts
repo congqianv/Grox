@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { GrokBridge } from "./GrokBridge";
 import { MODELS } from "./types";
+import { isComputerUseOperatorEnabled } from "../lib/computerUse";
 import type {
   AccountInfo,
   AgentMode,
@@ -1241,14 +1242,10 @@ export class AcpBridge implements GrokBridge {
   private inboundDraining = false;
 
   private enqueueInbound(line: string) {
-    // Belt-and-braces if Rust silent filter is off or a line slipped through.
-    if (this.silentReplaying.size > 0) {
-      if (
-        line.includes("sessionUpdate") ||
-        line.includes("agent_thought_chunk") ||
-        line.includes('"session/update"') ||
-        line.includes("x.ai/session/update")
-      ) {
+    // Belt-and-braces: only drop history floods for sessions currently silent-binding.
+    if (this.silentReplaying.size > 0 && this.isSilentHistoryFloodLine(line)) {
+      const sid = this.sessionIdFromAcpLine(line);
+      if (sid ? this.silentReplaying.has(sid) : this.silentReplaying.size === 1) {
         return;
       }
     }
@@ -1271,11 +1268,40 @@ export class AcpBridge implements GrokBridge {
     window.requestAnimationFrame(pump);
   }
 
-  private async setSilentStream(silent: boolean): Promise<void> {
+  /**
+   * Per-session silent history filter. Pass `sessionId` when enabling/disabling
+   * bind for one mission; omit sessionId with silent=false to clear all.
+   */
+  private async setSilentStream(silent: boolean, sessionId?: string): Promise<void> {
     try {
-      await invoke("acp_set_silent_stream", { silent });
+      await invoke("acp_set_silent_stream", {
+        silent,
+        sessionId: sessionId ?? null,
+      });
     } catch {
       /* older shells without the command — JS drop still applies */
+    }
+  }
+
+  private isSilentHistoryFloodLine(line: string): boolean {
+    return (
+      line.includes("sessionUpdate") ||
+      line.includes("agent_thought_chunk") ||
+      line.includes('"session/update"') ||
+      line.includes("x.ai/session/update")
+    );
+  }
+
+  private sessionIdFromAcpLine(line: string): string | null {
+    try {
+      const value = JSON.parse(line) as {
+        sessionId?: string;
+        params?: { sessionId?: string };
+      };
+      const sid = value.params?.sessionId ?? value.sessionId;
+      return typeof sid === "string" && sid.length > 0 ? sid : null;
+    } catch {
+      return null;
     }
   }
 
@@ -2562,7 +2588,7 @@ export class AcpBridge implements GrokBridge {
     this.replaying.set(id, emptySession(meta));
     if (silentBind) {
       this.silentReplaying.add(id);
-      await this.setSilentStream(true);
+      await this.setSilentStream(true, id);
     } else if (!background) {
       this.progressiveLoad.add(id);
     }
@@ -2575,7 +2601,7 @@ export class AcpBridge implements GrokBridge {
       const attachComputer = !silentBind && !background;
       let computer: ComputerSessionExtensions | null = null;
       if (attachComputer) {
-        computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+        computer = await this.invokeComputerSessionExtensions();
       }
       // Large sessions can take several minutes for the agent to rehydrate.
       let response: unknown;
@@ -2646,7 +2672,7 @@ export class AcpBridge implements GrokBridge {
       this.replaying.delete(id);
       this.silentReplaying.delete(id);
       this.knownSessions.add(id);
-      await this.setSilentStream(this.silentReplaying.size > 0);
+      await this.setSilentStream(false, id);
 
       if (silentBind) {
         // Bound for prompt; do not overwrite offline disk history with empty replay.
@@ -2670,7 +2696,7 @@ export class AcpBridge implements GrokBridge {
       this.clearProgressiveLoad(id);
       this.replaying.delete(id);
       this.silentReplaying.delete(id);
-      await this.setSilentStream(this.silentReplaying.size > 0);
+      await this.setSilentStream(false, id);
       throw error;
     }
   }
@@ -2679,7 +2705,7 @@ export class AcpBridge implements GrokBridge {
     await this.ready;
     // Do not optimistically mark bound — only session/new or successful session/load.
     const trimmed = text.trim();
-    // Computer attach must be channel-serialized (silent stream is process-global).
+    // Computer attach must be channel-serialized (silent filter is session-scoped).
     // The interject RPC itself must NOT wait behind an in-flight session/prompt
     // (that would block mid-turn 插话 until the turn ends — R3 regression).
     if (this.promptRequestsComputer(trimmed) && !this.computerLeases.has(sessionId)) {
@@ -3095,7 +3121,7 @@ export class AcpBridge implements GrokBridge {
     this.replaying.delete(id);
     this.sessionOptions.delete(id);
     this.cliQueues.delete(id);
-    void this.setSilentStream(this.silentReplaying.size > 0);
+    void this.setSilentStream(false, id);
   }
 
   async emergencyStopComputer(sessionId: string): Promise<void> {
@@ -3137,7 +3163,22 @@ export class AcpBridge implements GrokBridge {
     if (this.computerLeases.has(sessionId)) return;
     if (!this.promptRequestsComputer(text)) return;
     if (!this.knownSessions.has(sessionId)) return;
+    if (!isComputerUseOperatorEnabled()) {
+      this.emit({
+        type: "error",
+        sessionId,
+        message:
+          "Computer Use 未启用。请在 设置 → 代理 中打开「允许 Computer Use」后再试。",
+      });
+      return;
+    }
     await this.attachComputerMcp(sessionId);
+  }
+
+  private async invokeComputerSessionExtensions(): Promise<ComputerSessionExtensions> {
+    return invoke<ComputerSessionExtensions>("computer_session_extensions", {
+      operatorEnabled: isComputerUseOperatorEnabled(),
+    });
   }
 
   private async attachComputerMcp(sessionId: string): Promise<void> {
@@ -3145,14 +3186,14 @@ export class AcpBridge implements GrokBridge {
     if (!meta) {
       throw new Error(`找不到会话，无法附加 Computer Use：${sessionId}`);
     }
-    const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+    const computer = await this.invokeComputerSessionExtensions();
     if (computer.mcpServers.length === 0 && computer.pluginDirs.length === 0) {
       // Non-Windows or harness unavailable — leave the turn to run without MCP.
       return;
     }
     const metaRequest = await this.sessionMeta(meta.cwd);
     this.silentReplaying.add(sessionId);
-    await this.setSilentStream(true);
+    await this.setSilentStream(true, sessionId);
     try {
       try {
         await this.request(
@@ -3191,7 +3232,7 @@ export class AcpBridge implements GrokBridge {
       });
     } finally {
       this.silentReplaying.delete(sessionId);
-      await this.setSilentStream(this.silentReplaying.size > 0);
+      await this.setSilentStream(false, sessionId);
     }
   }
 

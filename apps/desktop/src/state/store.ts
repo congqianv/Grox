@@ -2305,10 +2305,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
     async installOfficialRuntime() {
       set({ runtimeBusy: true });
       try {
+        // Opens official install docs in the browser (no remote irm|iex).
+        // Throws with instructions when CLI is not yet on PATH.
         await invoke<GrokRuntimeInfo>("install_official_grok_cli");
-        window.location.reload();
+        await get().refreshRuntime();
+        set({ runtimeBusy: false });
       } catch (error) {
         set({ runtimeBusy: false });
+        // Still re-detect after user may have installed out-of-band.
+        try {
+          await get().refreshRuntime();
+        } catch {
+          /* ignore */
+        }
         throw error;
       }
     },
@@ -2350,9 +2359,30 @@ export const useDesktop = create<DesktopState>((set, get) => {
         return;
       }
       try {
+        // Starting a workspace `dev` script requires explicit confirm (product gate).
+        let confirmStart = false;
+        if (start) {
+          const zh = (localStorage.getItem("grox.language") ?? "").startsWith("zh");
+          const msg = zh
+            ? "将执行当前项目 package.json 中的 dev 脚本（可能运行任意代码）。仅在可信仓库中确认。\n\n继续？"
+            : "This will run the project's package.json “dev” script (arbitrary code). Only confirm for trusted repos.\n\nContinue?";
+          // Prefer in-app prompt when available; fall back to window.confirm.
+          confirmStart = typeof window.confirm === "function" ? window.confirm(msg) : false;
+          if (!confirmStart) {
+            set({
+              projectPreview: {
+                ...get().projectPreview,
+                status: "detected",
+                error: zh ? "已取消启动开发服务器" : "Preview start cancelled",
+              },
+            });
+            return;
+          }
+        }
         const projectPreview = await invoke<ProjectPreview>("start_project_preview", {
           cwd: get().workspace,
           start,
+          confirmStart: start ? confirmStart : false,
         });
         const shouldOpen = start && (projectPreview.status === "starting" || projectPreview.status === "ready");
         set({

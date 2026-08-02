@@ -181,12 +181,51 @@ function General() {
         {appUpdate.body.trim().slice(0, 1200)}
       </div>
     )}
-    <Row label={zh ? "Grok Build 运行时" : "Grok Build runtime"} hint={runtime?.path}><div className="flex items-center gap-2"><span className="chip">{runtimeSource}</span><ActionButton disabled={runtimeBusy} onClick={() => void refreshRuntime()}>{zh ? "重新检测" : "Detect"}</ActionButton>{runtime && runtime.source !== "override" && <ActionButton tone="accent" disabled={runtimeBusy} onClick={() => { setRuntimeError(""); void installOfficialRuntime().catch((cause) => setRuntimeError(cause instanceof Error ? cause.message : String(cause))); }}>{runtimeBusy ? (zh ? "安装中" : "Installing") : runtime.systemPath ? (zh ? "更新官方 CLI" : "Update official CLI") : (zh ? "安装官方 CLI" : "Install official CLI")}</ActionButton>}</div></Row>
+    <Row label={zh ? "Grok Build 运行时" : "Grok Build runtime"} hint={runtime?.path}><div className="flex items-center gap-2"><span className="chip">{runtimeSource}</span><ActionButton disabled={runtimeBusy} onClick={() => void refreshRuntime()}>{zh ? "重新检测" : "Detect"}</ActionButton>{runtime && runtime.source !== "override" && <ActionButton tone="accent" disabled={runtimeBusy} onClick={() => { setRuntimeError(""); void installOfficialRuntime().catch((cause) => setRuntimeError(cause instanceof Error ? cause.message : String(cause))); }}>{runtimeBusy ? (zh ? "打开安装说明" : "Open install docs") : runtime.systemPath ? (zh ? "打开官方安装说明" : "Open official install docs") : (zh ? "打开官方安装说明" : "Open official install docs")}</ActionButton>}</div></Row>
     {runtime && <Row label={zh ? "版本来源" : "Version provenance"} hint={zh ? "Lite 壳使用本机 Grok CLI；此处显示 CLI 版本与桌面壳提交。" : "Lite shell uses the system Grok CLI; shows CLI version and desktop shell commit."}><div className="max-w-[440px] space-y-1 text-right font-mono text-[9px] text-dim"><p className="truncate" title={runtime.version}>{runtime.version ?? (zh ? "无法读取 CLI 版本" : "CLI version unavailable")}</p><p className="truncate" title={runtime.groxCommit}>CLI · {runtime.source}　{zh ? "壳" : "SHELL"} · {runtime.groxCommit}</p></div></Row>}
     {runtimeError && <p className="mb-4 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{runtimeError}</p>}
     <Row label={zh ? "推理强度" : "Reasoning effort"}><div className="flex gap-1">{EFFORTS.map((item) => <button key={item} onClick={() => setEffort(item)} className={`h-7 rounded-[3px] border px-2 font-mono text-[9.5px] ${effort === item ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim"}`}>{item.toUpperCase()}</button>)}</div></Row>
     <Row label={zh ? "权限模式" : "Permission mode"} hint={zh ? "Default 保留审批；Auto 交给 Agent 策略；Bypass 仅用于可信环境。" : "Default keeps approvals; Auto follows the Agent policy; use Bypass only in trusted environments."}><select value={permission} onChange={(event) => setPermission(event.target.value as typeof permission)} className="h-8 rounded-[4px] border border-line2 bg-void px-2 font-mono text-[9.5px] text-fg2"><option value="default">DEFAULT</option><option value="auto">AUTO</option><option value="bypass">BYPASS / YOLO</option></select></Row>
+    <ComputerUseOptIn zh={zh} />
   </div>;
+}
+
+function ComputerUseOptIn({ zh }: { zh: boolean }) {
+  const [enabled, setEnabled] = useState(() => {
+    try {
+      return localStorage.getItem("grox.computerUseEnabled") === "1";
+    } catch {
+      return false;
+    }
+  });
+  return (
+    <Row
+      label={zh ? "允许 Computer Use" : "Allow Computer Use"}
+      hint={
+        zh
+          ? "默认关闭。开启后 Agent 可在明确请求时控制本机窗口（键鼠）。仅在可信环境使用。"
+          : "Off by default. When on, the Agent may control local windows on explicit request. Trusted environments only."
+      }
+    >
+      <label className="flex items-center gap-2 font-mono text-[10px] text-fg2">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(event) => {
+            const next = event.target.checked;
+            setEnabled(next);
+            try {
+              if (next) localStorage.setItem("grox.computerUseEnabled", "1");
+              else localStorage.removeItem("grox.computerUseEnabled");
+            } catch {
+              /* ignore */
+            }
+          }}
+        />
+        {enabled ? (zh ? "已启用" : "Enabled") : zh ? "已关闭" : "Disabled"}
+      </label>
+    </Row>
+  );
 }
 
 function Account() {

