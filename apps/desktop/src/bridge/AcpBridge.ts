@@ -1312,6 +1312,13 @@ export class AcpBridge implements GrokBridge {
     this.backgroundLoadInFlight = null;
     this.backgroundLoadRunning = false;
     this.backgroundLoadFailed.clear();
+    // Cut the exclusive channel so a hung load cannot block the next agent life.
+    this.channelTail = Promise.resolve();
+    // Stale Computer leases cannot drive desktop after the stdio child is gone.
+    this.computerLeases.clear();
+    this.activeComputerSessions.clear();
+    this.activeComputerToolCalls.clear();
+    void invoke("computer_revoke_http_auth").catch(() => {});
     void this.setSilentStream(false);
   }
 
@@ -2687,7 +2694,9 @@ export class AcpBridge implements GrokBridge {
             mcpServers: [],
             _meta: metaRequest,
           },
-          silentBind ? 10 * 60_000 : 2 * 60_000,
+          // Silent first-send bind: 5 min cap (was 10) so hung loads surface sooner;
+          // large transcripts still fit; store restores draft on timeout.
+          silentBind ? 5 * 60_000 : 2 * 60_000,
         );
       }
       // Soft-fail CU (opt-in off) returns non-null computer with empty lists —

@@ -4002,8 +4002,30 @@ fn computer_session_extensions(operator_enabled: Option<bool>) -> Result<Compute
             lease_id,
         });
     }
-    let plugin = ensure_computer_plugin()?;
-    let endpoint = computer_mcp::serve_http(lease_id.clone())?;
+    // Soft-fail harness start: never kill ordinary chat / session/load because
+    // MCP bind or plugin staging failed (port flake, AV lock, missing plugin).
+    let plugin = match ensure_computer_plugin() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("grox: Computer Use Plugin 不可用，本回合不附带 MCP：{error}");
+            return Ok(ComputerSessionExtensions {
+                mcp_servers: Vec::new(),
+                plugin_dirs: Vec::new(),
+                lease_id,
+            });
+        }
+    };
+    let endpoint = match computer_mcp::serve_http(lease_id.clone()) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            eprintln!("grox: Computer Use MCP 启动失败，本回合不附带 MCP：{error}");
+            return Ok(ComputerSessionExtensions {
+                mcp_servers: Vec::new(),
+                plugin_dirs: Vec::new(),
+                lease_id,
+            });
+        }
+    };
     Ok(ComputerSessionExtensions {
         mcp_servers: vec![serde_json::json!({
             "type": "http",

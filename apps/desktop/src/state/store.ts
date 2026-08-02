@@ -40,6 +40,7 @@ import type {
   RewindResult,
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
+import { mergeOfflineWithLive } from "../lib/offlineMerge";
 import {
   cancelSaveSessionCache,
   loadSessionCache,
@@ -1271,28 +1272,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
     });
     get().sendPrompt(next.text, next.attachments, sessionId);
   };
-
-  /** Merge offline history with any live-only blocks still on the session. */
-  function mergeOfflineWithLive(pending: Session, cur: Session | undefined): Session {
-    if (!cur || cur.blocks.length === 0) {
-      return { ...pending, status: "idle" };
-    }
-    // Live longer than offline: keep live (already has the offline prefix + turn).
-    if (cur.blocks.length > pending.blocks.length) {
-      return { ...cur, status: "idle" };
-    }
-    const pendingIds = new Set(pending.blocks.map((b) => b.id));
-    const liveOnly = cur.blocks.filter((b) => !pendingIds.has(b.id));
-    if (liveOnly.length === 0) {
-      return { ...pending, status: "idle" };
-    }
-    return {
-      ...pending,
-      status: "idle",
-      blocks: [...pending.blocks, ...liveOnly],
-      usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
-    };
-  }
 
   /** Apply offline transcript deferred because a turn was in flight. */
   function flushPendingOfflineMerge(sessionId: string): void {
@@ -2908,6 +2887,32 @@ export const useDesktop = create<DesktopState>((set, get) => {
           }
           const clearAgent =
             s.fullHistoryLoadingId === session.id && s.historyLoadMode === "agent";
+          const curSession = get().sessions[session.id];
+          let blocks = curSession?.blocks ?? [];
+          // Pop the optimistic user bubble we painted so retry does not duplicate it.
+          const last = blocks[blocks.length - 1];
+          if (last?.type === "user" && last.text === trimmed) {
+            blocks = blocks.slice(0, -1);
+          }
+          // Restore composer draft — bind/prompt failure must not wipe operator text.
+          const restoredComposers = {
+            ...get().sessionComposers,
+            [session.id]: {
+              ...(get().sessionComposers[session.id] ?? composer),
+              text: trimmed,
+              attachments: [...attachments],
+              model: composer.model,
+              effort: composer.effort,
+              mode: composer.mode,
+              permissionMode: composer.permissionMode,
+            },
+          };
+          persistSessionComposers(restoredComposers);
+          const errText = error instanceof Error ? error.message : String(error);
+          const friendly =
+            /请求超时|session\/load|超时/.test(errText)
+              ? `${errText}（首次绑定大会话可能较久；草稿已恢复，可重试）`
+              : errText;
           set({
             ...(clearAgent
               ? {
@@ -2918,15 +2923,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
               : {}),
             queueNotice: {
               id: uid(),
-              message: error instanceof Error ? error.message : String(error),
+              message: friendly,
               state: "blocked",
               at: Date.now(),
             },
+            sessionComposers: restoredComposers,
             sessions: {
               ...get().sessions,
               [session.id]: {
                 ...get().sessions[session.id],
                 status: "idle",
+                blocks,
               },
             },
           });
