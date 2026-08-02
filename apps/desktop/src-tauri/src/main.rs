@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -2850,7 +2850,10 @@ fn start_offline_session_history(
                 .map(|(size, _)| size)
                 .unwrap_or(0);
             // Blocking worker: use std BufReader (tokio::io::BufReader is async).
-            let reader = StdBufReader::with_capacity(1024 * 256, file);
+            // Cap per-line read so multi-MB thought lines cannot freeze progress for minutes.
+            const MAX_LINE_BYTES: usize = 192 * 1024;
+            let mut reader = StdBufReader::with_capacity(1024 * 256, file);
+            let mut line_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
             let mut blocks: Vec<serde_json::Value> = Vec::new();
             let mut user_open: Option<(String, String)> = None; // id, text
             let mut asst_open: Option<(String, String)> = None;
@@ -2858,9 +2861,11 @@ fn start_offline_session_history(
             let mut line_i = 0usize;
             let mut last_emit_lines = 0usize;
             let mut last_progress_lines = 0usize;
+            let mut last_progress_bytes = 0u64;
+            let mut last_progress_at = Instant::now();
             let mut bytes_read = 0u64;
 
-            // Immediate 0% so UI can show a bar before the first 2k-line tick.
+            // Immediate 0% so UI can show a bar before the first tick.
             emit_progress(None, false, "scanning", 0, total_bytes, 0, 0);
 
             let flush_user = |blocks: &mut Vec<serde_json::Value>,
@@ -2894,38 +2899,70 @@ fn start_offline_session_history(
                 }
             };
 
-            for line in reader.lines() {
+            loop {
                 if abandoned() {
                     return;
                 }
+                line_buf.clear();
+                // Read one logical line, but never buffer more than MAX_LINE_BYTES of body.
+                // Oversized tails (huge thoughts) are drained without holding them in RAM.
+                let (read_n, capped) =
+                    match read_jsonl_line_capped(&mut reader, &mut line_buf, MAX_LINE_BYTES) {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                if read_n == 0 {
+                    break; // EOF
+                }
                 line_i += 1;
-                // Cheap cancel check every ~4k lines without waiting for emit cadence.
+                bytes_read = bytes_read.saturating_add(read_n as u64);
+
+                // Heartbeat: every 256KB OR 200ms OR 400 lines — never stall the bar
+                // while draining multi-MB thought regions.
+                let need_tick = bytes_read.saturating_sub(last_progress_bytes) >= 256 * 1024
+                    || last_progress_at.elapsed() >= Duration::from_millis(200)
+                    || line_i.saturating_sub(last_progress_lines) >= 400;
+                if need_tick {
+                    last_progress_lines = line_i;
+                    last_progress_bytes = bytes_read;
+                    last_progress_at = Instant::now();
+                    let shown = if total_bytes > 0 {
+                        bytes_read.min(total_bytes)
+                    } else {
+                        bytes_read
+                    };
+                    emit_progress(
+                        None,
+                        false,
+                        "scanning",
+                        shown,
+                        total_bytes,
+                        line_i,
+                        blocks.len(),
+                    );
+                }
                 if line_i & 0xFFF == 0 && abandoned() {
                     return;
                 }
-                let Ok(line) = line else { continue };
-                // Approximate stream position (line + newline) for percent UI.
-                bytes_read = bytes_read.saturating_add(line.len() as u64 + 1);
+
+                // Oversized / truncated lines: skip parse (almost always thoughts / blobs).
+                if capped {
+                    continue;
+                }
+
+                let Ok(line) = std::str::from_utf8(&line_buf) else {
+                    continue;
+                };
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
                 }
                 // Fast-path: thoughts dominate huge updates.jsonl files (100MB+).
-                // Skip before full JSON parse — keeps UI free while scanning.
                 if line.contains("\"agent_thought_chunk\"") {
-                    // Still tick progress while skipping heavy thought lines.
-                    if line_i - last_progress_lines >= 2500 {
-                        last_progress_lines = line_i;
-                        emit_progress(
-                            None,
-                            false,
-                            "scanning",
-                            bytes_read.min(total_bytes.max(bytes_read)),
-                            total_bytes,
-                            line_i,
-                            blocks.len(),
-                        );
-                    }
+                    continue;
+                }
+                // Other heavy payloads (inline images, huge tool_update) — skip parse.
+                if line.len() > 96 * 1024 {
                     continue;
                 }
                 let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -3132,20 +3169,7 @@ fn start_offline_session_history(
                     _ => {}
                 }
 
-                // Lightweight percent ticks often; session body less often.
-                if line_i - last_progress_lines >= 2000 {
-                    last_progress_lines = line_i;
-                    emit_progress(
-                        None,
-                        false,
-                        "scanning",
-                        bytes_read.min(total_bytes.max(bytes_read)),
-                        total_bytes,
-                        line_i,
-                        blocks.len(),
-                    );
-                }
-                // Emit session snapshot every ~8000 lines — rare enough not to thrash React.
+                // Session snapshot every ~8000 kept lines — rare enough not to thrash React.
                 if line_i - last_emit_lines >= 8000 {
                     last_emit_lines = line_i;
                     flush_user(&mut blocks, &mut user_open, updated_at);
@@ -3154,6 +3178,11 @@ fn start_offline_session_history(
                         blocks[blocks.len() - 600..].to_vec()
                     } else {
                         blocks.clone()
+                    };
+                    let shown = if total_bytes > 0 {
+                        bytes_read.min(total_bytes)
+                    } else {
+                        bytes_read
                     };
                     emit_progress(
                         Some(pack_offline_session(
@@ -3167,11 +3196,14 @@ fn start_offline_session_history(
                         )),
                         false,
                         "scanning",
-                        bytes_read.min(total_bytes.max(bytes_read)),
+                        shown,
                         total_bytes,
                         line_i,
                         blocks.len(),
                     );
+                    last_progress_lines = line_i;
+                    last_progress_bytes = bytes_read;
+                    last_progress_at = Instant::now();
                 }
             }
 
@@ -3220,6 +3252,71 @@ fn start_offline_session_history(
         })
         .map_err(|e| format!("无法启动离线历史线程：{e}"))?;
     Ok(())
+}
+
+/// Read one JSONL record, capping buffered body size.
+/// Returns `(bytes_consumed_including_skipped_tail, was_capped)`.
+/// `Ok((0, _))` means EOF at start of read.
+fn read_jsonl_line_capped<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_body: usize,
+) -> std::io::Result<(usize, bool)> {
+    buf.clear();
+    let mut consumed = 0usize;
+    let mut capped = false;
+    loop {
+        let data = reader.fill_buf()?;
+        if data.is_empty() {
+            // EOF mid-line or empty file.
+            if consumed == 0 {
+                return Ok((0, false));
+            }
+            if !capped {
+                while buf.last().copied() == Some(b'\n') || buf.last().copied() == Some(b'\r') {
+                    buf.pop();
+                }
+            }
+            return Ok((consumed, capped));
+        }
+        if let Some(pos) = data.iter().position(|&b| b == b'\n') {
+            let take = pos + 1;
+            if !capped {
+                let room = max_body.saturating_sub(buf.len());
+                if take <= room {
+                    buf.extend_from_slice(&data[..take]);
+                } else if room > 0 {
+                    buf.extend_from_slice(&data[..room]);
+                    capped = true;
+                } else {
+                    capped = true;
+                }
+            }
+            reader.consume(take);
+            consumed = consumed.saturating_add(take);
+            if !capped {
+                while buf.last().copied() == Some(b'\n') || buf.last().copied() == Some(b'\r') {
+                    buf.pop();
+                }
+            }
+            return Ok((consumed, capped));
+        }
+        // No newline in this chunk — copy or skip.
+        let chunk_len = data.len();
+        if !capped {
+            let room = max_body.saturating_sub(buf.len());
+            if chunk_len <= room {
+                buf.extend_from_slice(data);
+            } else {
+                if room > 0 {
+                    buf.extend_from_slice(&data[..room]);
+                }
+                capped = true;
+            }
+        }
+        reader.consume(chunk_len);
+        consumed = consumed.saturating_add(chunk_len);
+    }
 }
 
 /// Pull tool_result bodies from chat_history (small) onto offline tool blocks.
