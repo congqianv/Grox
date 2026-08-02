@@ -63,6 +63,8 @@ function startOfflineScanPoll(sessionId: string): void {
   stopOfflineScanPoll();
   let lastBytes = -1;
   let stuckTicks = 0;
+  /** Do not arm the stuck-watchdog until the worker has actually read ≥1 byte. */
+  let scanStarted = false;
   offlineScanPollTimer = window.setInterval(() => {
     void (async () => {
       try {
@@ -89,39 +91,45 @@ function startOfflineScanPoll(sessionId: string): void {
         }
 
         const bytes = Number(p.bytesRead) || 0;
+        const total = Number(p.totalBytes) || 0;
         const done = Boolean(p.done);
         const phase = p.phase || "idle";
 
         if (!done) {
+          if (bytes > 0) scanStarted = true;
           useDesktop.setState({
             diskHistoryProgress: {
               id: sessionId,
               percent: Math.min(99, Math.max(0, Number(p.percent) || 0)),
               bytesRead: bytes,
-              totalBytes: Number(p.totalBytes) || 0,
+              totalBytes: total,
               lines: Number(p.lines) || 0,
               blocks: Number(p.blocks) || 0,
             },
             fullHistoryLoadingId: sessionId,
             historyLoadMode: "disk",
           });
+          // Preparing (find dir / open file / cache check): bytes stay 0 — never
+          // treat that as a dead worker (was firing "扫描中断" in ~2–5s).
+          if (!scanStarted) {
+            stuckTicks = 0;
+            lastBytes = bytes;
+            return;
+          }
           if (bytes === lastBytes) {
             stuckTicks += 1;
-            // ~5s with no byte movement → worker dead; clear sticky flags so user can retry.
-            if (stuckTicks >= 20) {
+            // ~15s with no byte movement after scan actually started.
+            if (stuckTicks >= 60) {
               offlineHistoryScanning.delete(sessionId);
+              // Soft-complete so we keep chat_history UI and do not thrash retries.
+              offlineHistoryComplete.add(sessionId);
               stopOfflineScanPoll();
               void invoke("cancel_offline_session_history").catch(() => {});
               useDesktop.setState({
                 fullHistoryLoadingId: null,
                 historyLoadMode: null,
                 diskHistoryProgress: null,
-                queueNotice: {
-                  id: crypto.randomUUID(),
-                  message: "磁盘历史扫描中断，请重新打开该对话重试",
-                  state: "blocked",
-                  at: Date.now(),
-                },
+                // No blocking toast — Wave 0: preview stays usable.
               });
             }
           } else {
@@ -137,8 +145,16 @@ function startOfflineScanPoll(sessionId: string): void {
         if (phase === "complete" || phase === "no-updates" || phase === "missing") {
           offlineHistoryComplete.add(sessionId);
         }
-        if (phase === "error" || phase === "cancelled" || phase === "missing") {
-          if (useDesktop.getState().fullHistoryLoadingId === sessionId) {
+        // cancelled/error from our soft watchdog or real failure: drop banner only.
+        if (
+          phase === "error" ||
+          phase === "cancelled" ||
+          phase === "missing" ||
+          phase === "complete" ||
+          phase === "no-updates"
+        ) {
+          // complete keeps banner until session event; clear if still loading after a beat.
+          if (phase !== "complete" && useDesktop.getState().fullHistoryLoadingId === sessionId) {
             useDesktop.setState({
               fullHistoryLoadingId: null,
               historyLoadMode: null,

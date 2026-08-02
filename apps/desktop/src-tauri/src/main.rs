@@ -2808,10 +2808,11 @@ fn start_offline_session_history(
     }
     // Mark running immediately so poll never treats a stale "done" as finished.
     SCAN_DONE.store(0, Ordering::Relaxed);
-    SCAN_PHASE_CODE.store(1, Ordering::Relaxed);
+    SCAN_PHASE_CODE.store(1, Ordering::Relaxed); // preparing/scanning
     SCAN_BYTES.store(0, Ordering::Relaxed);
     SCAN_LINES.store(0, Ordering::Relaxed);
     SCAN_BLOCKS.store(0, Ordering::Relaxed);
+    SCAN_TOTAL.store(0, Ordering::Relaxed);
     std::thread::Builder::new()
         .name(format!("offline-hist-{safe}"))
         .spawn(move || {
@@ -2868,6 +2869,12 @@ fn start_offline_session_history(
                 clear_active();
                 return;
             };
+
+            // Publish total size ASAP so the UI can show 0/xxx MB while we prepare.
+            let updates_path_early = dir.join("updates.jsonl");
+            if let Some((sz, _)) = file_size_mtime_ms(&updates_path_early) {
+                SCAN_TOTAL.store(sz, Ordering::Relaxed);
+            }
 
             // Wave 1: durable fingerprint cache — skip multi-hundred-MB rescan.
             if let Some(cached) = read_ui_transcript_if_fresh(&dir, &safe) {
