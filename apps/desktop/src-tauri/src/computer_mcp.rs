@@ -519,6 +519,8 @@ fn call_tool_inner(name: &str, args: &Value, state: &mut ComputerState) -> Resul
             if let Some(lease_id) = state.lease_id.as_deref() {
                 mark_emergency_stop(lease_id)?;
             }
+            // Kill process-wide bearer so leftover localhost clients cannot continue.
+            let _ = revoke_http_auth();
             ok_text("Computer Use 已紧急停止；重新创建或加载会话后才能再次控制")
         }
         "activate_window" => {
@@ -763,8 +765,14 @@ fn deny_focus_stealing_chord(keys: &[&str]) -> Result<(), String> {
     if has("CONTROL") && has("ESC") {
         return Err("出于安全原因，禁止 CTRL+ESC（开始菜单）".into());
     }
-    if has("ALT") && (has("F4") || has("F4")) {
+    if has("ALT") && has("F4") {
         return Err("出于安全原因，禁止 ALT+F4（关闭窗口）".into());
+    }
+    if has("ALT") && has("SPACE") {
+        return Err("出于安全原因，禁止 ALT+SPACE（系统菜单）".into());
+    }
+    if (has("CTRL") || has("CONTROL")) && has("SHIFT") && (has("ESC") || has("ESCAPE")) {
+        return Err("出于安全原因，禁止 CTRL+SHIFT+ESC（任务管理器）".into());
     }
     // CTRL+ALT+DEL cannot be synthesized by SendInput on modern Windows, but
     // reject the combination if ever expressed as three keys.

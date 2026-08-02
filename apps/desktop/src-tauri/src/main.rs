@@ -1001,16 +1001,23 @@ fn extract_media_artifacts(output: &str, cwd: &Path) -> Result<Vec<MediaArtifact
         } else {
             continue;
         };
-        if clean.starts_with("https://")
-            || clean.starts_with("http://localhost")
-            || clean.starts_with("http://127.0.0.1")
-        {
-            artifacts.push(MediaArtifact {
-                path: None,
-                url: Some(clean.to_string()),
-                mime: mime.into(),
-            });
-            continue;
+        // Parse host properly — reject localhost.evil.com prefix tricks.
+        if let Ok(parsed) = url::Url::parse(clean) {
+            let scheme = parsed.scheme();
+            let host = parsed.host_str();
+            let ok = match scheme {
+                "https" => true, // remote CDN artifacts from media tools
+                "http" => is_loopback_host(host),
+                _ => false,
+            };
+            if ok {
+                artifacts.push(MediaArtifact {
+                    path: None,
+                    url: Some(clean.to_string()),
+                    mime: mime.into(),
+                });
+                continue;
+            }
         }
         let path = PathBuf::from(clean);
         let path = if path.is_absolute() {
@@ -4472,13 +4479,16 @@ fn scan_progress_finish_if(gen: u64, phase: &str) {
 }
 
 /// Bump generation so any in-flight offline history worker exits without emitting.
+/// Only marks progress cancelled when no newer start has already taken ownership
+/// (start_offline bumps gen first and resets DONE=0).
 #[tauri::command]
 fn cancel_offline_session_history() {
-    OFFLINE_HISTORY_GEN.fetch_add(1, Ordering::SeqCst);
+    let gen = OFFLINE_HISTORY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
         guard.clear();
     }
-    scan_progress_finish("cancelled");
+    // If start_offline already advanced past this cancel, do not clobber its atomics.
+    scan_progress_finish_if(gen, "cancelled");
 }
 
 /// Frontend polls this every ~250ms — never depends on high-frequency emit.

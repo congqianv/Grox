@@ -1320,7 +1320,18 @@ export class AcpBridge implements GrokBridge {
       }),
       await listen<ExitPayload>("acp-exit", ({ payload }) => this.onExit(payload)),
       await listen("computer-emergency-shortcut", () => {
-        for (const sessionId of this.activeComputerSessions) {
+        // Stop every session that has (or had) a Computer lease — not only
+        // mid-tool-call sessions. Between observe→action activeComputerSessions
+        // is empty while the bearer is still live.
+        const leaseSessions = new Set<string>([
+          ...this.activeComputerSessions,
+          ...this.computerLeases.keys(),
+        ]);
+        if (leaseSessions.size === 0) {
+          void invoke("computer_revoke_http_auth").catch(() => {});
+          return;
+        }
+        for (const sessionId of leaseSessions) {
           void this.emergencyStopComputer(sessionId);
         }
       }),
@@ -3042,10 +3053,14 @@ export class AcpBridge implements GrokBridge {
     const meta = this.catalogue.get(id);
     this.cancel(id);
     const computerLease = this.computerLeases.get(id);
-    // Revoke MCP bearer so leftover localhost clients cannot keep controlling.
-    // Do NOT clear emergency-stop marker alone (that re-armed tools under a live token).
+    // Sticky-stop this lease then revoke process-wide bearer. Fail-closed: still
+    // attempt revoke even if mark fails.
     if (computerLease) {
-      await invoke("computer_revoke_http_auth").catch(() => {});
+      try {
+        await invoke("computer_emergency_stop", { leaseId: computerLease });
+      } catch {
+        await invoke("computer_revoke_http_auth").catch(() => {});
+      }
     }
     await this.request(ACP_METHODS.sessionDelete, {
       sessionId: id,

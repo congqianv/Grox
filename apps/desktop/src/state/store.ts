@@ -159,8 +159,8 @@ function startOfflineScanPoll(sessionId: string): void {
         ) {
           stopOfflineScanPoll();
         }
-        // Require progress id match before permanent complete (stale atomics).
-        const progressOwned = !p.id || p.id === sessionId;
+        // Strict id match only — empty active id after cancel is not "ours".
+        const progressOwned = Boolean(p.id) && p.id === sessionId;
         if (
           progressOwned &&
           (phase === "complete" || phase === "no-updates" || phase === "missing")
@@ -1642,7 +1642,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
             bridge.kind === "acp" &&
             !offlineHistoryComplete.has(id) &&
             !offlineHistoryScanning.has(id) &&
-            current.historyLoadMode !== "disk"
+            current.historyLoadMode !== "disk" &&
+            current.historyLoadMode !== "agent" &&
+            !promptInFlightSessions.has(id)
           ) {
             offlineHistoryScanning.add(id);
             set({ fullHistoryLoadingId: id, historyLoadMode: "disk" });
@@ -1666,10 +1668,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
           return;
         }
 
-        // Switching missions: cancel previous offline worker + free scanning slots.
+        // Switching missions: free previous scanning slot. Do NOT call
+        // cancel_offline here — it races with start_offline and can mark the
+        // new gen cancelled. start_offline already bumps OFFLINE_HISTORY_GEN.
         const prevId = current.activeId;
         if (bridge.kind === "acp" && prevId && prevId !== id) {
-          void invoke("cancel_offline_session_history").catch(() => {});
           offlineHistoryScanning.delete(prevId);
           stopOfflineScanPoll();
         }

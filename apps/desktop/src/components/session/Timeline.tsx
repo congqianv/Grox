@@ -417,10 +417,7 @@ export function Timeline({ session }: { session: Session }) {
   /** true = show entire transcript (default for restored history). */
   const [showAll, setShowAll] = useState(true);
   const [bindElapsedSec, setBindElapsedSec] = useState(0);
-  const lastBlock = session.blocks.at(-1);
-  // Do not include streaming text length — Virtuoso followOutput handles growth
-  // without forcing a signature storm every 32ms token flush.
-  const signature = `${session.id}:${session.blocks.length}:${lastBlock?.id ?? ""}:${session.status}`;
+  // Streaming text length intentionally omitted — Virtuoso followOutput covers growth.
   const hasBlocks = session.blocks.length > 0;
   // Latest turn id — only this row uses live process chrome while the session runs.
   const lastTurnId = turns.at(-1)?.id;
@@ -519,20 +516,19 @@ export function Timeline({ session }: { session: Session }) {
     if (!hasBlocks) return;
     followRef.current = true;
     scrollToBottom(true);
-    const t1 = window.setTimeout(() => scrollToBottom(true), 40);
-    const t2 = window.setTimeout(() => scrollToBottom(true), 160);
+    // Delayed remeasure must honor unfollow if the user scrolled/jumped early.
+    const t1 = window.setTimeout(() => {
+      if (followRef.current) scrollToBottom(true);
+    }, 40);
+    const t2 = window.setTimeout(() => {
+      if (followRef.current) scrollToBottom(true);
+    }, 160);
     return () => {
       window.clearTimeout(t1);
       window.clearTimeout(t2);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: session open only
   }, [session.id]);
-
-  // Soft follow when already at bottom and transcript grows (does not re-arm follow).
-  useEffect(() => {
-    if (!hasBlocks || !followRef.current) return;
-    scrollToBottom(true);
-  }, [signature, showAll, hiddenCount, visibleTurns.length, hasBlocks]);
 
   if (!hasBlocks) {
     if (loadingFullHistory && historyLoadMode === "disk") {
@@ -596,9 +592,10 @@ export function Timeline({ session }: { session: Session }) {
         atBottomStateChange={(atBottom) => {
           followRef.current = atBottom;
         }}
-        followOutput={(atBottom) => {
-          if (followRef.current || atBottom) return isLive ? "smooth" : "auto";
-          return false;
+        followOutput={() => {
+          // Only the follow flag — atBottom alone must not re-stick after RequestRail jump.
+          if (!followRef.current) return false;
+          return isLive ? "smooth" : "auto";
         }}
         computeItemKey={(_index, turn) => turn.id}
         components={{
