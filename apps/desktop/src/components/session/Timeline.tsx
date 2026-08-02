@@ -257,8 +257,12 @@ const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
   return previous.turn.blocks.every((block, index) => block === next.turn.blocks[index]);
 });
 
-/** Cap initial paint for very long restored transcripts; user can load older turns. */
-const INITIAL_TURN_WINDOW = 24;
+/**
+ * Optional window for *live* ultra-long sessions only.
+ * Restored / offline history always shows in full — users should not have to
+ * click "show earlier turns" just to read what was already loaded from disk.
+ */
+const LIVE_TURN_WINDOW = 40;
 const STICK_BOTTOM_PX = 120;
 
 export function Timeline({ session }: { session: Session }) {
@@ -275,7 +279,8 @@ export function Timeline({ session }: { session: Session }) {
   /** Suppress onScroll while we programmatically pin to bottom. */
   const pinningRef = useRef(false);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
-  const [showAll, setShowAll] = useState(false);
+  /** true = show entire transcript (default for restored history). */
+  const [showAll, setShowAll] = useState(true);
   const lastBlock = session.blocks.at(-1);
   // Do not include streaming text length — ResizeObserver handles growth without
   // forcing a signature storm every 32ms token flush.
@@ -283,17 +288,24 @@ export function Timeline({ session }: { session: Session }) {
   const hasBlocks = session.blocks.length > 0;
   // Latest turn id — only this row uses live process chrome while the session runs.
   const lastTurnId = turns.at(-1)?.id;
+  const isLive = session.status === "running";
 
-  // Reset window when switching sessions so we don't keep a previous "show all".
+  // Opening / switching: always show full history (scroll sticks to bottom).
   useEffect(() => {
-    setShowAll(false);
+    setShowAll(true);
     followRef.current = true;
   }, [session.id]);
 
+  // Offline scan / cache upgrade may add many older turns — keep them visible.
+  useEffect(() => {
+    if (!isLive) setShowAll(true);
+  }, [session.blocks.length, isLive]);
+
   const visibleTurns = useMemo(() => {
-    if (showAll || turns.length <= INITIAL_TURN_WINDOW) return turns;
-    return turns.slice(turns.length - INITIAL_TURN_WINDOW);
-  }, [showAll, turns]);
+    // Restored idle sessions: always full. Live stream with huge history: optional window.
+    if (showAll || !isLive || turns.length <= LIVE_TURN_WINDOW) return turns;
+    return turns.slice(turns.length - LIVE_TURN_WINDOW);
+  }, [showAll, turns, isLive]);
   const hiddenCount = turns.length - visibleTurns.length;
 
   const scrollToBottom = (force = false) => {
