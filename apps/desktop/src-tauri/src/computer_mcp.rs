@@ -136,6 +136,18 @@ fn current_http_auth() -> Option<(String, String)> {
     Some((auth.token.clone(), auth.lease_id.clone()))
 }
 
+/// Constant-time equality for bearer tokens (length mismatch still fails closed).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn handle_http(mut stream: TcpStream, state: Arc<Mutex<ComputerState>>) {
     let mut buffer = vec![0_u8; 1024 * 1024];
     let Ok(size) = stream.read(&mut buffer) else { return };
@@ -146,9 +158,15 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<ComputerState>>) {
     let Some((token, session_id)) = current_http_auth() else {
         return;
     };
+    // R17: constant-time bearer compare (localhost MCP still holds desktop control).
     let authorized = headers.lines().any(|line| {
-        line.to_ascii_lowercase().starts_with("authorization: bearer ")
-            && line.trim()["authorization: bearer ".len()..].trim() == token
+        let lower = line.to_ascii_lowercase();
+        const PREFIX: &str = "authorization: bearer ";
+        if !lower.starts_with(PREFIX) {
+            return false;
+        }
+        let presented = line.trim()[PREFIX.len()..].trim();
+        constant_time_eq(presented.as_bytes(), token.as_bytes())
     });
     let (status, reason, response) = if !authorized {
         (401, "Unauthorized", Some(json!({"error":"Unauthorized"})))
@@ -1821,6 +1839,15 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_time_eq_matches_and_rejects() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
+    }
 
     #[test]
     fn action_schemas_are_specific_and_stateful() {

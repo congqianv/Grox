@@ -1240,6 +1240,12 @@ fn extract_media_artifacts(output: &str, cwd: &Path) -> Result<Vec<MediaArtifact
         if let Ok(parsed) = url::Url::parse(clean) {
             let scheme = parsed.scheme();
             let host = parsed.host_str();
+            // R17: never promote IMDS / link-local even if a future allowlist drifts.
+            // Only for http(s) — Windows paths like `C:\…` can parse as scheme `c`
+            // with host None; those must fall through to the workspace path gate.
+            if matches!(scheme, "http" | "https") && is_blocked_ssrf_host(host) {
+                continue;
+            }
             let ok = match scheme {
                 "https" => is_media_https_host_allowed(host),
                 "http" => is_loopback_host(host),
@@ -1373,14 +1379,45 @@ fn checked_workspace_file(workspace: &Path, requested: &str) -> Result<PathBuf, 
 fn is_loopback_host(host: Option<&str>) -> bool {
     let Some(host) = host else { return false };
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Ok(address) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    if address.is_loopback() {
+        return true;
+    }
+    // R17: IPv4-mapped loopback (::ffff:127.0.0.1) is not IpAddr::is_loopback().
+    if let std::net::IpAddr::V6(v6) = address {
+        if let Some(v4) = v6.to_ipv4_mapped() {
+            return v4.is_loopback();
+        }
+    }
+    false
+}
+
+/// Cloud metadata / link-local IPv4 — shared by host parse and IPv4-mapped IPv6.
+/// R17: also Alibaba Cloud IMDS (100.100.100.200).
+fn is_blocked_ssrf_v4(v4: std::net::Ipv4Addr) -> bool {
+    if v4.is_unspecified() || v4.is_broadcast() {
+        return true;
+    }
+    let o = v4.octets();
+    // 169.254.0.0/16 link-local (AWS/GCP/Azure IMDS)
+    if o[0] == 169 && o[1] == 254 {
+        return true;
+    }
+    // Alibaba Cloud metadata service
+    if o == [100, 100, 100, 200] {
+        return true;
+    }
+    false
 }
 
 /// Cloud metadata / link-local targets — never call as provider base_url or open.
 /// R16: belt against SSRF to 169.254.169.254 and metadata DNS names.
+/// R17: IPv4-mapped IPv6 (::ffff:169.254.169.254), extra hostnames, Aliyun IMDS.
 fn is_blocked_ssrf_host(host: Option<&str>) -> bool {
     let Some(host) = host.map(|h| h.trim().trim_start_matches('[').trim_end_matches(']')) else {
         return true;
@@ -1393,36 +1430,48 @@ fn is_blocked_ssrf_host(host: Option<&str>) -> bool {
         || host == "metadata.google.internal"
         || host.ends_with(".metadata.google.internal")
         || host == "instance-data"
+        || host == "instance-data.ec2.internal"
+        || host.ends_with(".ec2.internal") && host.contains("instance-data")
         || host == "kubernetes.default"
         || host == "kubernetes.default.svc"
+        || host.ends_with(".kubernetes.default.svc")
+        || host == "metadata.azure.com"
+        || host.ends_with(".metadata.azure.com")
     {
         return true;
     }
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                if v4.is_unspecified() {
-                    return true;
-                }
-                let o = v4.octets();
-                // 169.254.0.0/16 link-local (AWS/GCP/Azure IMDS)
-                if o[0] == 169 && o[1] == 254 {
-                    return true;
-                }
-            }
-            std::net::IpAddr::V6(v6) => {
-                if v6.is_unspecified() {
-                    return true;
-                }
-                // fe80::/10 link-local
-                let seg0 = v6.segments()[0];
-                if (seg0 & 0xffc0) == 0xfe80 {
-                    return true;
-                }
-            }
-        }
+        return is_blocked_ssrf_ip(ip);
     }
     false
+}
+
+fn is_blocked_ssrf_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_blocked_ssrf_v4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_unspecified() {
+                return true;
+            }
+            // R17: IPv4-mapped / IPv4-compatible embeddings of IMDS ranges.
+            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| {
+                // Deprecated IPv4-compatible ::a.b.c.d (not mapped).
+                if v6.segments()[..6] == [0, 0, 0, 0, 0, 0] {
+                    v6.to_ipv4()
+                } else {
+                    None
+                }
+            }) {
+                return is_blocked_ssrf_v4(v4);
+            }
+            // fe80::/10 link-local
+            let seg0 = v6.segments()[0];
+            if (seg0 & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            false
+        }
+    }
 }
 
 /// Provider model-list redirects: HTTPS (non-metadata) or loopback HTTP only.
@@ -4745,13 +4794,12 @@ fn write_ui_transcript(
         },
         "session": session,
     });
-    let body = envelope
-        .to_string();
-    atomic_write_bytes(
-        &ui_transcript_path(session_dir),
-        &body,
-        UI_TRANSCRIPT_MAX_BYTES,
-    )
+    let body = envelope.to_string();
+    let path = ui_transcript_path(session_dir);
+    atomic_write_bytes(&path, &body, UI_TRANSCRIPT_MAX_BYTES)?;
+    // R17: offline transcripts can hold chat content — match session-cache ACL.
+    let _ = restrict_private_file(&path);
+    Ok(())
 }
 
 /// Return cached offline session JSON if fingerprint still matches updates.jsonl.
@@ -8036,6 +8084,9 @@ api_key = "local-key"
         assert!(!is_loopback_host(Some("127.0.0.1.attacker")));
         assert!(!is_loopback_host(Some("example.com")));
         assert!(!is_loopback_host(None));
+        // R17: IPv4-mapped loopback is still local for preview HTTP.
+        assert!(is_loopback_host(Some("::ffff:127.0.0.1")));
+        assert!(is_loopback_host(Some("[::ffff:127.0.0.1]")));
     }
 
     #[test]
@@ -8223,9 +8274,24 @@ api_key = "local-key"
         assert!(is_blocked_ssrf_host(Some("169.254.169.254")));
         assert!(is_blocked_ssrf_host(Some("metadata.google.internal")));
         assert!(is_blocked_ssrf_host(Some("METADATA.GOOGLE.INTERNAL")));
+        assert!(is_blocked_ssrf_host(Some("instance-data.ec2.internal")));
+        assert!(is_blocked_ssrf_host(Some("100.100.100.200"))); // Aliyun IMDS
+        assert!(is_blocked_ssrf_host(Some("255.255.255.255")));
+        // R17: IPv4-mapped IPv6 IMDS must not bypass the V4-only check.
+        assert!(is_blocked_ssrf_host(Some("::ffff:169.254.169.254")));
+        assert!(is_blocked_ssrf_host(Some("[::ffff:169.254.169.254]")));
+        assert!(is_blocked_ssrf_host(Some("::ffff:100.100.100.200")));
         assert!(!is_blocked_ssrf_host(Some("127.0.0.1")));
+        assert!(!is_blocked_ssrf_host(Some("::ffff:127.0.0.1"))); // loopback mapped still not IMDS
         assert!(!is_blocked_ssrf_host(Some("api.openai.com")));
         assert!(!is_blocked_ssrf_host(Some("10.0.0.5"))); // LAN proxies still allowed
+    }
+
+    #[test]
+    fn parse_browser_url_rejects_ipv4_mapped_imds() {
+        assert!(parse_browser_url("https://[::ffff:169.254.169.254]/latest/meta-data/").is_err());
+        assert!(parse_browser_url("http://[::ffff:169.254.169.254]/").is_err());
+        assert!(checked_service_url("https://[::ffff:169.254.169.254]/v1", "服务地址").is_err());
     }
 
     #[test]
