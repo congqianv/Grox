@@ -3829,14 +3829,19 @@ Use only the grok_desktop_computer MCP tools for an explicit `/computer` or `@Co
     Ok(root)
 }
 
+/// Product gate shared by the tauri command (unit-testable).
+fn computer_use_gate_open(operator_enabled: Option<bool>) -> bool {
+    let env_on = std::env::var("GROX_COMPUTER_USE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    operator_enabled == Some(true) || env_on
+}
+
 #[tauri::command]
 fn computer_session_extensions(operator_enabled: Option<bool>) -> Result<ComputerSessionExtensions, String> {
     // Product gate: Computer Use is opt-in (Settings / explicit flag). Env
     // GROX_COMPUTER_USE=1 also enables for advanced operators.
-    let env_on = std::env::var("GROX_COMPUTER_USE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if operator_enabled != Some(true) && !env_on {
+    if !computer_use_gate_open(operator_enabled) {
         return Err(
             "Computer Use 未启用。请在设置中打开「允许 Computer Use」，或设置环境变量 GROX_COMPUTER_USE=1。"
                 .into(),
@@ -6800,6 +6805,15 @@ api_key = "local-key"
         assert!(should_drop_silent_history_line(&state, flood_a));
         assert!(!should_drop_silent_history_line(&state, flood_b));
         assert!(!should_drop_silent_history_line(&state, rpc_ok));
+    }
+
+    #[test]
+    fn computer_use_gate_defaults_closed() {
+        // Without env/opt-in the gate must refuse (no MCP serve).
+        std::env::remove_var("GROX_COMPUTER_USE");
+        assert!(!computer_use_gate_open(None));
+        assert!(!computer_use_gate_open(Some(false)));
+        assert!(computer_use_gate_open(Some(true)));
     }
 
     #[test]

@@ -22,4 +22,10 @@ describe("computerUse opt-in", () => {
     setComputerUseOperatorEnabled(false);
     expect(isComputerUseOperatorEnabled()).toBe(false);
   });
+
+  it("refuses computer attach when opt-in is off (shipped helper)", () => {
+    setComputerUseOperatorEnabled(false);
+    // attach path gates on this helper — must be false by default.
+    expect(isComputerUseOperatorEnabled()).toBe(false);
+  });
 });

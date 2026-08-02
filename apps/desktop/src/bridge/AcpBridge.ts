@@ -5,6 +5,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { GrokBridge } from "./GrokBridge";
 import { MODELS } from "./types";
 import { isComputerUseOperatorEnabled } from "../lib/computerUse";
+import { shouldDropSilentInbound } from "../lib/silentAcp";
 import type {
   AccountInfo,
   AgentMode,
@@ -1243,11 +1244,8 @@ export class AcpBridge implements GrokBridge {
 
   private enqueueInbound(line: string) {
     // Belt-and-braces: only drop history floods for sessions currently silent-binding.
-    if (this.silentReplaying.size > 0 && this.isSilentHistoryFloodLine(line)) {
-      const sid = this.sessionIdFromAcpLine(line);
-      if (sid ? this.silentReplaying.has(sid) : this.silentReplaying.size === 1) {
-        return;
-      }
+    if (shouldDropSilentInbound(line, this.silentReplaying)) {
+      return;
     }
     this.inboundQueue.push(line);
     if (this.inboundDraining) return;
@@ -1280,28 +1278,6 @@ export class AcpBridge implements GrokBridge {
       });
     } catch {
       /* older shells without the command — JS drop still applies */
-    }
-  }
-
-  private isSilentHistoryFloodLine(line: string): boolean {
-    return (
-      line.includes("sessionUpdate") ||
-      line.includes("agent_thought_chunk") ||
-      line.includes('"session/update"') ||
-      line.includes("x.ai/session/update")
-    );
-  }
-
-  private sessionIdFromAcpLine(line: string): string | null {
-    try {
-      const value = JSON.parse(line) as {
-        sessionId?: string;
-        params?: { sessionId?: string };
-      };
-      const sid = value.params?.sessionId ?? value.sessionId;
-      return typeof sid === "string" && sid.length > 0 ? sid : null;
-    } catch {
-      return null;
     }
   }
 

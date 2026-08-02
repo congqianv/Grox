@@ -207,6 +207,8 @@ function PreviewTab() {
   const setUrl = useDesktop((state) => state.setProjectPreviewUrl);
   const [draft, setDraft] = useState(preview.url ?? "");
   const [frameKey, setFrameKey] = useState(0);
+  /** In-app confirm — window.confirm is unreliable in Tauri WebView. */
+  const [pendingStart, setPendingStart] = useState(false);
   useEffect(() => setDraft(preview.url ?? ""), [preview.url]);
   const zh = language === "zh-CN";
   const navigate = (event: FormEvent) => {
@@ -225,6 +227,28 @@ function PreviewTab() {
     } catch {
       // Keep the current page when the address is incomplete.
     }
+  };
+  const requestStart = () => {
+    setPendingStart(true);
+    // Probe package.json without spawning (confirmStart stays false).
+    void refresh(true);
+  };
+  const acceptStart = () => {
+    setPendingStart(false);
+    void refresh(true, { confirmStart: true });
+  };
+  const cancelStart = () => {
+    setPendingStart(false);
+    void refresh(false).then(() => {
+      // Keep detected/none state; surface cancel if we already had a preview object.
+      useDesktop.setState((s) => ({
+        projectPreview: {
+          ...s.projectPreview,
+          status: s.projectPreview.status === "ready" ? s.projectPreview.status : "detected",
+          error: zh ? "已取消启动开发服务器" : "Preview start cancelled",
+        },
+      }));
+    });
   };
   return (
     <div className="flex h-full min-h-0 flex-col bg-void">
@@ -253,23 +277,52 @@ function PreviewTab() {
           <span className={`h-2 w-2 rounded-full ${preview.status === "starting" ? "animate-pulse-dot bg-acc" : preview.status === "error" ? "bg-red" : "bg-faint"}`} />
           <div>
             <p className="text-[11px] text-fg2">
-              {preview.status === "starting"
-                ? (zh ? "正在启动项目预览…" : "Starting project preview…")
-                : preview.status === "detected"
-                  ? (zh ? "检测到前端项目，确认后再执行开发脚本" : "Frontend detected. Start its development script when ready.")
-                  : preview.status === "error"
-                    ? (zh ? "预览启动失败" : "Preview failed")
-                    : (zh ? "未检测到可预览的前端项目" : "No previewable frontend detected")}
+              {pendingStart
+                ? (zh
+                    ? "将执行 package.json 的 dev 脚本（可能运行任意代码）。仅在可信仓库中确认。"
+                    : "This runs package.json “dev” (arbitrary code). Confirm only for trusted repos.")
+                : preview.status === "starting"
+                  ? (zh ? "正在启动项目预览…" : "Starting project preview…")
+                  : preview.status === "detected"
+                    ? (zh ? "检测到前端项目，确认后再执行开发脚本" : "Frontend detected. Start its development script when ready.")
+                    : preview.status === "error"
+                      ? (zh ? "预览启动失败" : "Preview failed")
+                      : (zh ? "未检测到可预览的前端项目" : "No previewable frontend detected")}
             </p>
             {preview.framework && <p className="mt-1 font-mono text-[9.5px] text-acc">{preview.framework}</p>}
-            {preview.error && <p className="mt-2 max-w-[260px] font-mono text-[9.5px] leading-relaxed text-red">{preview.error}</p>}
+            {preview.error && !pendingStart && (
+              <p className="mt-2 max-w-[260px] font-mono text-[9.5px] leading-relaxed text-red">{preview.error}</p>
+            )}
             {preview.command && <p className="mt-2 max-w-[260px] truncate font-mono text-[9px] text-faint">{preview.command}</p>}
           </div>
-          <button onClick={() => void refresh(true)} className="rounded-[3px] border border-line2 bg-raise px-3 py-1.5 text-[10px] text-fg2 hover:border-line3 hover:text-fg">
-            {preview.command
-              ? (zh ? `执行 ${preview.command}` : `Run ${preview.command}`)
-              : (zh ? "检测并启动" : "Detect & start")}
-          </button>
+          {pendingStart ? (
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={acceptStart}
+                className="rounded-[3px] border border-acc-dim bg-acc-wash px-3 py-1.5 text-[10px] text-acc hover:border-acc"
+              >
+                {zh ? "确认启动" : "Confirm start"}
+              </button>
+              <button
+                type="button"
+                onClick={cancelStart}
+                className="rounded-[3px] border border-line2 bg-raise px-3 py-1.5 text-[10px] text-fg2 hover:border-line3 hover:text-fg"
+              >
+                {zh ? "取消" : "Cancel"}
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={requestStart}
+              className="rounded-[3px] border border-line2 bg-raise px-3 py-1.5 text-[10px] text-fg2 hover:border-line3 hover:text-fg"
+            >
+              {preview.command
+                ? (zh ? `准备 ${preview.command}` : `Prepare ${preview.command}`)
+                : (zh ? "检测并启动" : "Detect & start")}
+            </button>
+          )}
         </div>
       )}
     </div>

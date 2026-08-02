@@ -506,7 +506,11 @@ interface DesktopState {
   setAccountSetupOpen(open: boolean): void;
   refreshWorkspaceFiles(): Promise<void>;
   refreshWorkspaceDiffs(): Promise<void>;
-  refreshProjectPreview(start?: boolean): Promise<void>;
+  /**
+   * Detect or start project preview. `start` alone only probes; starting a
+   * workspace dev script requires `opts.confirmStart === true` after in-app confirm.
+   */
+  refreshProjectPreview(start?: boolean, opts?: { confirmStart?: boolean }): Promise<void>;
   setProjectPreviewUrl(url: string): void;
   openPreview(path: string): Promise<void>;
   closePreview(): void;
@@ -2353,36 +2357,29 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
     },
 
-    async refreshProjectPreview(start = false) {
+    async refreshProjectPreview(start = false, opts?: { confirmStart?: boolean }) {
       if (bridge.kind === "mock") {
         set({ projectPreview: { status: "none" } });
         return;
       }
       try {
-        // Starting a workspace `dev` script requires explicit confirm (product gate).
-        let confirmStart = false;
-        if (start) {
-          const zh = (localStorage.getItem("grox.language") ?? "").startsWith("zh");
-          const msg = zh
-            ? "将执行当前项目 package.json 中的 dev 脚本（可能运行任意代码）。仅在可信仓库中确认。\n\n继续？"
-            : "This will run the project's package.json “dev” script (arbitrary code). Only confirm for trusted repos.\n\nContinue?";
-          // Prefer in-app prompt when available; fall back to window.confirm.
-          confirmStart = typeof window.confirm === "function" ? window.confirm(msg) : false;
-          if (!confirmStart) {
-            set({
-              projectPreview: {
-                ...get().projectPreview,
-                status: "detected",
-                error: zh ? "已取消启动开发服务器" : "Preview start cancelled",
-              },
-            });
-            return;
-          }
+        // Never use window.confirm (unreliable in Tauri WebView). The Inspector
+        // in-app confirm UI must pass confirmStart:true after the operator accepts.
+        const confirmStart = start === true && opts?.confirmStart === true;
+        if (start && !confirmStart) {
+          // Detect-only probe: do not spawn package.json scripts.
+          const projectPreview = await invoke<ProjectPreview>("start_project_preview", {
+            cwd: get().workspace,
+            start: false,
+            confirmStart: false,
+          });
+          set({ projectPreview });
+          return;
         }
         const projectPreview = await invoke<ProjectPreview>("start_project_preview", {
           cwd: get().workspace,
           start,
-          confirmStart: start ? confirmStart : false,
+          confirmStart,
         });
         const shouldOpen = start && (projectPreview.status === "starting" || projectPreview.status === "ready");
         set({
