@@ -2396,6 +2396,18 @@ fn json_text_content(value: &serde_json::Value) -> String {
     }
 }
 
+/// Truncate to `max` bytes on a UTF-8 char boundary (never panic on CJK).
+fn trunc_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 fn extract_user_visible_text(raw: &str) -> String {
     if let Some(start) = raw.find("<user_query>") {
         if let Some(end) = raw.find("</user_query>") {
@@ -2408,11 +2420,7 @@ fn extract_user_visible_text(raw: &str) -> String {
         return String::new();
     }
     if raw.len() > 4000 {
-        let mut end = 4000;
-        while !raw.is_char_boundary(end) {
-            end -= 1;
-        }
-        return format!("{}…", &raw[..end]);
+        return trunc_str(raw, 4000);
     }
     raw.trim().to_string()
 }
@@ -2561,7 +2569,8 @@ fn preview_session_from_disk(
 
     // chat_history is already small (typically <2MB); keep all turns for the
     // instant paint. Offline updates scan upgrades tools/fidelity later.
-    const MAX_BLOCKS: usize = 800;
+    // Prefer completeness over tiny caps — this is the reliable Wave-0 history path.
+    const MAX_BLOCKS: usize = 2000;
     if blocks.len() > MAX_BLOCKS {
         blocks = blocks.split_off(blocks.len() - MAX_BLOCKS);
     }
@@ -2816,6 +2825,9 @@ fn start_offline_session_history(
     std::thread::Builder::new()
         .name(format!("offline-hist-{safe}"))
         .spawn(move || {
+            // Catch panics (e.g. historical UTF-8 slice bugs) so the UI never
+            // sits forever on a frozen progress value with no completion event.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let abandoned = || OFFLINE_HISTORY_GEN.load(Ordering::SeqCst) != gen;
             let clear_active = || {
                 if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
@@ -3019,38 +3031,64 @@ fn start_offline_session_history(
                 }
             };
 
+            let tick = |bytes_read: u64, line_i: usize, block_count: usize,
+                        last_progress_bytes: &mut u64,
+                        last_progress_lines: &mut usize,
+                        last_progress_at: &mut Instant| {
+                *last_progress_lines = line_i;
+                *last_progress_bytes = bytes_read;
+                *last_progress_at = Instant::now();
+                let shown = if total_bytes > 0 {
+                    bytes_read.min(total_bytes)
+                } else {
+                    bytes_read
+                };
+                scan_progress_set(shown, line_i as u64, block_count as u64);
+            };
+
             loop {
                 if abandoned() {
+                    scan_progress_finish("cancelled");
+                    clear_active();
                     return;
                 }
                 line_buf.clear();
                 // Read one logical line, but never buffer more than MAX_LINE_BYTES of body.
                 // Oversized tails (huge thoughts) are drained without holding them in RAM.
-                let (read_n, capped) =
-                    match read_jsonl_line_capped(&mut reader, &mut line_buf, MAX_LINE_BYTES) {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
+                // Progress is updated during drain so a multi-MB line cannot freeze the bar.
+                let (read_n, capped) = match read_jsonl_line_capped_progress(
+                    &mut reader,
+                    &mut line_buf,
+                    MAX_LINE_BYTES,
+                    &mut bytes_read,
+                    total_bytes,
+                    &mut last_progress_bytes,
+                    &mut last_progress_at,
+                    line_i,
+                    blocks.len(),
+                ) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
                 if read_n == 0 {
                     break; // EOF
                 }
                 line_i += 1;
-                bytes_read = bytes_read.saturating_add(read_n as u64);
+                // bytes_read already advanced inside reader for this line.
 
                 // Update atomics often; UI polls them — no emit, no main-thread block.
                 let need_tick = bytes_read.saturating_sub(last_progress_bytes) >= 128 * 1024
                     || last_progress_at.elapsed() >= Duration::from_millis(100)
                     || line_i.saturating_sub(last_progress_lines) >= 200;
                 if need_tick {
-                    last_progress_lines = line_i;
-                    last_progress_bytes = bytes_read;
-                    last_progress_at = Instant::now();
-                    let shown = if total_bytes > 0 {
-                        bytes_read.min(total_bytes)
-                    } else {
-                        bytes_read
-                    };
-                    scan_progress_set(shown, line_i as u64, blocks.len() as u64);
+                    tick(
+                        bytes_read,
+                        line_i,
+                        blocks.len(),
+                        &mut last_progress_bytes,
+                        &mut last_progress_lines,
+                        &mut last_progress_at,
+                    );
                 }
                 if line_i & 0xFFF == 0 && abandoned() {
                     scan_progress_finish("cancelled");
@@ -3117,18 +3155,13 @@ fn start_offline_session_history(
                                 if delta.len() <= room {
                                     text.push_str(&delta);
                                 } else {
-                                    text.push_str(&delta[..room]);
-                                    text.push('…');
+                                    text.push_str(&trunc_str(&delta, room));
                                 }
                             }
                         } else {
                             block_i += 1;
-                            let clipped = if delta.len() > ASST_CAP {
-                                format!("{}…", &delta[..ASST_CAP])
-                            } else {
-                                delta
-                            };
-                            asst_open = Some((format!("off-asst-{block_i}"), clipped));
+                            asst_open =
+                                Some((format!("off-asst-{block_i}"), trunc_str(&delta, ASST_CAP)));
                         }
                     }
                     "tool_call" => {
@@ -3171,11 +3204,7 @@ fn start_offline_session_history(
                                 } else {
                                     v.to_string()
                                 };
-                                if s.len() > 4000 {
-                                    format!("{}…", &s[..4000])
-                                } else {
-                                    s
-                                }
+                                trunc_str(&s, 4000)
                             });
                         let mut call = serde_json::json!({
                             "id": tool_id,
@@ -3340,6 +3369,29 @@ fn start_offline_session_history(
             scan_progress_finish("complete");
             emit_done(Some(packed), "complete");
             clear_active();
+            }));
+            if result.is_err() {
+                // Panic inside worker — unlock UI and allow retry.
+                SCAN_DONE.store(1, Ordering::Relaxed);
+                SCAN_PHASE_CODE.store(phase_code("error"), Ordering::Relaxed);
+                if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
+                    if guard.as_str() == safe {
+                        guard.clear();
+                    }
+                }
+                let _ = app.emit(
+                    "disk-history-progress",
+                    serde_json::json!({
+                        "id": safe,
+                        "gen": gen,
+                        "done": true,
+                        "phase": "error",
+                        "error": "offline history worker panicked",
+                        "session": null,
+                        "percent": 0,
+                    }),
+                );
+            }
         })
         .map_err(|e| {
             scan_progress_finish("error");
@@ -3352,20 +3404,40 @@ fn start_offline_session_history(
 }
 
 /// Read one JSONL record, capping buffered body size.
-/// Returns `(bytes_consumed_including_skipped_tail, was_capped)`.
-/// `Ok((0, _))` means EOF at start of read.
-fn read_jsonl_line_capped<R: BufRead>(
+/// Advances `bytes_read` as it goes and heartbeats scan atomics during long drains
+/// (so a multi-MB thought line cannot freeze the progress bar for 15s+).
+/// Returns `(bytes_consumed_this_line, was_capped)`. `Ok((0,_))` = EOF.
+fn read_jsonl_line_capped_progress<R: BufRead>(
     reader: &mut R,
     buf: &mut Vec<u8>,
     max_body: usize,
+    bytes_read: &mut u64,
+    total_bytes: u64,
+    last_progress_bytes: &mut u64,
+    last_progress_at: &mut Instant,
+    line_i: usize,
+    block_count: usize,
 ) -> std::io::Result<(usize, bool)> {
     buf.clear();
     let mut consumed = 0usize;
     let mut capped = false;
+    let mut heartbeat = |bytes_read: u64| {
+        if bytes_read.saturating_sub(*last_progress_bytes) >= 128 * 1024
+            || last_progress_at.elapsed() >= Duration::from_millis(100)
+        {
+            *last_progress_bytes = bytes_read;
+            *last_progress_at = Instant::now();
+            let shown = if total_bytes > 0 {
+                bytes_read.min(total_bytes)
+            } else {
+                bytes_read
+            };
+            scan_progress_set(shown, line_i as u64, block_count as u64);
+        }
+    };
     loop {
         let data = reader.fill_buf()?;
         if data.is_empty() {
-            // EOF mid-line or empty file.
             if consumed == 0 {
                 return Ok((0, false));
             }
@@ -3391,6 +3463,8 @@ fn read_jsonl_line_capped<R: BufRead>(
             }
             reader.consume(take);
             consumed = consumed.saturating_add(take);
+            *bytes_read = bytes_read.saturating_add(take as u64);
+            heartbeat(*bytes_read);
             if !capped {
                 while buf.last().copied() == Some(b'\n') || buf.last().copied() == Some(b'\r') {
                     buf.pop();
@@ -3398,7 +3472,6 @@ fn read_jsonl_line_capped<R: BufRead>(
             }
             return Ok((consumed, capped));
         }
-        // No newline in this chunk — copy or skip.
         let chunk_len = data.len();
         if !capped {
             let room = max_body.saturating_sub(buf.len());
@@ -3413,6 +3486,8 @@ fn read_jsonl_line_capped<R: BufRead>(
         }
         reader.consume(chunk_len);
         consumed = consumed.saturating_add(chunk_len);
+        *bytes_read = bytes_read.saturating_add(chunk_len as u64);
+        heartbeat(*bytes_read);
     }
 }
 
@@ -3454,11 +3529,7 @@ fn enrich_tools_from_chat_history(dir: &Path, blocks: &mut [serde_json::Value]) 
             continue;
         }
         const CAP: usize = 16 * 1024;
-        let clipped = if text.len() > CAP {
-            format!("{}…", &text[..CAP])
-        } else {
-            text.to_string()
-        };
+        let clipped = trunc_str(text, CAP);
         outputs.insert(id.to_string(), clipped);
     }
     if outputs.is_empty() {
