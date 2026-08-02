@@ -265,7 +265,10 @@ export function Timeline({ session }: { session: Session }) {
   const { language } = useI18n();
   const fullHistoryLoadingId = useDesktop((s) => s.fullHistoryLoadingId);
   const historyLoadMode = useDesktop((s) => s.historyLoadMode);
+  const diskHistoryProgress = useDesktop((s) => s.diskHistoryProgress);
   const loadingFullHistory = fullHistoryLoadingId === session.id;
+  const scanProgress =
+    diskHistoryProgress?.id === session.id ? diskHistoryProgress : null;
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
@@ -341,6 +344,33 @@ export function Timeline({ session }: { session: Session }) {
   }, [session.id, hasBlocks]);
 
   if (!hasBlocks) {
+    if (loadingFullHistory && historyLoadMode === "disk") {
+      const pct = scanProgress?.percent ?? 0;
+      return (
+        <div className="flex flex-1 flex-col items-center justify-center gap-4 px-8 pb-24">
+          <BlackHole size={40} spin />
+          <div className="w-full max-w-sm text-center">
+            <p className="text-[14px] text-mute">
+              {language === "zh-CN"
+                ? `正在从磁盘加载历史… ${pct}%`
+                : `Loading history from disk… ${pct}%`}
+            </p>
+            <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-line/60">
+              <div
+                className="h-full rounded-full bg-acc/80 transition-[width] duration-200 ease-out"
+                style={{ width: `${Math.min(100, Math.max(2, pct))}%` }}
+              />
+            </div>
+            {scanProgress && scanProgress.totalBytes > 0 && (
+              <p className="mt-2 text-[11px] text-faint">
+                {(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)} /{" "}
+                {(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB
+              </p>
+            )}
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-4 pb-24">
         <BlackHole size={40} spin="slow" />
@@ -368,17 +398,46 @@ export function Timeline({ session }: { session: Session }) {
     >
       <div ref={contentRef} className="mx-auto max-w-[860px] px-8 py-8">
         {loadingFullHistory && (
-          <div className="mb-4 flex items-center justify-center gap-2 rounded-md border border-line/80 bg-raise/50 px-3 py-2 text-[11.5px] text-mute">
-            <BlackHole size={14} spin />
-            <span>
-              {historyLoadMode === "disk"
-                ? language === "zh-CN"
-                  ? "正在从磁盘补全完整历史（工具调用等）… 可切换其他对话，不会卡住"
-                  : "Loading full history from disk (tools…)… switching chats is fine"
-                : language === "zh-CN"
-                  ? "首次发送：静默绑定 Agent 上下文中（不卡界面）… 大会话可能仍需等待 Agent 读盘"
-                  : "First send: silently binding agent context… large sessions may still wait on disk"}
-            </span>
+          <div className="mb-4 rounded-md border border-line/80 bg-raise/50 px-3 py-2.5">
+            <div className="flex items-center justify-center gap-2 text-[11.5px] text-mute">
+              <BlackHole size={14} spin />
+              <span className="min-w-0 text-center">
+                {historyLoadMode === "disk"
+                  ? language === "zh-CN"
+                    ? scanProgress
+                      ? `正在从磁盘补全历史… ${scanProgress.percent}%` +
+                        (scanProgress.totalBytes > 0
+                          ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
+                          : "") +
+                        (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} 条` : "")
+                      : "正在从磁盘补全完整历史（工具调用等）… 可切换其他对话"
+                    : scanProgress
+                      ? `Loading history from disk… ${scanProgress.percent}%` +
+                        (scanProgress.totalBytes > 0
+                          ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
+                          : "") +
+                        (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} blocks` : "")
+                      : "Loading full history from disk… switching chats is fine"
+                  : language === "zh-CN"
+                    ? "首次发送：静默绑定 Agent 上下文中（不卡界面）… 大会话可能仍需等待 Agent 读盘"
+                    : "First send: silently binding agent context… large sessions may still wait on disk"}
+              </span>
+            </div>
+            {historyLoadMode === "disk" && scanProgress && (
+              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-line/60">
+                <div
+                  className="h-full rounded-full bg-acc/80 transition-[width] duration-200 ease-out"
+                  style={{ width: `${Math.min(100, Math.max(2, scanProgress.percent))}%` }}
+                />
+              </div>
+            )}
+            {historyLoadMode === "disk" && (
+              <p className="mt-1.5 text-center text-[10.5px] text-faint">
+                {language === "zh-CN"
+                  ? "可切换其他对话，不会卡住 · 完成后下次打开会更快"
+                  : "You can switch chats · next open will be faster"}
+              </p>
+            )}
           </div>
         )}
         {hiddenCount > 0 && (

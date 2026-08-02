@@ -2706,20 +2706,47 @@ fn start_offline_session_history(
         .name(format!("offline-hist-{safe}"))
         .spawn(move || {
             let abandoned = || OFFLINE_HISTORY_GEN.load(Ordering::SeqCst) != gen;
-            let emit = |session: serde_json::Value, done: bool, phase: &str| {
+            let emit_progress = |session: Option<serde_json::Value>,
+                                 done: bool,
+                                 phase: &str,
+                                 bytes_read: u64,
+                                 total_bytes: u64,
+                                 lines: usize,
+                                 block_count: usize| {
                 if abandoned() {
                     return;
                 }
-                let _ = app.emit(
-                    "disk-history-progress",
-                    serde_json::json!({
-                        "id": safe,
-                        "gen": gen,
-                        "done": done,
-                        "phase": phase,
-                        "session": session,
-                    }),
-                );
+                let percent = if total_bytes > 0 {
+                    ((bytes_read.saturating_mul(100)) / total_bytes).min(if done {
+                        100
+                    } else {
+                        99
+                    })
+                } else if done {
+                    100
+                } else {
+                    0
+                };
+                let mut payload = serde_json::json!({
+                    "id": safe,
+                    "gen": gen,
+                    "done": done,
+                    "phase": phase,
+                    "bytesRead": bytes_read,
+                    "totalBytes": total_bytes,
+                    "percent": percent,
+                    "lines": lines,
+                    "blocks": block_count,
+                });
+                if let Some(session) = session {
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("session".into(), session);
+                    }
+                }
+                let _ = app.emit("disk-history-progress", payload);
+            };
+            let emit = |session: serde_json::Value, done: bool, phase: &str| {
+                emit_progress(Some(session), done, phase, 0, 0, 0, 0);
             };
 
             let Some(dir) = find_grok_session_dir(&safe) else {
@@ -2739,6 +2766,11 @@ fn start_offline_session_history(
             // Wave 1: durable fingerprint cache — skip multi-hundred-MB rescan.
             if let Some(cached) = read_ui_transcript_if_fresh(&dir, &safe) {
                 if !abandoned() {
+                    let blocks_n = cached
+                        .get("blocks")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
                     let _ = app.emit(
                         "disk-history-progress",
                         serde_json::json!({
@@ -2748,6 +2780,11 @@ fn start_offline_session_history(
                             "phase": "complete",
                             "session": cached,
                             "fromCache": true,
+                            "percent": 100,
+                            "bytesRead": 0,
+                            "totalBytes": 0,
+                            "lines": 0,
+                            "blocks": blocks_n,
                         }),
                     );
                 }
@@ -2809,6 +2846,9 @@ fn start_offline_session_history(
                 }
             };
 
+            let total_bytes = file_size_mtime_ms(&updates_path)
+                .map(|(size, _)| size)
+                .unwrap_or(0);
             // Blocking worker: use std BufReader (tokio::io::BufReader is async).
             let reader = StdBufReader::with_capacity(1024 * 256, file);
             let mut blocks: Vec<serde_json::Value> = Vec::new();
@@ -2817,6 +2857,11 @@ fn start_offline_session_history(
             let mut block_i = 0usize;
             let mut line_i = 0usize;
             let mut last_emit_lines = 0usize;
+            let mut last_progress_lines = 0usize;
+            let mut bytes_read = 0u64;
+
+            // Immediate 0% so UI can show a bar before the first 2k-line tick.
+            emit_progress(None, false, "scanning", 0, total_bytes, 0, 0);
 
             let flush_user = |blocks: &mut Vec<serde_json::Value>,
                              user_open: &mut Option<(String, String)>,
@@ -2859,6 +2904,8 @@ fn start_offline_session_history(
                     return;
                 }
                 let Ok(line) = line else { continue };
+                // Approximate stream position (line + newline) for percent UI.
+                bytes_read = bytes_read.saturating_add(line.len() as u64 + 1);
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
@@ -2866,6 +2913,19 @@ fn start_offline_session_history(
                 // Fast-path: thoughts dominate huge updates.jsonl files (100MB+).
                 // Skip before full JSON parse — keeps UI free while scanning.
                 if line.contains("\"agent_thought_chunk\"") {
+                    // Still tick progress while skipping heavy thought lines.
+                    if line_i - last_progress_lines >= 2500 {
+                        last_progress_lines = line_i;
+                        emit_progress(
+                            None,
+                            false,
+                            "scanning",
+                            bytes_read.min(total_bytes.max(bytes_read)),
+                            total_bytes,
+                            line_i,
+                            blocks.len(),
+                        );
+                    }
                     continue;
                 }
                 let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -3072,7 +3132,20 @@ fn start_offline_session_history(
                     _ => {}
                 }
 
-                // Emit progress every ~8000 lines — rare enough not to thrash React.
+                // Lightweight percent ticks often; session body less often.
+                if line_i - last_progress_lines >= 2000 {
+                    last_progress_lines = line_i;
+                    emit_progress(
+                        None,
+                        false,
+                        "scanning",
+                        bytes_read.min(total_bytes.max(bytes_read)),
+                        total_bytes,
+                        line_i,
+                        blocks.len(),
+                    );
+                }
+                // Emit session snapshot every ~8000 lines — rare enough not to thrash React.
                 if line_i - last_emit_lines >= 8000 {
                     last_emit_lines = line_i;
                     flush_user(&mut blocks, &mut user_open, updated_at);
@@ -3082,8 +3155,8 @@ fn start_offline_session_history(
                     } else {
                         blocks.clone()
                     };
-                    emit(
-                        pack_offline_session(
+                    emit_progress(
+                        Some(pack_offline_session(
                             &safe,
                             &title_s,
                             &cwd_s,
@@ -3091,9 +3164,13 @@ fn start_offline_session_history(
                             created_at,
                             updated_at,
                             &view_blocks,
-                        ),
+                        )),
                         false,
                         "scanning",
+                        bytes_read.min(total_bytes.max(bytes_read)),
+                        total_bytes,
+                        line_i,
+                        blocks.len(),
                     );
                 }
             }
@@ -3131,7 +3208,15 @@ fn start_offline_session_history(
             );
             // Durable fingerprint cache for next cold open.
             let _ = write_ui_transcript(&dir, &safe, &packed, &updates_path);
-            emit(packed, true, "complete");
+            emit_progress(
+                Some(packed),
+                true,
+                "complete",
+                total_bytes.max(bytes_read),
+                total_bytes.max(bytes_read),
+                line_i,
+                blocks.len(),
+            );
         })
         .map_err(|e| format!("无法启动离线历史线程：{e}"))?;
     Ok(())

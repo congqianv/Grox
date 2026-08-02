@@ -53,6 +53,24 @@ type DiskHistoryProgress = {
   phase?: string;
   session?: Session | null;
   error?: string;
+  fromCache?: boolean;
+  /** 0–100 scan progress from Rust offline worker. */
+  percent?: number;
+  bytesRead?: number;
+  totalBytes?: number;
+  lines?: number;
+  blocks?: number;
+};
+
+/** Live offline-scan progress shown in Timeline banner. */
+export type DiskHistoryScanProgress = {
+  id: string;
+  percent: number;
+  bytesRead: number;
+  totalBytes: number;
+  lines: number;
+  blocks: number;
+  fromCache?: boolean;
 };
 
 function normalizeOfflineSession(raw: unknown, fallback?: Session | null): Session | null {
@@ -231,6 +249,8 @@ interface DesktopState {
   fullHistoryLoadingId: string | null;
   /** Why fullHistoryLoadingId is set: offline disk scan vs agent session/load. */
   historyLoadMode: HistoryLoadMode;
+  /** Real-time offline disk scan progress (null when idle). */
+  diskHistoryProgress: DiskHistoryScanProgress | null;
   account: AccountInfo | null;
   billing: BillingInfo | null;
   provider: ProviderStatus;
@@ -1061,6 +1081,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     activeId: null,
     fullHistoryLoadingId: null,
     historyLoadMode: null,
+    diskHistoryProgress: null,
     account: null,
     billing: null,
     provider: { kind: "oauth", hasApiKey: false },
@@ -1126,13 +1147,32 @@ export const useDesktop = create<DesktopState>((set, get) => {
           if (!payload?.id) return;
           const existing = get().sessions[payload.id];
           // Don't clobber an in-flight live turn with a partial offline paint.
-          if (
+          const liveBusy =
             existing &&
             (existing.status === "running" ||
               existing.status === "awaiting_permission" ||
               existing.status === "awaiting_input") &&
-            !payload.done
+            !payload.done;
+
+          // Always surface percent for the active mission's disk scan banner.
+          if (
+            !payload.done &&
+            (get().activeId === payload.id || get().fullHistoryLoadingId === payload.id)
           ) {
+            set({
+              diskHistoryProgress: {
+                id: payload.id,
+                percent: Math.min(100, Math.max(0, Number(payload.percent) || 0)),
+                bytesRead: Number(payload.bytesRead) || 0,
+                totalBytes: Number(payload.totalBytes) || 0,
+                lines: Number(payload.lines) || 0,
+                blocks: Number(payload.blocks) || 0,
+                fromCache: Boolean(payload.fromCache),
+              },
+            });
+          }
+
+          if (liveBusy) {
             return;
           }
 
@@ -1169,7 +1209,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
               offlineHistoryComplete.add(payload.id);
             }
             if (get().fullHistoryLoadingId === payload.id && get().historyLoadMode === "disk") {
-              set({ fullHistoryLoadingId: null, historyLoadMode: null });
+              set({
+                fullHistoryLoadingId: null,
+                historyLoadMode: null,
+                diskHistoryProgress: null,
+              });
+            } else if (get().diskHistoryProgress?.id === payload.id) {
+              set({ diskHistoryProgress: null });
             }
           }
         }).catch((error) => {
@@ -1263,6 +1309,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         fullHistoryLoadingId:
           get().historyLoadMode === "disk" ? null : get().fullHistoryLoadingId,
         historyLoadMode: get().historyLoadMode === "disk" ? null : get().historyLoadMode,
+        diskHistoryProgress: get().historyLoadMode === "disk" ? null : get().diskHistoryProgress,
       });
     },
 
