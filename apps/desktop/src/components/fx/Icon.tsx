@@ -131,6 +131,14 @@ const paths: Record<string, JSX.Element> = {
       <path d="M6.5 8.4v7.2M17.5 10.4c0 4.2-6.5 3.2-9 5.4" />
     </>
   ),
+  summary: (
+    <>
+      <path d="M8 6h12M8 12h12M8 18h12" />
+      <circle cx="4.5" cy="6" r="1.5" />
+      <circle cx="4.5" cy="12" r="1.5" />
+      <circle cx="4.5" cy="18" r="1.5" />
+    </>
+  ),
   refresh: (
     <>
       <path d="M20.5 12a8.5 8.5 0 1 1-2.5-6" />

@@ -282,6 +282,39 @@ html[data-reduce-motion="1"] * {
 }
 
 
+
+.summary-row {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 10px;
+  border-radius: 5px;
+  padding: 0 8px;
+  color: var(--color-fg2);
+  font-size: calc(11px + var(--grox-font-increase, 0px));
+}
+button.summary-row:hover {
+  background: var(--color-high);
+  color: var(--color-fg);
+}
+.summary-action {
+  height: 26px;
+  border: 1px solid var(--color-line2);
+  border-radius: 4px;
+  padding: 0 9px;
+  color: var(--color-fg2);
+  font-size: calc(9.5px + var(--grox-font-increase, 0px));
+}
+.summary-action:hover:not(:disabled) {
+  border-color: var(--color-line3);
+  background: var(--color-high);
+  color: var(--color-fg);
+}
+.summary-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
 @keyframes planSpin {
   to { transform: rotate(360deg); }
 }

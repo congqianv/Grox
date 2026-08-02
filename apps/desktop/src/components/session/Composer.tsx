@@ -27,6 +27,7 @@ import {
   searchWorkspaceFiles,
   validateAttachmentSet,
 } from "../../lib/attachments";
+import { attachExplicitPromptImages } from "../../lib/pathAttachments";
 import {
   elementContainsPoint,
   isNativeDragDropActive,
@@ -322,30 +323,52 @@ export function Composer() {
   const send = () => {
     const t = text.trim();
     if ((!t && attachments.length === 0) || readingFiles || interjecting) return;
-    // Keep the draft when gated — sendPrompt only posts a notice.
-    if (gated) {
-      sendPrompt(t, attachments);
-      return;
-    }
-    sendPrompt(t, attachments);
-    clearComposer();
+    void (async () => {
+      setAttachmentError("");
+      try {
+        const turnAttachments = await attachExplicitPromptImages(workspace, t, attachments);
+        // Keep the draft when gated — sendPrompt only posts a notice.
+        if (gated) {
+          sendPrompt(t, turnAttachments);
+          return;
+        }
+        sendPrompt(t, turnAttachments);
+        clearComposer();
+      } catch (cause) {
+        const code = cause instanceof Error ? cause.message : String(cause);
+        setAttachmentError(attachmentErrorMessage(code, language));
+      }
+    })();
   };
 
   const interject = () => {
     const t = text.trim();
     if ((!t && attachments.length === 0) || readingFiles || interjecting) return;
-    if (gated) {
-      sendPrompt(t, attachments);
-      return;
-    }
-    if (!busy) {
-      send();
-      return;
-    }
-    setInterjecting(true);
-    void interjectPrompt(t, attachments)
-      .then(() => clearComposer())
-      .finally(() => setInterjecting(false));
+    void (async () => {
+      setAttachmentError("");
+      try {
+        const turnAttachments = await attachExplicitPromptImages(workspace, t, attachments);
+        if (gated) {
+          sendPrompt(t, turnAttachments);
+          return;
+        }
+        if (!busy) {
+          sendPrompt(t, turnAttachments);
+          clearComposer();
+          return;
+        }
+        setInterjecting(true);
+        try {
+          await interjectPrompt(t, turnAttachments);
+          clearComposer();
+        } finally {
+          setInterjecting(false);
+        }
+      } catch (cause) {
+        const code = cause instanceof Error ? cause.message : String(cause);
+        setAttachmentError(attachmentErrorMessage(code, language));
+      }
+    })();
   };
 
   const pickAtFile = (entry: WorkspaceEntry) => {
