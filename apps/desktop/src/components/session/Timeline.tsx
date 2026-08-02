@@ -409,9 +409,13 @@ const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
  */
 const LIVE_TURN_WINDOW = 40;
 /** How close to the true bottom before we consider "stuck" for auto-follow. */
-const STICK_BOTTOM_PX = 48;
-/** After wheel/touch/keyboard scroll, suppress follow so stream growth cannot yank. */
-const USER_UNFOLLOW_MS = 2800;
+const STICK_BOTTOM_PX = 64;
+/**
+ * After user scrolls *up*, suppress follow so stream growth cannot yank.
+ * Shorter than R4++ (2800ms): long cooldown made "scroll back down to live"
+ * feel broken until the timer expired.
+ */
+const USER_UNFOLLOW_MS = 1600;
 
 /** Stable Footer type — inline `Footer: () => …` remounts Virtuoso chrome every stream tick. */
 function TimelineVirtuosoFooter() {
@@ -430,14 +434,18 @@ export function Timeline({ session }: { session: Session }) {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   /** When true, stream growth may pin the viewport to the last turn. */
   const followRef = useRef(true);
-  /** Timestamp until which follow is forced off after explicit user scroll. */
+  /** Timestamp until which follow is forced off after explicit user scroll-up. */
   const unfollowUntilRef = useRef(0);
+  /** True when the latest user scroll intent was downward (re-stick allowed). */
+  const scrollDownIntentRef = useRef(false);
   const jumpTimersRef = useRef<number[]>([]);
   const scrollerElRef = useRef<HTMLElement | null>(null);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
   /** true = show entire transcript (default for restored history). */
   const [showAll, setShowAll] = useState(true);
   const [bindElapsedSec, setBindElapsedSec] = useState(0);
+  /** UI: show "jump to latest" when user has unfollowed a live stream. */
+  const [showJumpLatest, setShowJumpLatest] = useState(false);
   // Streaming text length intentionally omitted — Virtuoso followOutput covers growth.
   const hasBlocks = session.blocks.length > 0;
   // Latest turn id — only this row uses live process chrome while the session runs.
@@ -465,6 +473,15 @@ export function Timeline({ session }: { session: Session }) {
   const markUserUnfollow = useCallback(() => {
     followRef.current = false;
     unfollowUntilRef.current = Date.now() + USER_UNFOLLOW_MS;
+    scrollDownIntentRef.current = false;
+    setShowJumpLatest(true);
+  }, []);
+
+  const markFollowLatest = useCallback(() => {
+    followRef.current = true;
+    unfollowUntilRef.current = 0;
+    scrollDownIntentRef.current = false;
+    setShowJumpLatest(false);
   }, []);
 
   const canFollow = useCallback(() => {
@@ -477,6 +494,8 @@ export function Timeline({ session }: { session: Session }) {
     setShowAll(true);
     followRef.current = true;
     unfollowUntilRef.current = 0;
+    scrollDownIntentRef.current = false;
+    setShowJumpLatest(false);
   }, [session.id]);
 
   // Offline scan / cache upgrade may add many older turns — keep them visible.
@@ -562,26 +581,28 @@ export function Timeline({ session }: { session: Session }) {
   type ScrollerEl = HTMLElement & {
     __groxUnfollowScroll?: () => void;
     __groxUnfollowKey?: (e: KeyboardEvent) => void;
+    __groxWheel?: (e: WheelEvent) => void;
   };
 
-  const detachScroller = useCallback(
-    (node: ScrollerEl | null) => {
-      if (!node) return;
-      node.removeEventListener("wheel", markUserUnfollow);
-      node.removeEventListener("touchmove", markUserUnfollow);
-      if (node.__groxUnfollowKey) {
-        node.removeEventListener("keydown", node.__groxUnfollowKey);
-        delete node.__groxUnfollowKey;
-      }
-      if (node.__groxUnfollowScroll) {
-        node.removeEventListener("scroll", node.__groxUnfollowScroll);
-        delete node.__groxUnfollowScroll;
-      }
-    },
-    [markUserUnfollow],
-  );
+  const detachScroller = useCallback((node: ScrollerEl | null) => {
+    if (!node) return;
+    if (node.__groxWheel) {
+      node.removeEventListener("wheel", node.__groxWheel);
+      delete node.__groxWheel;
+    }
+    if (node.__groxUnfollowKey) {
+      node.removeEventListener("keydown", node.__groxUnfollowKey);
+      delete node.__groxUnfollowKey;
+    }
+    if (node.__groxUnfollowScroll) {
+      node.removeEventListener("scroll", node.__groxUnfollowScroll);
+      delete node.__groxUnfollowScroll;
+    }
+  }, []);
 
-  // Attach to Virtuoso scroller: wheel/touch/keys/scroll-up must unfollow immediately.
+  // Attach to Virtuoso scroller.
+  // R23: only *upward* scroll unfollows. Downward wheel/drag must stay free so
+  // users can scroll back to the live edge; re-stick when near bottom.
   // atBottomStateChange alone is too slow / flaky while tall Computer-Use tables remeasure.
   const scrollerRef = useCallback(
     (el: HTMLElement | Window | null) => {
@@ -589,10 +610,14 @@ export function Timeline({ session }: { session: Session }) {
       const node = el instanceof HTMLElement ? (el as ScrollerEl) : null;
       scrollerElRef.current = node;
       if (!node) return;
-      node.addEventListener("wheel", markUserUnfollow, { passive: true });
-      node.addEventListener("touchmove", markUserUnfollow, { passive: true });
+      const onWheel = (event: WheelEvent) => {
+        // deltaY < 0 → fingers/trackpad scroll content upward (read history).
+        if (event.deltaY < 0) markUserUnfollow();
+        else if (event.deltaY > 0) scrollDownIntentRef.current = true;
+      };
+      node.addEventListener("wheel", onWheel, { passive: true });
       const onKeyUnfollow = (event: KeyboardEvent) => {
-        // Page/home/arrow navigation must not lose place when the stream keeps growing.
+        // Page/home/arrow-up must not lose place when the stream keeps growing.
         if (
           event.key === "PageUp" ||
           event.key === "Home" ||
@@ -600,21 +625,38 @@ export function Timeline({ session }: { session: Session }) {
           (event.key === " " && event.shiftKey)
         ) {
           markUserUnfollow();
+        } else if (
+          event.key === "PageDown" ||
+          event.key === "End" ||
+          event.key === "ArrowDown" ||
+          (event.key === " " && !event.shiftKey)
+        ) {
+          scrollDownIntentRef.current = true;
         }
       };
       node.addEventListener("keydown", onKeyUnfollow);
       let lastTop = node.scrollTop;
       const onScrollerScroll = () => {
         const top = node.scrollTop;
-        // Any upward motion (incl. trackpad / scrollbar drag) freezes follow.
-        if (top + 2 < lastTop) markUserUnfollow();
+        const max = Math.max(0, node.scrollHeight - node.clientHeight);
+        if (top + 2 < lastTop) {
+          // Upward motion freezes follow.
+          markUserUnfollow();
+        } else if (top > lastTop + 1) {
+          // Downward motion: free the viewport; re-stick only when near bottom.
+          scrollDownIntentRef.current = true;
+          if (max - top <= STICK_BOTTOM_PX) {
+            markFollowLatest();
+          }
+        }
         lastTop = top;
       };
       node.__groxUnfollowScroll = onScrollerScroll;
       node.__groxUnfollowKey = onKeyUnfollow;
+      node.__groxWheel = onWheel;
       node.addEventListener("scroll", onScrollerScroll, { passive: true });
     },
-    [detachScroller, markUserUnfollow],
+    [detachScroller, markFollowLatest, markUserUnfollow],
   );
 
   useEffect(
@@ -626,8 +668,7 @@ export function Timeline({ session }: { session: Session }) {
   useEffect(() => {
     clearJumpTimers();
     if (!hasBlocks) return;
-    followRef.current = true;
-    unfollowUntilRef.current = 0;
+    markFollowLatest();
     scrollToBottom(true);
     // Delayed remeasure must honor unfollow if the user scrolled/jumped early.
     const t1 = window.setTimeout(() => {
@@ -802,13 +843,23 @@ export function Timeline({ session }: { session: Session }) {
         increaseViewportBy={{ top: 800, bottom: 1000 }}
         atBottomThreshold={STICK_BOTTOM_PX}
         atBottomStateChange={(atBottom) => {
-          // Never re-enable follow during the user-scroll cooldown (stream can
-          // briefly report atBottom=true while tables remeasure).
+          if (atBottom && scrollDownIntentRef.current) {
+            // User scrolled down to the live edge — re-stick immediately.
+            markFollowLatest();
+            return;
+          }
+          // During unfollow cooldown, ignore flaky atBottom=true from CU remeasure
+          // unless the user is clearly still away from bottom.
           if (Date.now() < unfollowUntilRef.current) {
-            if (!atBottom) followRef.current = false;
+            if (!atBottom) {
+              followRef.current = false;
+              setShowJumpLatest(true);
+            }
             return;
           }
           followRef.current = atBottom;
+          if (atBottom) setShowJumpLatest(false);
+          else if (isLive) setShowJumpLatest(true);
         }}
         followOutput={(isAtBottom) => {
           // Require BOTH sticky intent and Virtuoso's at-bottom — live `true`
@@ -835,6 +886,18 @@ export function Timeline({ session }: { session: Session }) {
         }}
       />
       <RequestRail markers={markers} language={language} onJump={jumpToTurn} />
+      {showJumpLatest && isLive && (
+        <button
+          type="button"
+          className="absolute bottom-4 left-1/2 z-30 -translate-x-1/2 rounded-full border border-line2 bg-raise/95 px-3.5 py-1.5 text-[11.5px] text-fg2 shadow-[var(--shadow-float)] backdrop-blur-sm transition-colors hover:bg-high hover:text-fg"
+          onClick={() => {
+            markFollowLatest();
+            scrollToBottom(true);
+          }}
+        >
+          {language === "zh-CN" ? "↓ 回到最新" : "↓ Jump to latest"}
+        </button>
+      )}
     </div>
   );
 }
