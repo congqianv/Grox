@@ -2749,13 +2749,26 @@ export const useDesktop = create<DesktopState>((set, get) => {
           if (bridge.prepareComputerForPrompt) {
             const cu = await bridge.prepareComputerForPrompt(session.id, trimmed);
             if (cu === "refused") {
-              // Drop the queue entry we just added — do not send to agent.
+              // Drop the queue entry and restore the draft — queue path already
+              // cleared sessionComposers; losing the text on CU refuse is a UX bug.
               const q = get().promptQueues[session.id] ?? [];
+              const comps = get().sessionComposers;
+              const cur = comps[session.id] ?? composer;
+              const restored = {
+                ...comps,
+                [session.id]: {
+                  ...cur,
+                  text: trimmed || cur.text,
+                  attachments: attachments.length > 0 ? [...attachments] : cur.attachments,
+                },
+              };
+              persistSessionComposers(restored);
               set({
                 promptQueues: {
                   ...get().promptQueues,
                   [session.id]: q.filter((item) => item.id !== entry.id),
                 },
+                sessionComposers: restored,
                 queueNotice: {
                   id: uid(),
                   message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
@@ -2940,8 +2953,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
 
       if (session.status === "awaiting_permission" || session.status === "awaiting_input") {
+        // Gate only — sendPrompt posts a notice and does not accept the draft.
+        // Return false so callers (Composer) do not clear the composer text.
         get().sendPrompt(trimmed, attachments, session.id);
-        return true;
+        return false;
       }
 
       const composer = sessionComposers[session.id] ?? {

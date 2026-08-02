@@ -870,6 +870,45 @@ fn apply_grox_provider_environment(command: &mut Command) {
     }
 }
 
+/// Allowlist of operator .env keys that may reach CLI children.
+/// Belt-and-braces with [`is_denied_cli_env_key`] — deny always wins.
+fn is_allowed_cli_env_key(key: &str) -> bool {
+    if is_denied_cli_env_key(key) {
+        return false;
+    }
+    let upper = key.to_ascii_uppercase();
+    // Locale / terminal colour only — never PATH, HOME, proxy, or toolchain.
+    matches!(
+        upper.as_str(),
+        "TERM"
+            | "COLORTERM"
+            | "NO_COLOR"
+            | "FORCE_COLOR"
+            | "LANG"
+            | "LC_ALL"
+            | "LC_CTYPE"
+            | "LC_MESSAGES"
+            | "TZ"
+    ) || upper.starts_with("XAI_")
+        || upper.starts_with("GROK_")
+        || upper.starts_with("GROX_")
+        || upper.starts_with("OPENAI_")
+        || upper.starts_with("ANTHROPIC_")
+        || upper.starts_with("AZURE_OPENAI")
+        || upper.starts_with("MISTRAL_")
+        || upper.starts_with("DEEPSEEK_")
+        || upper.starts_with("TOGETHER_")
+        || upper.starts_with("FIREWORKS_")
+        || upper.starts_with("GROQ_")
+        || upper.starts_with("OLLAMA_")
+        || upper.starts_with("HF_")
+        || upper.starts_with("HUGGINGFACE_")
+        || upper.starts_with("GEMINI_")
+        || upper.starts_with("GOOGLE_AI_")
+        || upper.starts_with("COHERE_")
+        || upper.starts_with("PERPLEXITY_")
+}
+
 /// Denylist of host-sensitive env keys that must never be taken from ~/.grok/.env
 /// into CLI children (PATH hijack / proxy / TLS keylog / toolchain injection).
 fn is_denied_cli_env_key(key: &str) -> bool {
@@ -954,13 +993,14 @@ fn is_denied_cli_env_key(key: &str) -> bool {
         || upper.starts_with("RUBY")
 }
 
-/// Same provider resolution used by `acp_spawn`: full ~/.grok/.env, then the
-/// active provider profile (authoritative), then privacy env. Media generation
-/// must match the agent so Settings profiles work for image/video studio.
+/// Same provider resolution used by `acp_spawn`: allowlisted ~/.grok/.env keys,
+/// then the active provider profile (authoritative), then privacy env. Media
+/// generation must match the agent so Settings profiles work for image/video.
 fn apply_cli_provider_environment(command: &mut Command) {
     if let Ok(home) = grok_home() {
         for (key, value) in parse_env_file(&home.join(".env")) {
-            if is_denied_cli_env_key(&key) {
+            // Allowlist + denylist: only known provider/locale keys cross the boundary.
+            if !is_allowed_cli_env_key(&key) {
                 continue;
             }
             command.env(key, value);
@@ -6117,12 +6157,23 @@ fn configure_provider(request: ProviderConfig) -> Result<(), String> {
 
 #[tauri::command]
 fn open_external(url: String) -> Result<(), String> {
-    let parsed = url::Url::parse(&url).map_err(|error| format!("无效链接：{error}"))?;
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.len() > 8_192 {
+        return Err("链接长度无效".into());
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("链接包含非法控制字符".into());
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|error| format!("无效链接：{error}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("只允许打开 HTTP(S) 链接".into());
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("链接不能包含用户名或密码".into());
+    }
+    // Reject scheme-smuggling and host-less oddities after parse.
+    if parsed.host_str().is_none() {
+        return Err("链接缺少主机名".into());
     }
 
     #[cfg(windows)]
@@ -6357,6 +6408,15 @@ fn acp_set_silent_stream(
 async fn acp_send(state: tauri::State<'_, Arc<AcpState>>, line: String) -> Result<(), String> {
     if line.contains('\n') || line.contains('\r') {
         return Err("ACP 消息必须是单行 JSON".into());
+    }
+    // Bound stdin payload size (multimodal base64 still fits under 8 MiB).
+    const MAX_ACP_LINE_BYTES: usize = 8 * 1024 * 1024;
+    if line.len() > MAX_ACP_LINE_BYTES {
+        return Err(format!(
+            "ACP 消息过大（{} bytes，上限 {}）",
+            line.len(),
+            MAX_ACP_LINE_BYTES
+        ));
     }
     let mut guard = state.process.lock().await;
     let process = guard
@@ -6699,6 +6759,9 @@ fn main() {
                     let state = window.state::<Arc<AcpState>>().inner().clone();
                     let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
                     tauri::async_runtime::spawn(async move {
+                        // Hold spawn_lock so a late acp_spawn cannot race teardown.
+                        let _spawn_guard = state.spawn_lock.lock().await;
+                        state.next_generation.fetch_add(1, Ordering::Relaxed);
                         if let Some(process) = state.process.lock().await.take() {
                             terminate_process(process).await;
                         }
@@ -6706,6 +6769,8 @@ fn main() {
                             let _ = process.child.kill().await;
                             let _ = process.child.wait().await;
                         }
+                        // Revoke local Computer Use MCP so orphans cannot drive the desktop.
+                        let _ = computer_mcp::revoke_http_auth();
                     });
                 }
                 _ => {}
@@ -7059,6 +7124,26 @@ api_key = "local-key"
         assert!(is_denied_cli_env_key("RUSTFLAGS"));
         assert!(!is_denied_cli_env_key("XAI_API_KEY"));
         assert!(!is_denied_cli_env_key("GROK_MODELS_BASE_URL"));
+    }
+
+    #[test]
+    fn cli_env_allowlist_only_provider_and_locale_keys() {
+        assert!(is_allowed_cli_env_key("XAI_API_KEY"));
+        assert!(is_allowed_cli_env_key("GROK_MODELS_BASE_URL"));
+        assert!(is_allowed_cli_env_key("OPENAI_API_KEY"));
+        assert!(is_allowed_cli_env_key("TERM"));
+        assert!(is_allowed_cli_env_key("LANG"));
+        // Random secrets / tooling from a polluted .env must not pass.
+        assert!(!is_allowed_cli_env_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!is_allowed_cli_env_key("DATABASE_URL"));
+        assert!(!is_allowed_cli_env_key("MY_CUSTOM_TOKEN"));
+        // Denylist always wins even if a prefix looks provider-like.
+        assert!(!is_allowed_cli_env_key("PATH"));
+        assert!(!is_allowed_cli_env_key("HTTP_PROXY"));
+        assert!(!is_allowed_cli_env_key("NODE_OPTIONS"));
+        // Host identity must not be rewritten from .env.
+        assert!(!is_allowed_cli_env_key("HOME"));
+        assert!(!is_allowed_cli_env_key("USERPROFILE"));
     }
 
     #[test]

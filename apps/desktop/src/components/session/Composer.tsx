@@ -1005,7 +1005,7 @@ export function Composer() {
             {!busy && (
               <button
                 onClick={send}
-                disabled={!canSubmit}
+                disabled={!canSubmit || gated}
                 title={
                   gated
                     ? submitBlockReason
