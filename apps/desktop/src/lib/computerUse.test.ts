@@ -1,21 +1,38 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  COMPUTER_USE_ENV_KEY,
   COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
   COMPUTER_USE_STORAGE_KEY,
   computerLeaseIfAttached,
   decideComputerAttachForPrompt,
   hasActiveComputerLease,
+  isComputerUseEnvFlag,
   isComputerUseOperatorEnabled,
+  resetComputerUseHostEnvCache,
+  setComputerUseHostEnvEnabled,
   setComputerUseOperatorEnabled,
 } from "./computerUse";
+
+function envBag(): Record<string, string | undefined> {
+  type Proc = { process?: { env?: Record<string, string | undefined> } };
+  const g = globalThis as unknown as Proc;
+  if (!g.process?.env) {
+    g.process = { env: { ...(g.process?.env ?? {}) } };
+  }
+  return g.process.env as Record<string, string | undefined>;
+}
 
 describe("computerUse opt-in", () => {
   afterEach(() => {
     localStorage.removeItem(COMPUTER_USE_STORAGE_KEY);
+    resetComputerUseHostEnvCache();
+    delete envBag()[COMPUTER_USE_ENV_KEY];
   });
 
   it("defaults to disabled", () => {
     localStorage.removeItem(COMPUTER_USE_STORAGE_KEY);
+    resetComputerUseHostEnvCache();
+    delete envBag()[COMPUTER_USE_ENV_KEY];
     expect(isComputerUseOperatorEnabled()).toBe(false);
   });
 
@@ -31,6 +48,34 @@ describe("computerUse opt-in", () => {
     setComputerUseOperatorEnabled(false);
     // attach path gates on this helper — must be false by default.
     expect(isComputerUseOperatorEnabled()).toBe(false);
+  });
+
+  it("honors process env GROX_COMPUTER_USE (R4A-CU-03)", () => {
+    setComputerUseOperatorEnabled(false);
+    envBag()[COMPUTER_USE_ENV_KEY] = "1";
+    expect(isComputerUseOperatorEnabled()).toBe(true);
+    envBag()[COMPUTER_USE_ENV_KEY] = "true";
+    expect(isComputerUseOperatorEnabled()).toBe(true);
+    envBag()[COMPUTER_USE_ENV_KEY] = "0";
+    expect(isComputerUseOperatorEnabled()).toBe(false);
+  });
+
+  it("honors host env cache from Tauri probe", () => {
+    setComputerUseOperatorEnabled(false);
+    delete envBag()[COMPUTER_USE_ENV_KEY];
+    setComputerUseHostEnvEnabled(true);
+    expect(isComputerUseOperatorEnabled()).toBe(true);
+    setComputerUseHostEnvEnabled(false);
+    expect(isComputerUseOperatorEnabled()).toBe(false);
+  });
+
+  it("parses env flag shapes", () => {
+    expect(isComputerUseEnvFlag("1")).toBe(true);
+    expect(isComputerUseEnvFlag("TRUE")).toBe(true);
+    expect(isComputerUseEnvFlag(" true ")).toBe(true);
+    expect(isComputerUseEnvFlag("0")).toBe(false);
+    expect(isComputerUseEnvFlag("")).toBe(false);
+    expect(isComputerUseEnvFlag(null)).toBe(false);
   });
 });
 

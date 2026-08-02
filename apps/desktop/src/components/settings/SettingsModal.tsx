@@ -5,6 +5,7 @@ import type { ConfigDocument, ProviderApiBackend, ProviderKind } from "../../bri
 import { EFFORTS } from "../../bridge/types";
 import {
   isComputerUseOperatorEnabled,
+  setComputerUseHostEnvEnabled,
   setComputerUseOperatorEnabled,
 } from "../../lib/computerUse";
 import { useDesktop } from "../../state/store";
@@ -196,13 +197,30 @@ function General() {
 
 function ComputerUseOptIn({ zh }: { zh: boolean }) {
   const [enabled, setEnabled] = useState(() => isComputerUseOperatorEnabled());
+  const [envForced, setEnvForced] = useState(false);
+  useEffect(() => {
+    // Align checkbox with host GROX_COMPUTER_USE when Settings opens (R4A-CU-03).
+    void invoke<boolean>("computer_use_env_enabled_cmd")
+      .then((on) => {
+        setComputerUseHostEnvEnabled(on === true);
+        setEnvForced(on === true);
+        setEnabled(isComputerUseOperatorEnabled());
+      })
+      .catch(() => {
+        /* non-tauri / older shell */
+      });
+  }, []);
   return (
     <Row
       label={zh ? "允许 Computer Use" : "Allow Computer Use"}
       hint={
-        zh
-          ? "默认关闭。开启后 Agent 可在明确请求时控制本机窗口（键鼠）。关闭会立即吊销本机 MCP。仅在可信环境使用。"
-          : "Off by default. When on, the Agent may control local windows on explicit request. Turning off revokes the local MCP. Trusted environments only."
+        envForced
+          ? zh
+            ? "已由环境变量 GROX_COMPUTER_USE=1 启用（高级）。关闭设置开关仍会吊销本机 MCP，但 env 在下次启动仍会打开门控。"
+            : "Enabled by host env GROX_COMPUTER_USE=1 (advanced). Turning the switch off revokes MCP now; env re-opens the gate on next ensure."
+          : zh
+            ? "默认关闭。开启后 Agent 可在明确请求时控制本机窗口（键鼠）。关闭会立即吊销本机 MCP。仅在可信环境使用。"
+            : "Off by default. When on, the Agent may control local windows on explicit request. Turning off revokes the local MCP. Trusted environments only."
       }
     >
       <label className="flex items-center gap-2 font-mono text-[10px] text-fg2">
@@ -218,6 +236,9 @@ function ComputerUseOptIn({ zh }: { zh: boolean }) {
           }}
         />
         {enabled ? (zh ? "已启用" : "Enabled") : zh ? "已关闭" : "Disabled"}
+        {envForced ? (
+          <span className="text-dim">{zh ? "· ENV" : "· ENV"}</span>
+        ) : null}
       </label>
     </Row>
   );

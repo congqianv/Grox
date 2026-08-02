@@ -2810,6 +2810,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
         };
         persistSessionComposers(nextComposers);
 
+        // Computer Use opt-in refuse: show notice, keep composer text, no queue.
+        if (result.state === "refused") {
+          set({
+            queueNotice: {
+              id: uid(),
+              message: result.message,
+              state: "interjected",
+              at: Date.now(),
+            },
+          });
+          return;
+        }
+
         if (result.fallback || result.state === "queued_head") {
           const entry: QueuedPrompt = {
             id: result.entryId ?? uid(),

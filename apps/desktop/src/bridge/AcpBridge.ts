@@ -10,6 +10,7 @@ import {
   decideComputerAttachForPrompt,
   hasActiveComputerLease,
   isComputerUseOperatorEnabled,
+  setComputerUseHostEnvEnabled,
 } from "../lib/computerUse";
 import { shouldDropSilentInbound } from "../lib/silentAcp";
 import type {
@@ -1319,6 +1320,8 @@ export class AcpBridge implements GrokBridge {
   private async connect(): Promise<void> {
     const environment = await invoke<DesktopEnvironment>("desktop_environment");
     this.workspace = localStorage.getItem("grok.workspace") ?? environment.defaultWorkspace;
+    // Align FE opt-in with host GROX_COMPUTER_USE (R4A-CU-03).
+    await this.refreshComputerUseHostEnv();
 
     this.unlisten.push(
       await listen<string>("acp-event", ({ payload }) => this.enqueueInbound(payload)),
@@ -2697,9 +2700,18 @@ export class AcpBridge implements GrokBridge {
     // The interject RPC itself must NOT wait behind an in-flight session/prompt
     // (that would block mid-turn 插话 until the turn ends — R3 regression).
     // Always enter ensure on Computer intent — even with an existing lease —
-    // so opt-in OFF can revoke stale MCP (R4A-CU-01).
+    // so opt-in OFF can revoke stale MCP (R4A-CU-01). Refuse aborts the turn (CU-02).
     if (this.promptRequestsComputer(trimmed)) {
-      await this.runOnChannel(() => this.ensureComputerAttachedForPrompt(sessionId, trimmed));
+      const cu = await this.runOnChannel(() =>
+        this.ensureComputerAttachedForPrompt(sessionId, trimmed),
+      );
+      if (cu === "refused") {
+        return {
+          state: "refused",
+          message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
+          fallback: false,
+        };
+      }
     }
     const interjectionId = crypto.randomUUID();
     const content = promptContent(trimmed, options.attachments ?? []);
@@ -2877,7 +2889,11 @@ export class AcpBridge implements GrokBridge {
     try {
       // Silent-bound sessions skip Computer MCP at load time; attach once when
       // the operator's prompt explicitly needs desktop control.
-      await this.ensureComputerAttachedForPrompt(sessionId, text);
+      // Refuse (opt-in off) aborts the turn — do not session/prompt (R4A-CU-02).
+      const cu = await this.ensureComputerAttachedForPrompt(sessionId, text);
+      if (cu === "refused") {
+        return;
+      }
       const previous = this.sessionOptions.get(sessionId);
       if (!previous || previous.model !== options.model || previous.effort !== options.effort) {
         await this.requestRaw(ACP_METHODS.sessionSetModel, {
@@ -3173,17 +3189,33 @@ export class AcpBridge implements GrokBridge {
     return false;
   }
 
+  /** Pull GROX_COMPUTER_USE from the host process into the FE opt-in helper. */
+  private async refreshComputerUseHostEnv(): Promise<void> {
+    try {
+      const on = await invoke<boolean>("computer_use_env_enabled_cmd");
+      setComputerUseHostEnvEnabled(on === true);
+    } catch {
+      /* older shells — leave cache unchanged / process.env only */
+    }
+  }
+
   /**
    * Secondary attach for sessions that were silent/background-bound without
    * Computer MCP. Re-issues session/load with MCP extensions under the silent
    * stream filter so offline history is not flooded.
    *
    * Re-checks opt-in even when a lease is already mapped (R4A-CU-01).
+   * Returns `refused` when opt-in blocks Computer intent so callers abort the
+   * turn (R4A-CU-02) instead of still calling session/prompt.
    */
   private async ensureComputerAttachedForPrompt(
     sessionId: string,
     text: string,
-  ): Promise<void> {
+  ): Promise<"ok" | "refused"> {
+    // Env may have been set after cold start; refresh once per ensure is cheap.
+    if (!isComputerUseOperatorEnabled()) {
+      await this.refreshComputerUseHostEnv();
+    }
     const decision = decideComputerAttachForPrompt({
       requestsComputer: this.promptRequestsComputer(text),
       knownSession: this.knownSessions.has(sessionId),
@@ -3193,14 +3225,14 @@ export class AcpBridge implements GrokBridge {
     switch (decision) {
       case "skip":
       case "already_attached":
-        return;
+        return "ok";
       case "refuse_opt_in":
         this.emit({
           type: "error",
           sessionId,
           message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
         });
-        return;
+        return "refused";
       case "revoke_stale_and_refuse":
         await this.revokeComputerLease(sessionId);
         // Process-wide bearer may still be live for other sessions; if this
@@ -3214,14 +3246,17 @@ export class AcpBridge implements GrokBridge {
           sessionId,
           message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
         });
-        return;
+        return "refused";
       case "attach":
         await this.attachComputerMcp(sessionId);
-        return;
+        return "ok";
     }
   }
 
   private async invokeComputerSessionExtensions(): Promise<ComputerSessionExtensions> {
+    if (!isComputerUseOperatorEnabled()) {
+      await this.refreshComputerUseHostEnv();
+    }
     return invoke<ComputerSessionExtensions>("computer_session_extensions", {
       operatorEnabled: isComputerUseOperatorEnabled(),
     });

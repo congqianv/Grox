@@ -435,7 +435,8 @@ export interface QueueOperationReceipt {
 }
 
 export interface InterjectResult {
-  state: "interjected" | "queued_head";
+  /** `refused` = Computer Use opt-in blocked the turn (no MCP, no queue). */
+  state: "interjected" | "queued_head" | "refused";
   message: string;
   fallback: boolean;
   entryId?: string;

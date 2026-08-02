@@ -3831,10 +3831,20 @@ Use only the grok_desktop_computer MCP tools for an explicit `/computer` or `@Co
 
 /// Product gate shared by the tauri command (unit-testable).
 fn computer_use_gate_open(operator_enabled: Option<bool>) -> bool {
-    let env_on = std::env::var("GROX_COMPUTER_USE")
+    computer_use_env_enabled() || operator_enabled == Some(true)
+}
+
+/// Advanced operator env flag (host process). Shared with FE via tauri command.
+fn computer_use_env_enabled() -> bool {
+    std::env::var("GROX_COMPUTER_USE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    operator_enabled == Some(true) || env_on
+        .unwrap_or(false)
+}
+
+/// FE probe so WebView opt-in matches Rust gate when only env is set (R4A-CU-03).
+#[tauri::command]
+fn computer_use_env_enabled_cmd() -> bool {
+    computer_use_env_enabled()
 }
 
 #[tauri::command]
@@ -6517,6 +6527,7 @@ fn main() {
             install_official_grok_cli,
             open_external,
             computer_session_extensions,
+            computer_use_env_enabled_cmd,
             computer_emergency_stop,
             computer_clear_emergency_stop,
             computer_revoke_http_auth,
@@ -6815,9 +6826,21 @@ api_key = "local-key"
     fn computer_use_gate_defaults_closed() {
         // Without env/opt-in the gate must refuse (no MCP serve).
         std::env::remove_var("GROX_COMPUTER_USE");
+        assert!(!computer_use_env_enabled());
         assert!(!computer_use_gate_open(None));
         assert!(!computer_use_gate_open(Some(false)));
         assert!(computer_use_gate_open(Some(true)));
+    }
+
+    #[test]
+    fn computer_use_env_opens_gate_without_operator_flag() {
+        std::env::remove_var("GROX_COMPUTER_USE");
+        assert!(!computer_use_gate_open(Some(false)));
+        std::env::set_var("GROX_COMPUTER_USE", "1");
+        assert!(computer_use_env_enabled());
+        assert!(computer_use_gate_open(Some(false)));
+        assert!(computer_use_gate_open(None));
+        std::env::remove_var("GROX_COMPUTER_USE");
     }
 
     #[test]

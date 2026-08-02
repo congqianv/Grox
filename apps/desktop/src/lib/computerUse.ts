@@ -1,9 +1,48 @@
 /** localStorage key for operator opt-in to Computer Use (desktop control). */
 export const COMPUTER_USE_STORAGE_KEY = "grox.computerUseEnabled";
 
+/** Process env name (desktop host + advanced operators). Mirrors Rust gate. */
+export const COMPUTER_USE_ENV_KEY = "GROX_COMPUTER_USE";
+
 /**
- * Computer Use requires explicit operator enablement (Settings toggle) or
- * process env GROX_COMPUTER_USE=1 (advanced). Default is off.
+ * Parse GROX_COMPUTER_USE-style values (`1` / `true`, case-insensitive).
+ * Pure — used by unit tests and host cache application.
+ */
+export function isComputerUseEnvFlag(value: string | null | undefined): boolean {
+  if (value == null) return false;
+  const v = value.trim();
+  return v === "1" || v.toLowerCase() === "true";
+}
+
+/** Host-process env cache (Tauri invoke); null = not yet refreshed. */
+let hostEnvEnabled: boolean | null = null;
+
+/** Apply host env probe result (from `computer_use_env_enabled` command). */
+export function setComputerUseHostEnvEnabled(enabled: boolean): void {
+  hostEnvEnabled = enabled;
+}
+
+/** Test/reset helper — clears host env cache. */
+export function resetComputerUseHostEnvCache(): void {
+  hostEnvEnabled = null;
+}
+
+function readProcessEnvComputerUse(): string | undefined {
+  try {
+    // Avoid Node types dependency in the desktop Vite tsconfig; probe globalThis.
+    const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } })
+      .process;
+    return proc?.env?.[COMPUTER_USE_ENV_KEY];
+  } catch {
+    /* browser */
+  }
+  return undefined;
+}
+
+/**
+ * Computer Use requires Settings toggle **or** host env GROX_COMPUTER_USE=1
+ * (advanced). Default is off. Host env is authoritative once refreshed via
+ * Tauri; process.env is used in Node/vitest and as a bootstrap fallback.
  */
 export function isComputerUseOperatorEnabled(): boolean {
   try {
@@ -13,6 +52,8 @@ export function isComputerUseOperatorEnabled(): boolean {
   } catch {
     /* private mode */
   }
+  if (hostEnvEnabled === true) return true;
+  if (isComputerUseEnvFlag(readProcessEnvComputerUse())) return true;
   return false;
 }
 
