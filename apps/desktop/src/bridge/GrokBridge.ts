@@ -168,4 +168,7 @@ export interface GrokBridge {
 
   renameSession(id: string, title: string): Promise<void>;
   deleteSession(id: string): Promise<void>;
+
+  /** Ctrl+Alt+Esc emergency stop for Windows Computer Use harness. */
+  emergencyStopComputer?(sessionId: string): Promise<void>;
 }

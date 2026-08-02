@@ -6,6 +6,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod computer_mcp;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
@@ -140,6 +142,42 @@ struct WorkspaceEntry {
     path: String,
     name: String,
     is_dir: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaGenerationRequest {
+    kind: String,
+    prompt: String,
+    aspect: String,
+    count: u8,
+    duration: u16,
+    resolution: String,
+    reference_path: Option<String>,
+    cwd: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaArtifact {
+    path: Option<String>,
+    url: Option<String>,
+    mime: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaGenerationResult {
+    artifacts: Vec<MediaArtifact>,
+    summary: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ComputerSessionExtensions {
+    mcp_servers: Vec<serde_json::Value>,
+    plugin_dirs: Vec<String>,
+    lease_id: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -316,6 +354,12 @@ struct OpenAiModelsResponse {
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_WORKSPACE_ENTRIES: usize = 2_000;
+const UPSTREAM_CLI_CLIENT_NAME: &str = "grok-shell";
+const PROVIDER_ENV_KEYS: [&str; 3] = [
+    "XAI_API_KEY",
+    "GROK_MODELS_BASE_URL",
+    "GROK_MODELS_LIST_URL",
+];
 static CONFIG_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn path_for_webview(path: &Path) -> String {
@@ -746,6 +790,198 @@ fn parse_env_file(path: &Path) -> BTreeMap<String, String> {
         })
         .collect()
 }
+
+
+fn parse_grox_managed_provider_env(path: &Path) -> BTreeMap<String, String> {
+    let Ok(content) = read_bounded_text(path, MAX_CONFIG_BYTES) else {
+        return BTreeMap::new();
+    };
+    let start = "# >>> Grox managed provider";
+    let end = "# <<< Grox managed provider";
+    let Some((_, after_start)) = content.split_once(start) else {
+        return BTreeMap::new();
+    };
+    let Some((block, _)) = after_start.split_once(end) else {
+        return BTreeMap::new();
+    };
+    block
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, raw_value) = line.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty()
+                || !key
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            {
+                return None;
+            }
+            let value = raw_value.trim();
+            let value = if value.len() >= 2
+                && ((value.starts_with('"') && value.ends_with('"'))
+                    || (value.starts_with('\'') && value.ends_with('\'')))
+            {
+                &value[1..value.len() - 1]
+            } else {
+                value
+            };
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// Start CLI children from a clean provider environment, then re-apply only the
+/// Grox-managed provider block from ~/.grok/.env.
+fn apply_grox_provider_environment(command: &mut Command) {
+    for key in PROVIDER_ENV_KEYS {
+        command.env_remove(key);
+    }
+    let Ok(home) = grok_home() else {
+        return;
+    };
+    let values = parse_grox_managed_provider_env(&home.join(".env"));
+    for key in PROVIDER_ENV_KEYS {
+        if let Some(value) = values.get(key) {
+            command.env(key, value);
+        }
+    }
+}
+
+fn checked_media_prompt(request: &MediaGenerationRequest) -> Result<String, String> {
+    let prompt = request.prompt.trim();
+    if prompt.is_empty() || prompt.chars().count() > 4_000 {
+        return Err("媒体提示词必须为 1–4000 个字符".into());
+    }
+    let aspect = match request.aspect.as_str() {
+        "1:1" | "16:9" | "9:16" | "4:3" => request.aspect.as_str(),
+        _ => return Err("不支持的画面比例".into()),
+    };
+    let instruction = match request.kind.as_str() {
+        "image" => format!(
+            "必须调用内置 image_gen 工具真实生成 {count} 张图片。画面比例 {aspect}。生成完成后仅列出每个实际输出文件的绝对路径或 URL。用户提示：{prompt}",
+            count = request.count.clamp(1, 4)
+        ),
+        "video" => {
+            let reference = request.reference_path.as_deref()
+                .map(|path| format!("参考图片绝对路径：{path}。必须使用 image_to_video 或 reference_to_video。"))
+                .unwrap_or_else(|| "必须使用 video_gen。".to_string());
+            format!(
+                "{reference}真实生成视频，画面比例 {aspect}，时长 {duration} 秒，分辨率 {resolution}。生成完成后仅列出实际输出文件的绝对路径或 URL。用户提示：{prompt}",
+                duration = request.duration.clamp(1, 30),
+                resolution = request.resolution
+            )
+        }
+        _ => return Err("不支持的媒体类型".into()),
+    };
+    Ok(instruction)
+}
+
+fn extract_media_artifacts(output: &str, cwd: &Path) -> Result<Vec<MediaArtifact>, String> {
+    let mut candidates = Vec::new();
+    for line in output.lines() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            collect_media_strings(&value, &mut candidates);
+        } else {
+            candidates.extend(line.split_whitespace().map(|value| {
+                value
+                    .trim_matches(|c| matches!(c, '"' | '\'' | ',' | ')' | '('))
+                    .to_string()
+            }));
+        }
+    }
+    let mut artifacts = Vec::new();
+    for candidate in candidates {
+        let clean = candidate.trim().trim_matches('"');
+        let lower = clean.to_ascii_lowercase();
+        let mime = if lower.contains(".png") {
+            "image/png"
+        } else if lower.contains(".jpg") || lower.contains(".jpeg") {
+            "image/jpeg"
+        } else if lower.contains(".webp") {
+            "image/webp"
+        } else if lower.contains(".mp4") {
+            "video/mp4"
+        } else if lower.contains(".webm") {
+            "video/webm"
+        } else {
+            continue;
+        };
+        if clean.starts_with("https://")
+            || clean.starts_with("http://localhost")
+            || clean.starts_with("http://127.0.0.1")
+        {
+            artifacts.push(MediaArtifact {
+                path: None,
+                url: Some(clean.to_string()),
+                mime: mime.into(),
+            });
+            continue;
+        }
+        let path = PathBuf::from(clean);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        if path.is_file() {
+            let display = path_for_webview(&path);
+            if !artifacts
+                .iter()
+                .any(|item| item.path.as_deref() == Some(&display))
+            {
+                artifacts.push(MediaArtifact {
+                    path: Some(display),
+                    url: None,
+                    mime: mime.into(),
+                });
+            }
+        }
+    }
+    Ok(artifacts)
+}
+
+fn collect_media_strings(value: &serde_json::Value, output: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) => output.push(value.clone()),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .for_each(|value| collect_media_strings(value, output)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .for_each(|value| collect_media_strings(value, output)),
+        _ => {}
+    }
+}
+
+/// Reveal one workspace file in the platform file manager.
+#[tauri::command]
+fn reveal_in_explorer(cwd: String, path: String) -> Result<(), String> {
+    let root = checked_workspace(&cwd)?;
+    let file = checked_workspace_file(&root, &path)?;
+    #[cfg(windows)]
+    std::process::Command::new("explorer.exe")
+        .arg("/select,")
+        .arg(&file)
+        .spawn()
+        .map_err(|error| format!("无法打开资源管理器：{error}"))?;
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open")
+        .arg("-R")
+        .arg(&file)
+        .spawn()
+        .map_err(|error| format!("无法在 Finder 中显示文件：{error}"))?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    std::process::Command::new("xdg-open")
+        .arg(file.parent().unwrap_or(&file))
+        .spawn()
+        .map_err(|error| format!("无法打开文件管理器：{error}"))?;
+    Ok(())
+}
+
 
 fn checked_workspace_file(workspace: &Path, requested: &str) -> Result<PathBuf, String> {
     let candidate = PathBuf::from(requested);
@@ -3408,6 +3644,226 @@ fn open_file_with_dialog(cwd: String, path: String) -> Result<(), String> {
 
 // ===== END UPSTREAM PORT =====
 
+
+fn ensure_computer_plugin() -> Result<PathBuf, String> {
+    let root = grok_home()?.join("plugins").join("grox-computer-use");
+    let skill = root.join("skills").join("computer");
+    fs::create_dir_all(&skill).map_err(|error| format!("无法创建 Computer Use Skill：{error}"))?;
+    fs::write(
+        root.join("plugin.json"),
+        r#"{"name":"grox-desktop-computer-use","version":"0.3.1","description":"Grox Windows foreground Computer Use harness"}"#,
+    )
+    .map_err(|error| format!("无法写入 Computer Use Plugin：{error}"))?;
+    fs::write(
+        skill.join("SKILL.md"),
+        r#"---
+name: computer
+description: Use Grox's experimental Windows foreground Computer Use harness only when the user explicitly asks for visual desktop control or uses @Computer.
+---
+
+# Grox Computer Use
+
+Use only the grok_desktop_computer MCP tools for an explicit `/computer` or `@Computer` request. Start with `list_apps`/`list_windows`, select an exact controllable window with `start`, then repeat observation → exactly one action → observation. Every state-changing action must use the latest `stateId`; stale state must be rejected. Screenshot and element coordinates are local to the selected window and are clamped to that window. Prefer UI Automation `elementId` and `set_value` when available. Use `deltaX` for horizontal scrolling and `deltaY` for vertical scrolling. Never control Grox, terminals, UAC, Windows Security, a higher-integrity window, or the secure desktop. A permanent `elevation-blocked` result cannot be resumed; ask the user to restart the target without administrator privileges or run Grox at matching integrity. Use `stop` immediately when the user asks. Emergency stop is sticky: the agent must not attempt `start` again, and only an explicit user reload/new session may re-arm control.
+"#,
+    )
+    .map_err(|error| format!("无法写入 Computer Use Skill：{error}"))?;
+    Ok(root)
+}
+
+#[tauri::command]
+fn computer_session_extensions() -> Result<ComputerSessionExtensions, String> {
+    let mut lease_bytes = [0_u8; 16];
+    getrandom::fill(&mut lease_bytes)
+        .map_err(|error| format!("无法创建 Computer Use 租约：{error}"))?;
+    let lease_id = lease_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    computer_mcp::clear_emergency_stop(&lease_id)?;
+    // The foreground harness is intentionally Windows-only.  Do not advertise
+    // an HTTP MCP server on macOS/Linux: the CLI would repeatedly attempt a
+    // handshake and surface a misleading "MCP transport error" to users.
+    if !cfg!(target_os = "windows") {
+        return Ok(ComputerSessionExtensions {
+            mcp_servers: Vec::new(),
+            plugin_dirs: Vec::new(),
+            lease_id,
+        });
+    }
+    let plugin = ensure_computer_plugin()?;
+    let endpoint = computer_mcp::serve_http(lease_id.clone())?;
+    Ok(ComputerSessionExtensions {
+        mcp_servers: vec![serde_json::json!({
+            "type": "http",
+            "name": "grok_desktop_computer",
+            "url": endpoint.url,
+            "headers": [{
+                "name": "Authorization",
+                "value": format!("Bearer {}", endpoint.token)
+            }]
+        })],
+        plugin_dirs: vec![path_for_webview(&plugin)],
+        lease_id,
+    })
+}
+
+#[tauri::command]
+fn computer_emergency_stop(lease_id: String) -> Result<(), String> {
+    computer_mcp::mark_emergency_stop(&lease_id)
+}
+
+#[tauri::command]
+fn computer_clear_emergency_stop(lease_id: String) -> Result<(), String> {
+    computer_mcp::clear_emergency_stop(&lease_id)
+}
+
+#[cfg(windows)]
+fn register_computer_emergency_shortcut(app: tauri::AppHandle) {
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::{
+            Input::KeyboardAndMouse::{
+                RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
+                MOD_NOREPEAT, VK_ESCAPE,
+            },
+            WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY},
+        };
+
+        const HOTKEY_ID: i32 = 0x4752;
+        let modifiers = HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_CONTROL.0 | MOD_NOREPEAT.0);
+        if RegisterHotKey(HWND::default(), HOTKEY_ID, modifiers, VK_ESCAPE.0 as u32).is_err() {
+            let _ = app.emit("computer-emergency-shortcut-status", false);
+            return;
+        }
+        let _ = app.emit("computer-emergency-shortcut-status", true);
+        let mut message = MSG::default();
+        while GetMessageW(&mut message, HWND::default(), 0, 0).0 > 0 {
+            if message.message == WM_HOTKEY && message.wParam.0 == HOTKEY_ID as usize {
+                let _ = app.emit("computer-emergency-shortcut", ());
+            }
+        }
+        let _ = UnregisterHotKey(HWND::default(), HOTKEY_ID);
+    });
+}
+
+#[cfg(not(windows))]
+fn register_computer_emergency_shortcut(app: tauri::AppHandle) {
+    let _ = app.emit("computer-emergency-shortcut-status", false);
+}
+
+#[tauri::command]
+fn save_media_reference(cwd: String, name: String, data: String) -> Result<String, String> {
+    let cwd = checked_workspace(&cwd)?;
+    let extension = Path::new(&name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or("参考图片缺少扩展名")?;
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+        return Err("参考图片仅支持 PNG、JPEG 或 WebP".into());
+    }
+    if data.len() > 32 * 1024 * 1024 {
+        return Err("参考图片不能超过 24 MB".into());
+    }
+    let payload = data
+        .rsplit_once(',')
+        .map(|(_, value)| value)
+        .unwrap_or(&data);
+    let bytes = BASE64
+        .decode(payload)
+        .map_err(|error| format!("参考图片编码无效：{error}"))?;
+    let directory = cwd.join(".grox").join("media-input");
+    fs::create_dir_all(&directory).map_err(|error| format!("无法创建媒体输入目录：{error}"))?;
+    let path = directory.join(format!(
+        "reference-{}-{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        extension
+    ));
+    fs::write(&path, bytes).map_err(|error| format!("无法保存参考图片：{error}"))?;
+    Ok(path_for_webview(&path))
+}
+
+#[tauri::command]
+async fn generate_media(
+    app: tauri::AppHandle,
+    request: MediaGenerationRequest,
+) -> Result<MediaGenerationResult, String> {
+    let cwd = checked_workspace(&request.cwd)?;
+    let prompt = checked_media_prompt(&request)?;
+    let runtime = configured_grok_command(&app);
+    let mut command = Command::new(&runtime.path);
+    command
+        .arg("--single")
+        .arg(&prompt)
+        .args(["--output-format", "streaming-json", "--always-approve"])
+        .args([
+            "--tools",
+            "image_gen,video_gen,image_to_video,reference_to_video",
+        ])
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // Keep media generation on the same authentication path as a terminal
+    // invocation. API variables are added only for the provider explicitly
+    // managed by Grox; OAuth gets a clean official CLI environment.
+    command.env("GROK_CLIENT_NAME", UPSTREAM_CLI_CLIENT_NAME);
+    apply_grox_provider_environment(&mut command);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(600), command.output())
+        .await
+        .map_err(|_| "媒体生成超过 10 分钟，任务已终止".to_string())?
+        .map_err(|error| format!("无法启动 Grok Build 媒体生成：{error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if stderr.trim().is_empty() {
+            stdout.as_ref()
+        } else {
+            stderr.as_ref()
+        };
+        return Err(format!(
+            "Grok Build 媒体生成失败：{}",
+            detail.trim().chars().take(4_000).collect::<String>()
+        ));
+    }
+    let artifacts = extract_media_artifacts(&stdout, &cwd)?;
+    if artifacts.is_empty() {
+        return Err(format!(
+            "Grok Build 已结束，但未返回媒体产物：{}",
+            stdout
+                .trim()
+                .chars()
+                .rev()
+                .take(2_000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        ));
+    }
+    for artifact in &artifacts {
+        if let Some(path) = artifact.path.as_deref() {
+            app.asset_protocol_scope()
+                .allow_file(PathBuf::from(path))
+                .map_err(|error| format!("无法授权媒体预览：{error}"))?;
+        }
+    }
+    Ok(MediaGenerationResult {
+        artifacts,
+        summary: format!("Grok Build 已生成 {} 个媒体产物", request.count),
+    })
+}
+
 /// Paths the user removed from the desktop sidebar.
 /// Stored under ~/.grok so it survives app reinstall (WebView localStorage does not).
 fn hidden_projects_path() -> Result<PathBuf, String> {
@@ -5255,10 +5711,25 @@ async fn acp_spawn(
     }
 
     let runtime = configured_grok_command(&app);
+    let computer_plugin = if cfg!(target_os = "windows") {
+        match ensure_computer_plugin() {
+            Ok(path) => Some(path),
+            Err(error) => {
+                eprintln!("grox: Computer Use Plugin 初始化失败：{error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let command_path = PathBuf::from(&runtime.path);
     let mut command = Command::new(&command_path);
+    command.arg("agent");
+    if let Some(plugin) = computer_plugin.as_ref() {
+        command.arg("--plugin-dir").arg(plugin);
+    }
     command
-        .args(["agent", "--leader", "--reasoning-effort", "high", "stdio"])
+        .args(["--leader", "--reasoning-effort", "high", "stdio"])
         .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -5584,11 +6055,27 @@ fn install_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 fn main() {
+    let process_args = std::env::args().collect::<Vec<_>>();
+    if process_args
+        .iter()
+        .any(|argument| argument == "--computer-mcp")
+    {
+        let lease_id = process_args
+            .windows(2)
+            .find(|pair| pair[0] == "--computer-lease")
+            .map(|pair| pair[1].clone());
+        if let Err(error) = computer_mcp::run(lease_id) {
+            eprintln!("grox-computer-mcp: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     tauri::Builder::default()
         .manage(Arc::new(AcpState::default()))
         .manage(Arc::new(PreviewState::default()))
         .setup(|app| {
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
+            register_computer_emergency_shortcut(app.handle().clone());
             if let Err(error) = install_app_menu(app.handle()) {
                 eprintln!("failed to install app menu: {error}");
             }
@@ -5666,6 +6153,12 @@ fn main() {
             set_grok_runtime_preference,
             install_official_grok_cli,
             open_external,
+            computer_session_extensions,
+            computer_emergency_stop,
+            computer_clear_emergency_stop,
+            save_media_reference,
+            generate_media,
+            reveal_in_explorer,
             check_app_update,
             install_app_update,
             start_project_preview,

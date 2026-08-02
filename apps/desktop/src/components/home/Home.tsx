@@ -27,6 +27,7 @@ import { Icon } from "../fx/Icon";
 import { ChipSelect } from "../common/ChipSelect";
 import { PromptOptionsMenu, ProviderSwitcher } from "../common/PromptControls";
 import { useI18n } from "../../lib/i18n";
+import { MediaStudio } from "./MediaStudio";
 
 const EMPTY_FILES: WorkspaceEntry[] = [];
 
@@ -38,6 +39,9 @@ function attachmentLabel(attachment: PromptAttachment): string {
 export function Home() {
   const { language, t } = useI18n();
   const zh = language === "zh-CN";
+  const [workspaceMode, setWorkspaceMode] = useState<"conversation" | "image" | "video">(
+    "conversation",
+  );
   const [q, setQ] = useState("");
   const [cursor, setCursor] = useState(0);
   const [atIdx, setAtIdx] = useState(0);
@@ -253,9 +257,19 @@ export function Home() {
 
   const currentModel = models.find((item) => item.id === model);
 
+  if (workspaceMode !== "conversation") {
+    return (
+      <div className="relative flex min-h-0 flex-1 flex-col bg-base">
+        <WorkspaceTabs mode={workspaceMode} onChange={setWorkspaceMode} />
+        <MediaStudio mode={workspaceMode} />
+      </div>
+    );
+  }
+
   return (
     <div className="relative flex-1 overflow-hidden bg-base">
       <Starfield />
+      <WorkspaceTabs mode={workspaceMode} onChange={setWorkspaceMode} />
 
       <div className="relative flex h-full flex-col items-center justify-center px-8 pb-16">
         <BlackHole size={88} spin="slow" />
@@ -471,6 +485,46 @@ export function Home() {
         <span className="max-w-[60%] truncate text-[12px] text-faint">{workspace}</span>
         <span className="text-[12px] text-faint">⌘K {zh ? "命令" : "Commands"} · ⌘N {t("newProject")}</span>
       </div>
+    </div>
+  );
+}
+
+function WorkspaceTabs({
+  mode,
+  onChange,
+}: {
+  mode: "conversation" | "image" | "video";
+  onChange(mode: "conversation" | "image" | "video"): void;
+}) {
+  const { language } = useI18n();
+  const zh = language === "zh-CN";
+  return (
+    <div className="absolute left-1/2 top-4 z-10 flex -translate-x-1/2 items-center gap-1 rounded-[6px] border border-line2 bg-panel/90 p-1 shadow-lg backdrop-blur">
+      {(
+        [
+          ["conversation", zh ? "对话" : "CHAT"],
+          ["image", zh ? "图片" : "IMAGE"],
+          ["video", zh ? "视频" : "VIDEO"],
+        ] as const
+      ).map(([id, label]) => (
+        <button
+          key={id}
+          type="button"
+          onClick={() => onChange(id)}
+          className={`flex h-7 items-center gap-1.5 rounded-[4px] px-3 font-mono text-[9.5px] tracking-[0.08em] transition-colors ${
+            mode === id ? "bg-acc text-base" : "text-dim hover:bg-high hover:text-fg2"
+          }`}
+        >
+          {id === "conversation" ? (
+            <Icon name="command" size={10} />
+          ) : id === "image" ? (
+            <Icon name="layers" size={10} />
+          ) : (
+            <Icon name="play" size={10} />
+          )}
+          {label}
+        </button>
+      ))}
     </div>
   );
 }

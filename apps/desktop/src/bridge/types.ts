@@ -33,6 +33,7 @@ export type ToolKind =
   | "video_gen"
   | "image_to_video"
   | "reference_to_video"
+  | "computer"
   | "deploy_app"
   | "search_tool"
   | "use_tool"
