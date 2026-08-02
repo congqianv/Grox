@@ -1215,25 +1215,48 @@ export const useDesktop = create<DesktopState>((set, get) => {
         }, 0);
         break;
       case "agent_reconnected": {
-        // Crash recovery finished — ensure every live session is idle and
-        // re-attempt local queue drain (prompts that started during reconnect
-        // may have failed bind; others may still be queued).
-        // R14: drop stuck in-flight claims so drain is not permanently blocked
-        // if a sendPrompt finally never ran after agent death.
-        promptInFlightSessions.clear();
+        // Crash recovery finished. Re-home CLI queue rows (new agent has empty
+        // server queue) and only force-idle sessions that are not mid sendPrompt
+        // IIFE — clearing in-flight while an await-ready turn is live causes dual-send.
+        const queues = get().promptQueues;
+        const nextQueues: typeof queues = {};
+        for (const [id, entries] of Object.entries(queues)) {
+          nextQueues[id] = entries.map((entry) => ({
+            ...entry,
+            source: "local" as const,
+            state: entry.state === "sending" ? ("queued" as const) : entry.state,
+          }));
+        }
         const live = get().sessions;
         const next: typeof live = {};
         for (const [id, session] of Object.entries(live)) {
+          if (promptInFlightSessions.has(id)) {
+            // Live IIFE owns this session — leave status; its finally will clear.
+            next[id] = session;
+            continue;
+          }
           next[id] =
             session.status === "running" ||
             session.status === "awaiting_permission" ||
             session.status === "awaiting_input"
-              ? { ...session, status: "idle" }
+              ? {
+                  ...session,
+                  status: "idle",
+                  // Stale permission/question cards are no longer actionable.
+                  blocks: session.blocks.map((block) =>
+                    block.type === "permission" && !block.resolved
+                      ? { ...block, resolved: "deny" as const }
+                      : block.type === "question" && !block.response
+                        ? { ...block, response: { outcome: "cancelled" as const } }
+                        : block,
+                  ),
+                }
               : session;
         }
-        set({ sessions: next });
+        set({ sessions: next, promptQueues: nextQueues });
         window.setTimeout(() => {
           for (const id of Object.keys(get().sessions)) {
+            if (promptInFlightSessions.has(id)) continue;
             flushPendingOfflineMerge(id);
             drainPromptQueue(id);
           }

@@ -815,8 +815,19 @@ export class AcpBridge implements GrokBridge {
   /** Crash auto-reconnect budget for the current agent life. */
   private reconnectAttempts = 0;
   private reconnectTimer: number | undefined;
+  /** Resolve the in-flight reconnect delay when cancelled (provider switch etc.). */
+  private reconnectDelayResolve: (() => void) | null = null;
   /** True while crash auto-reconnect owns `ready` (prompt/drain must wait). */
   private crashReconnectInFlight = false;
+  /**
+   * Bumped on intentional restart so an in-flight runCrashReconnect aborts
+   * instead of racing ready or sticking crashReconnectInFlight.
+   */
+  private reconnectEpoch = 0;
+  /** Child died again while crash-reconnect was still finishing success path. */
+  private reconnectChildDied = false;
+  /** When true, restartAgentInner must not steal `ready` from runCrashReconnect. */
+  private restartFromCrashReconnect = false;
   /**
    * Scheme C + visit memory:
    * 1) Always prefer full-load of the active mission if unbound.
@@ -1431,12 +1442,29 @@ export class AcpBridge implements GrokBridge {
     return run;
   }
 
-  private async restartAgentInner(): Promise<void> {
-    this.suppressExitHandling = true;
+  /** Wake any crash-reconnect backoff waiter and drop the timer. */
+  private cancelReconnectDelay(): void {
     if (this.reconnectTimer !== undefined) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
+    if (this.reconnectDelayResolve) {
+      const resolve = this.reconnectDelayResolve;
+      this.reconnectDelayResolve = null;
+      resolve();
+    }
+  }
+
+  private async restartAgentInner(): Promise<void> {
+    const fromCrash = this.restartFromCrashReconnect;
+    this.suppressExitHandling = true;
+    // Intentional restart (provider switch / logout) aborts crash-reconnect ownership.
+    if (!fromCrash) {
+      this.reconnectEpoch += 1;
+      this.crashReconnectInFlight = false;
+      this.reconnectChildDied = false;
+    }
+    this.cancelReconnectDelay();
     try {
       this.flushStreamAppends();
       this.flushToolPatches();
@@ -1458,9 +1486,14 @@ export class AcpBridge implements GrokBridge {
       this.authMethodId = undefined;
       this.modelState = { models: MODELS, currentId: MODELS[0].id };
       const next = this.initializeAgent();
-      this.ready = next;
+      // Crash-reconnect owns `ready` for the full attempt budget — do not overwrite
+      // with a rejected init mid-retry (R14.1 B1).
+      if (!fromCrash) {
+        this.ready = next;
+      }
       await next;
       this.reconnectAttempts = 0;
+      this.reconnectChildDied = false;
     } finally {
       this.suppressExitHandling = false;
     }
@@ -1520,10 +1553,16 @@ export class AcpBridge implements GrokBridge {
   private onExit(payload: ExitPayload) {
     // Exit from a process we are intentionally replacing (restart/spawn).
     if (this.suppressExitHandling) {
+      // Child died under suppress — if crash-reconnect just spawned, force another try.
+      if (this.crashReconnectInFlight && payload.reason !== "killed") {
+        this.reconnectChildDied = true;
+      }
       return;
     }
     this.flushStreamAppends();
     this.flushToolPatches();
+    // Drop permission/question RPCs immediately so UI cannot sendRaw to a corpse.
+    this.interactions.clear();
     // Intentional stop (acp_kill) still must clear bind/lease state.
     if (payload.reason === "killed") {
       for (const request of this.pending.values()) {
@@ -1532,6 +1571,9 @@ export class AcpBridge implements GrokBridge {
       }
       this.pending.clear();
       this.resetBindStateAfterAgentExit();
+      this.reconnectEpoch += 1;
+      this.crashReconnectInFlight = false;
+      this.cancelReconnectDelay();
       // Park ready on a rejected promise so send/drain cannot talk to a dead child.
       const stopped = new Error("Grok Agent 已停止");
       this.ready = Promise.reject(stopped);
@@ -1563,24 +1605,35 @@ export class AcpBridge implements GrokBridge {
     for (const sessionId of bound) {
       this.emit({ type: "error", sessionId, message });
     }
-    // Park `ready` on the reconnect promise so queue drain / prompt cannot race
-    // a dead stdio child while the 800ms backoff runs (R12).
-    if (!this.crashReconnectInFlight) {
-      this.crashReconnectInFlight = true;
-      this.ready = this.runCrashReconnect(message).finally(() => {
-        this.crashReconnectInFlight = false;
-      });
-      void this.ready.catch(() => undefined);
+    // Second death while reconnect is already running: force another attempt.
+    if (this.crashReconnectInFlight) {
+      this.reconnectChildDied = true;
+      return;
     }
+    // Park `ready` on the reconnect promise so queue drain / prompt cannot race
+    // a dead stdio child while the 800ms backoff runs (R12 / R14.1).
+    this.crashReconnectInFlight = true;
+    this.reconnectChildDied = false;
+    const epoch = this.reconnectEpoch;
+    this.ready = this.runCrashReconnect(message, epoch).finally(() => {
+      if (this.reconnectEpoch === epoch) {
+        this.crashReconnectInFlight = false;
+      }
+    });
+    void this.ready.catch(() => undefined);
   }
 
   /**
    * Auto-reconnect after unexpected agent exit. Owns `this.ready` for the full
    * attempt budget so concurrent prompt/drain await the live child.
    */
-  private async runCrashReconnect(lastMessage: string): Promise<void> {
+  private async runCrashReconnect(lastMessage: string, epoch: number): Promise<void> {
     let lastError = lastMessage;
     while (this.reconnectAttempts < 2) {
+      if (this.reconnectEpoch !== epoch) {
+        // Intentional restart took over ready — exit quietly.
+        return;
+      }
       this.reconnectAttempts += 1;
       const attempt = this.reconnectAttempts;
       const delayMs = 800 * attempt;
@@ -1590,18 +1643,44 @@ export class AcpBridge implements GrokBridge {
         error: `Agent 异常退出，正在自动重连（${attempt}/2）…`,
       });
       await new Promise<void>((resolve) => {
+        this.reconnectDelayResolve = () => {
+          this.reconnectDelayResolve = null;
+          resolve();
+        };
         this.reconnectTimer = window.setTimeout(() => {
           this.reconnectTimer = undefined;
-          resolve();
+          const done = this.reconnectDelayResolve;
+          this.reconnectDelayResolve = null;
+          done?.();
         }, delayMs);
       });
+      if (this.reconnectEpoch !== epoch) {
+        return;
+      }
       try {
-        await this.restartAgent();
+        this.reconnectChildDied = false;
+        this.restartFromCrashReconnect = true;
+        try {
+          await this.restartAgent();
+        } finally {
+          this.restartFromCrashReconnect = false;
+        }
+        if (this.reconnectEpoch !== epoch) {
+          return;
+        }
+        // Child exited again before we published success — count as failed attempt.
+        if (this.reconnectChildDied) {
+          lastError = "Agent 在重连后再次退出";
+          this.reconnectChildDied = false;
+          continue;
+        }
         this.setAuthState({
           ...this.authState,
           error: undefined,
           inProgress: false,
         });
+        // Publish a settled ready marker (outer promise is about to resolve too).
+        this.ready = Promise.resolve();
         // Rebind active mission in the background so the next send is cheap.
         const active = this.activeSessionId();
         if (active) {
@@ -1625,13 +1704,19 @@ export class AcpBridge implements GrokBridge {
         lastError = errorText(error);
       }
     }
+    if (this.reconnectEpoch !== epoch) {
+      return;
+    }
     const finalMessage = `${lastError}（已自动重连 2 次仍失败，请重启 Grox 或检查 Grok CLI）`;
     this.setAuthState({
       required: this.authState.required,
       inProgress: false,
       error: finalMessage,
     });
-    throw new Error(finalMessage);
+    const fail = new Error(finalMessage);
+    this.ready = Promise.reject(fail);
+    void this.ready.catch(() => undefined);
+    throw fail;
   }
 
   private onLine(line: string) {
@@ -3108,7 +3193,8 @@ export class AcpBridge implements GrokBridge {
       // Refuse (opt-in off) aborts the turn — do not session/prompt (R4A-CU-02).
       const cu = await this.ensureComputerAttachedForPrompt(sessionId, text);
       if (cu === "refused") {
-        return;
+        // Throw so store can restore draft + pop optimistic bubble (busy-queue parity).
+        throw new Error(COMPUTER_USE_OPT_IN_REFUSE_MESSAGE);
       }
       const previous = this.sessionOptions.get(sessionId);
       if (!previous || previous.model !== options.model || previous.effort !== options.effort) {
@@ -3140,7 +3226,16 @@ export class AcpBridge implements GrokBridge {
       if (promptUsage) this.emitUsage(sessionId, promptUsage);
       await this.refreshSessionInfo(sessionId);
     } catch (error) {
-      this.emit({ type: "error", sessionId, message: errorText(error) });
+      const detail = errorText(error);
+      this.emit({ type: "error", sessionId, message: detail });
+      // Propagate CU refuse so the store restores composer draft + pops the
+      // optimistic user bubble (mirrors busy-queue CU refuse path).
+      if (
+        detail === COMPUTER_USE_OPT_IN_REFUSE_MESSAGE
+        || /computer\s*use|GROX_COMPUTER_USE|未启用/i.test(detail)
+      ) {
+        throw error instanceof Error ? error : new Error(detail);
+      }
     } finally {
       this.finishTurn(sessionId);
     }

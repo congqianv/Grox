@@ -438,7 +438,36 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
     atomic_write_bytes(path, content, MAX_CONFIG_BYTES)
 }
 
+/// Replace `dest` with `temp` without deleting `dest` first (crash-safe).
+#[cfg(windows)]
+fn replace_file_atomic(temp: &Path, dest: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let src: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let dst: Vec<u16> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(src.as_ptr()),
+            PCWSTR(dst.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+        .map_err(|error| format!("无法替换 {}：{error}", dest.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomic(temp: &Path, dest: &Path) -> Result<(), String> {
+    // Unix rename replaces atomically when dest exists.
+    fs::rename(temp, dest).map_err(|error| format!("无法保存 {}：{error}", dest.display()))
+}
+
 /// Atomic write with an explicit size cap (session UI transcripts can exceed 4MB).
+/// R14.1: never delete the destination before rename — on failure the original stays.
 fn atomic_write_bytes(path: &Path, content: &str, max_bytes: u64) -> Result<(), String> {
     if content.len() as u64 > max_bytes {
         return Err(format!(
@@ -476,11 +505,11 @@ fn atomic_write_bytes(path: &Path, content: &str, max_bytes: u64) -> Result<(), 
             return Err(format!("无法写入 {}：{error}", temp.display()));
         }
     }
-    if path.exists() {
-        fs::remove_file(path)
-            .map_err(|error| format!("无法替换 {}：{error}", path.display()))?;
+    if let Err(error) = replace_file_atomic(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
     }
-    fs::rename(&temp, path).map_err(|error| format!("无法保存 {}：{error}", path.display()))
+    Ok(())
 }
 
 fn file_size_mtime_ms(path: &Path) -> Option<(u64, u64)> {
@@ -6120,6 +6149,125 @@ fn enrich_tools_from_chat_history(dir: &Path, blocks: &mut [serde_json::Value]) 
     }
 }
 
+/// Placeholder written into Settings drafts so WebView never holds real API keys.
+const CONFIG_SECRET_REDACTED: &str = "********";
+
+fn is_redacted_config_secret(value: &str) -> bool {
+    let v = value.trim().trim_matches('"').trim_matches('\'');
+    v.is_empty()
+        || v == CONFIG_SECRET_REDACTED
+        || v == "[REDACTED]"
+        || v == "[dpapi-sealed]"
+        || v.contains('…')
+}
+
+/// Strip `api_key = "..."` / env-style key lines before config content enters the WebView.
+fn redact_config_document_secrets(content: &str) -> String {
+    content
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            // TOML: api_key = "sk-..."
+            if let Some(rest) = trimmed
+                .strip_prefix("api_key")
+                .or_else(|| trimmed.strip_prefix("API_KEY"))
+            {
+                let rest = rest.trim_start();
+                if rest.starts_with('=') {
+                    let indent_len = line.len() - trimmed.len();
+                    let indent = &line[..indent_len];
+                    return format!("{indent}api_key = \"{CONFIG_SECRET_REDACTED}\"");
+                }
+            }
+            // Rare dotenv-in-toml mistakes
+            if let Some((key, _)) = trimmed.split_once('=') {
+                let key = key.trim();
+                if key.eq_ignore_ascii_case("XAI_API_KEY")
+                    || key.eq_ignore_ascii_case("OPENAI_API_KEY")
+                    || key.eq_ignore_ascii_case("ANTHROPIC_API_KEY")
+                {
+                    let indent_len = line.len() - trimmed.len();
+                    let indent = &line[..indent_len];
+                    return format!("{indent}{key}={CONFIG_SECRET_REDACTED}");
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// When the operator saves a redacted draft, keep prior secret values from disk.
+fn merge_config_secrets_from_existing(existing: &str, incoming: &str) -> String {
+    let mut prior_api_keys: Vec<String> = Vec::new();
+    let mut prior_env: BTreeMap<String, String> = BTreeMap::new();
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("api_key") {
+            let rest = rest.trim_start();
+            if let Some(val) = rest.strip_prefix('=') {
+                let val = val.trim().trim_matches('"').trim_matches('\'');
+                if !is_redacted_config_secret(val) {
+                    prior_api_keys.push(val.to_string());
+                }
+            }
+        }
+        if let Some((key, raw)) = trimmed.split_once('=') {
+            let key = key.trim();
+            if key.eq_ignore_ascii_case("XAI_API_KEY")
+                || key.eq_ignore_ascii_case("OPENAI_API_KEY")
+                || key.eq_ignore_ascii_case("ANTHROPIC_API_KEY")
+            {
+                let val = raw.trim().trim_matches('"').trim_matches('\'');
+                if !is_redacted_config_secret(val) {
+                    prior_env.insert(key.to_string(), val.to_string());
+                }
+            }
+        }
+    }
+    let mut api_idx = 0usize;
+    incoming
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("api_key") {
+                let rest = rest.trim_start();
+                if let Some(val) = rest.strip_prefix('=') {
+                    let val = val.trim().trim_matches('"').trim_matches('\'');
+                    if is_redacted_config_secret(val) {
+                        if let Some(real) = prior_api_keys.get(api_idx) {
+                            api_idx += 1;
+                            let indent_len = line.len() - trimmed.len();
+                            let indent = &line[..indent_len];
+                            return format!("{indent}api_key = {}", toml_string(real));
+                        }
+                    } else {
+                        api_idx += 1;
+                    }
+                }
+            }
+            if let Some((key, raw)) = trimmed.split_once('=') {
+                let key_trim = key.trim();
+                if key_trim.eq_ignore_ascii_case("XAI_API_KEY")
+                    || key_trim.eq_ignore_ascii_case("OPENAI_API_KEY")
+                    || key_trim.eq_ignore_ascii_case("ANTHROPIC_API_KEY")
+                {
+                    let val = raw.trim().trim_matches('"').trim_matches('\'');
+                    if is_redacted_config_secret(val) {
+                        if let Some(real) = prior_env.get(key_trim) {
+                            let indent_len = line.len() - trimmed.len();
+                            let indent = &line[..indent_len];
+                            return format!("{indent}{key_trim}={}", env_value(real));
+                        }
+                    }
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[tauri::command]
 fn read_config_documents(cwd: String) -> Result<Vec<ConfigDocument>, String> {
     let cwd = checked_workspace(&cwd)?;
@@ -6128,11 +6276,22 @@ fn read_config_documents(cwd: String) -> Result<Vec<ConfigDocument>, String> {
         .map(|id| {
             let (path, label, language) = config_path(id, &cwd)?;
             let exists = path.is_file();
+            let raw = if exists {
+                read_bounded_text(&path, MAX_CONFIG_BYTES)?
+            } else {
+                String::new()
+            };
+            // R14.1 B5: never ship plaintext api_key into Settings WebView drafts.
+            let content = if id == "config" {
+                redact_config_document_secrets(&raw)
+            } else {
+                raw
+            };
             Ok(ConfigDocument {
                 id,
                 label,
                 path: path_for_webview(&path),
-                content: read_bounded_text(&path, MAX_CONFIG_BYTES)?,
+                content,
                 exists,
                 language,
             })
@@ -6154,7 +6313,13 @@ fn write_config_document(request: WriteConfigDocument) -> Result<ConfigDocument,
         return Err("配置内容不能包含空字节".into());
     }
     let (path, label, language) = config_path(id, &cwd)?;
-    atomic_write(&path, &request.content)?;
+    let to_write = if id == "config" && path.is_file() {
+        let existing = read_bounded_text(&path, MAX_CONFIG_BYTES).unwrap_or_default();
+        merge_config_secrets_from_existing(&existing, &request.content)
+    } else {
+        request.content.clone()
+    };
+    atomic_write(&path, &to_write)?;
     // Home-scoped configs can hold routing / identity-adjacent settings — ACL like creds.
     if matches!(id, "config" | "system-prompt") {
         let _ = restrict_private_file(&path);
@@ -6163,7 +6328,12 @@ fn write_config_document(request: WriteConfigDocument) -> Result<ConfigDocument,
         id,
         label,
         path: path_for_webview(&path),
-        content: request.content,
+        // Echo redacted form back to the WebView — never the merged plaintext.
+        content: if id == "config" {
+            redact_config_document_secrets(&to_write)
+        } else {
+            to_write
+        },
         exists: true,
         language,
     })
@@ -6311,7 +6481,21 @@ fn redact_secret_for_export(value: &str) -> String {
     format!("{}…{}", &v[..4], &v[v.len().saturating_sub(2)..])
 }
 
+/// Serializes provider-profile RMW so seal-on-read cannot race a concurrent save
+/// during the atomic write window (R14.1 B6).
+fn provider_profiles_lock() -> &'static StdMutex<()> {
+    static LOCK: StdMutex<()> = StdMutex::new(());
+    &LOCK
+}
+
 fn read_provider_profiles_file() -> Result<ProviderProfilesFile, String> {
+    let _guard = provider_profiles_lock()
+        .lock()
+        .map_err(|_| "供应商档案锁已损坏".to_string())?;
+    read_provider_profiles_file_unlocked()
+}
+
+fn read_provider_profiles_file_unlocked() -> Result<ProviderProfilesFile, String> {
     let path = provider_profiles_path()?;
     if !path.exists() {
         return Ok(ProviderProfilesFile::default());
@@ -6324,15 +6508,13 @@ fn read_provider_profiles_file() -> Result<ProviderProfilesFile, String> {
         !profile.api_key.is_empty() && !profile.api_key.starts_with(SECRET_SEAL_PREFIX)
     });
     if needs_seal {
-        // write_provider_profiles_file seals every plaintext key.
-        let _ = write_provider_profiles_file(&value);
-        // Re-read sealed form when write succeeded; keep in-memory sealed copy if re-read fails.
+        // Hold the same lock — call unlocked writer to avoid deadlock.
+        let _ = write_provider_profiles_file_unlocked(&value);
         if let Ok(content) = read_bounded_text(&path, MAX_CONFIG_BYTES) {
             if let Ok(sealed) = serde_json::from_str::<ProviderProfilesFile>(&content) {
                 return Ok(sealed);
             }
         }
-        // Fallback: seal in-memory for this process even if disk rewrite failed.
         for profile in &mut value.profiles {
             if profile.api_key.is_empty() || profile.api_key.starts_with(SECRET_SEAL_PREFIX) {
                 continue;
@@ -6410,6 +6592,13 @@ fn export_support_diagnostics() -> Result<String, String> {
 }
 
 fn write_provider_profiles_file(value: &ProviderProfilesFile) -> Result<(), String> {
+    let _guard = provider_profiles_lock()
+        .lock()
+        .map_err(|_| "供应商档案锁已损坏".to_string())?;
+    write_provider_profiles_file_unlocked(value)
+}
+
+fn write_provider_profiles_file_unlocked(value: &ProviderProfilesFile) -> Result<(), String> {
     let path = provider_profiles_path()?;
     // Seal any legacy plaintext keys before flush (Windows DPAPI).
     let mut sealed = value.clone();
@@ -7900,6 +8089,40 @@ api_key = "local-key"
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn redact_config_document_secrets_masks_api_keys() {
+        let raw = r#"
+# comment
+[model.foo]
+api_key = "sk-super-secret-key-value"
+base_url = "https://api.example.com"
+XAI_API_KEY=plain-env-secret
+"#;
+        let redacted = redact_config_document_secrets(raw);
+        assert!(!redacted.contains("sk-super-secret"));
+        assert!(!redacted.contains("plain-env-secret"));
+        assert!(redacted.contains(CONFIG_SECRET_REDACTED));
+        assert!(redacted.contains("base_url"));
+    }
+
+    #[test]
+    fn merge_config_secrets_preserves_real_keys_from_disk() {
+        let existing = r#"
+[model.foo]
+api_key = "sk-real-key-on-disk"
+base_url = "https://api.example.com"
+"#;
+        let incoming = r#"
+[model.foo]
+api_key = "********"
+base_url = "https://api.example.com/v2"
+"#;
+        let merged = merge_config_secrets_from_existing(existing, incoming);
+        assert!(merged.contains("sk-real-key-on-disk"));
+        assert!(merged.contains("/v2"));
+        assert!(!merged.contains(CONFIG_SECRET_REDACTED));
     }
 
     #[test]
