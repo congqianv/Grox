@@ -409,9 +409,9 @@ const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
  */
 const LIVE_TURN_WINDOW = 40;
 /** How close to the true bottom before we consider "stuck" for auto-follow. */
-const STICK_BOTTOM_PX = 80;
-/** After wheel/touch scroll, suppress follow so stream growth cannot yank the viewport. */
-const USER_UNFOLLOW_MS = 1200;
+const STICK_BOTTOM_PX = 48;
+/** After wheel/touch/keyboard scroll, suppress follow so stream growth cannot yank. */
+const USER_UNFOLLOW_MS = 2800;
 
 /** Stable Footer type — inline `Footer: () => …` remounts Virtuoso chrome every stream tick. */
 function TimelineVirtuosoFooter() {
@@ -559,13 +559,20 @@ export function Timeline({ session }: { session: Session }) {
     return true;
   };
 
-  type ScrollerEl = HTMLElement & { __groxUnfollowScroll?: () => void };
+  type ScrollerEl = HTMLElement & {
+    __groxUnfollowScroll?: () => void;
+    __groxUnfollowKey?: (e: KeyboardEvent) => void;
+  };
 
   const detachScroller = useCallback(
     (node: ScrollerEl | null) => {
       if (!node) return;
       node.removeEventListener("wheel", markUserUnfollow);
       node.removeEventListener("touchmove", markUserUnfollow);
+      if (node.__groxUnfollowKey) {
+        node.removeEventListener("keydown", node.__groxUnfollowKey);
+        delete node.__groxUnfollowKey;
+      }
       if (node.__groxUnfollowScroll) {
         node.removeEventListener("scroll", node.__groxUnfollowScroll);
         delete node.__groxUnfollowScroll;
@@ -574,7 +581,7 @@ export function Timeline({ session }: { session: Session }) {
     [markUserUnfollow],
   );
 
-  // Attach to Virtuoso scroller: wheel/touch/scroll-up must unfollow immediately.
+  // Attach to Virtuoso scroller: wheel/touch/keys/scroll-up must unfollow immediately.
   // atBottomStateChange alone is too slow / flaky while tall Computer-Use tables remeasure.
   const scrollerRef = useCallback(
     (el: HTMLElement | Window | null) => {
@@ -584,13 +591,27 @@ export function Timeline({ session }: { session: Session }) {
       if (!node) return;
       node.addEventListener("wheel", markUserUnfollow, { passive: true });
       node.addEventListener("touchmove", markUserUnfollow, { passive: true });
+      const onKeyUnfollow = (event: KeyboardEvent) => {
+        // Page/home/arrow navigation must not lose place when the stream keeps growing.
+        if (
+          event.key === "PageUp" ||
+          event.key === "Home" ||
+          event.key === "ArrowUp" ||
+          (event.key === " " && event.shiftKey)
+        ) {
+          markUserUnfollow();
+        }
+      };
+      node.addEventListener("keydown", onKeyUnfollow);
       let lastTop = node.scrollTop;
       const onScrollerScroll = () => {
         const top = node.scrollTop;
+        // Any upward motion (incl. trackpad / scrollbar drag) freezes follow.
         if (top + 2 < lastTop) markUserUnfollow();
         lastTop = top;
       };
       node.__groxUnfollowScroll = onScrollerScroll;
+      node.__groxUnfollowKey = onKeyUnfollow;
       node.addEventListener("scroll", onScrollerScroll, { passive: true });
     },
     [detachScroller, markUserUnfollow],

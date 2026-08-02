@@ -1106,7 +1106,7 @@ fn extract_media_artifacts(output: &str, cwd: &Path) -> Result<Vec<MediaArtifact
         };
         // Never promote arbitrary absolute paths outside the workspace into the
         // asset-protocol allowlist (CLI stdout can mention unrelated local files).
-        if !canonical.starts_with(&workspace) || !canonical.is_file() {
+        if !path_is_inside_workspace(&workspace, &canonical) || !canonical.is_file() {
             continue;
         }
         let display = path_for_webview(&canonical);
@@ -1143,11 +1143,14 @@ fn reveal_in_explorer(cwd: String, path: String) -> Result<(), String> {
     let root = checked_workspace(&cwd)?;
     let file = checked_workspace_file(&root, &path)?;
     #[cfg(windows)]
-    std::process::Command::new("explorer.exe")
-        .arg("/select,")
-        .arg(&file)
-        .spawn()
-        .map_err(|error| format!("无法打开资源管理器：{error}"))?;
+    {
+        // explorer wants a single `/select,<path>` argument (spaces/commas break two-arg form).
+        let select = format!("/select,{}", file.display());
+        std::process::Command::new("explorer.exe")
+            .arg(select)
+            .spawn()
+            .map_err(|error| format!("无法打开资源管理器：{error}"))?;
+    }
     #[cfg(target_os = "macos")]
     std::process::Command::new("open")
         .arg("-R")
@@ -1163,6 +1166,35 @@ fn reveal_in_explorer(cwd: String, path: String) -> Result<(), String> {
 }
 
 
+/// True when `candidate` is `workspace` or a strict descendant.
+/// On Windows, also tolerates `\\?\` prefix drift and case differences after canonicalize.
+fn path_is_inside_workspace(workspace: &Path, candidate: &Path) -> bool {
+    if candidate.starts_with(workspace) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        fn normalize(path: &Path) -> String {
+            let raw = path.to_string_lossy();
+            let stripped = raw
+                .strip_prefix(r"\\?\")
+                .or_else(|| raw.strip_prefix(r"//?/"))
+                .unwrap_or(&raw);
+            stripped.replace('/', "\\").to_ascii_lowercase()
+        }
+        let root = normalize(workspace);
+        let path = normalize(candidate);
+        path == root
+            || path.starts_with(&format!("{root}\\"))
+            || path.starts_with(&format!("{root}/"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (workspace, candidate);
+        false
+    }
+}
+
 fn checked_workspace_file(workspace: &Path, requested: &str) -> Result<PathBuf, String> {
     let candidate = PathBuf::from(requested);
     let candidate = if candidate.is_absolute() {
@@ -1173,7 +1205,7 @@ fn checked_workspace_file(workspace: &Path, requested: &str) -> Result<PathBuf, 
     let canonical = candidate
         .canonicalize()
         .map_err(|error| format!("无法解析文件 {}：{error}", candidate.display()))?;
-    if !canonical.starts_with(workspace) {
+    if !path_is_inside_workspace(workspace, &canonical) {
         return Err("只能访问当前项目内的文件".into());
     }
     Ok(canonical)
@@ -2763,7 +2795,7 @@ fn checked_explicit_prompt_image(workspace: &Path, requested: &str) -> Result<Pa
         .canonicalize()
         .map_err(|error| format!("无法解析图片路径 {}：{error}", candidate.display()))?;
     // Hard workspace boundary — same as checked_workspace_file.
-    if !canonical.starts_with(workspace) {
+    if !path_is_inside_workspace(workspace, &canonical) {
         return Err("只能附加当前项目内的图片".into());
     }
     let metadata = fs::metadata(&canonical)
@@ -6352,6 +6384,9 @@ async fn acp_kill(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AcpState>>,
 ) -> Result<(), String> {
+    // Same mutex as acp_spawn: concurrent kill during terminate→spawn must not
+    // bump generation mid-flight and orphan the new child stdout readers.
+    let _spawn_guard = state.spawn_lock.lock().await;
     state.next_generation.fetch_add(1, Ordering::Relaxed);
     if let Some(process) = state.process.lock().await.take() {
         terminate_process(process).await;
@@ -6482,6 +6517,7 @@ fn install_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 /// Append a line to %LOCALAPPDATA%\Grox\last-exit.log for post-mortem (crash vs clean close).
+/// Rotates when the file exceeds ~128 KiB so crash forensics stay bounded.
 fn append_lifecycle_log(reason: &str) {
     let Ok(local) = std::env::var("LOCALAPPDATA") else {
         eprintln!("grox lifecycle: {reason}");
@@ -6490,16 +6526,31 @@ fn append_lifecycle_log(reason: &str) {
     let dir = PathBuf::from(local).join("Grox");
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("last-exit.log");
+    const MAX_LIFECYCLE_LOG_BYTES: u64 = 128 * 1024;
+    if fs::metadata(&path)
+        .map(|m| m.len() > MAX_LIFECYCLE_LOG_BYTES)
+        .unwrap_or(false)
+    {
+        let bak = dir.join("last-exit.prev.log");
+        let _ = fs::remove_file(&bak);
+        let _ = fs::rename(&path, &bak);
+    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let line = format!("{stamp}\t{reason}\n");
+    // Keep a single line — no newlines from reason (panic paths may include multiline).
+    let safe_reason = reason
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .take(2_048)
+        .collect::<String>();
+    let line = format!("{stamp}\t{safe_reason}\n");
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         use std::io::Write;
         let _ = file.write_all(line.as_bytes());
     }
-    eprintln!("grox lifecycle: {reason}");
+    eprintln!("grox lifecycle: {safe_reason}");
 }
 
 fn install_panic_lifecycle_hook() {
@@ -6969,6 +7020,28 @@ api_key = "local-key"
         assert!(off.mcp_servers.is_empty());
         assert!(off.plugin_dirs.is_empty());
         assert!(off.lease_id.is_empty());
+    }
+
+    #[test]
+    fn path_is_inside_workspace_accepts_descendant() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("grox-ws-in-{stamp}"));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        let ws = root.canonicalize().unwrap();
+        let inside = ws.join("nested").join("file.txt");
+        fs::write(&inside, b"x").unwrap();
+        let inside_c = inside.canonicalize().unwrap();
+        assert!(path_is_inside_workspace(&ws, &inside_c));
+        assert!(path_is_inside_workspace(&ws, &ws));
+        let outside_path = std::env::temp_dir().join(format!("grox-ws-out-{stamp}.txt"));
+        fs::write(&outside_path, b"y").unwrap();
+        let outside = outside_path.canonicalize().unwrap();
+        assert!(!path_is_inside_workspace(&ws, &outside));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&outside);
     }
 
     #[test]

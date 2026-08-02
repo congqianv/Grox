@@ -2018,18 +2018,38 @@ export class AcpBridge implements GrokBridge {
       const option = record(rawOption) ?? {};
       const optionId = string(option.optionId);
       if (!optionId) continue;
-      switch ((string(option.kind) ?? string(option.name) ?? "").toLowerCase()) {
-        case "allow_once":
-          optionIds.allow_once = optionId;
-          break;
-        case "allow_always":
-          optionIds.allow_always = optionId;
-          break;
-        case "reject_once":
-        case "reject_always":
-        case "deny":
-          optionIds.deny ??= optionId;
-          break;
+      const kindRaw = (
+        string(option.kind) ??
+        string(option.name) ??
+        string(option.label) ??
+        optionId
+      ).toLowerCase();
+      if (
+        kindRaw === "allow_once" ||
+        kindRaw === "allow-once" ||
+        kindRaw === "allowonce" ||
+        (kindRaw.includes("allow") && kindRaw.includes("once") && !kindRaw.includes("always"))
+      ) {
+        optionIds.allow_once = optionId;
+      } else if (
+        kindRaw === "allow_always" ||
+        kindRaw === "allow-always" ||
+        kindRaw === "allowalways" ||
+        kindRaw === "allow_all" ||
+        (kindRaw.includes("allow") && kindRaw.includes("always"))
+      ) {
+        optionIds.allow_always = optionId;
+      } else if (
+        kindRaw === "reject_once" ||
+        kindRaw === "reject_always" ||
+        kindRaw === "deny" ||
+        kindRaw.includes("reject") ||
+        kindRaw.includes("deny")
+      ) {
+        optionIds.deny ??= optionId;
+      } else if (kindRaw.includes("allow") && !optionIds.allow_once) {
+        // CLI variants that only expose a generic "allow" — treat as once.
+        optionIds.allow_once = optionId;
       }
     }
     const options = (["allow_once", "allow_always", "deny"] as PermissionOption[]).filter(
