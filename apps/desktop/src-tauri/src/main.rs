@@ -172,6 +172,9 @@ struct MediaGenerationResult {
     summary: String,
 }
 
+/// Hard-coded media CLI tool allowlist for `generate_media` (never from request).
+const MEDIA_GENERATION_TOOLS: &str = "image_gen,video_gen,image_to_video,reference_to_video";
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ComputerSessionExtensions {
@@ -3865,17 +3868,14 @@ async fn generate_media(
     let prompt = checked_media_prompt(&request, &cwd)?;
     let runtime = configured_grok_command(&app);
     let mut command = Command::new(&runtime.path);
-    // Headless media child: only the four media tools are enabled. `--always-approve`
-    // is scoped by that tool allowlist (not full agent yolo). Permission mode is
-    // intentionally media-only; chat permissionMode does not apply to this child.
+    // Headless media child: tool allowlist is a hard constant (never from request).
+    // `--always-approve` only covers these four media tools — not full agent yolo.
+    // Chat `permissionMode` does not apply to this child process.
     command
         .arg("--single")
         .arg(&prompt)
         .args(["--output-format", "streaming-json", "--always-approve"])
-        .args([
-            "--tools",
-            "image_gen,video_gen,image_to_video,reference_to_video",
-        ])
+        .args(["--tools", MEDIA_GENERATION_TOOLS])
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -6634,6 +6634,21 @@ api_key = "local-key"
         assert!(is_denied_cli_env_key("NODE_OPTIONS"));
         assert!(!is_denied_cli_env_key("XAI_API_KEY"));
         assert!(!is_denied_cli_env_key("GROK_MODELS_BASE_URL"));
+    }
+
+    #[test]
+    fn media_generation_tools_are_media_only_constant() {
+        // Always-approve is only safe while this list stays media-scoped.
+        assert_eq!(
+            MEDIA_GENERATION_TOOLS,
+            "image_gen,video_gen,image_to_video,reference_to_video"
+        );
+        for forbidden in ["bash", "shell", "computer", "read_file", "write", "edit"] {
+            assert!(
+                !MEDIA_GENERATION_TOOLS.contains(forbidden),
+                "media tools must not include {forbidden}"
+            );
+        }
     }
 
     #[test]

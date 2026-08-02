@@ -205,13 +205,8 @@ html:not([data-theme="light"]) {
   box-shadow: 0 0 0 1px var(--color-line3);
 }
 
-/* Long restored transcripts stay mounted and searchable, while Chromium can
-   skip layout and paint work for turns far outside the scroll viewport. */
-.timeline-turn {
-  content-visibility: auto;
-  contain-intrinsic-block-size: auto 180px;
-  contain: layout paint style;
-}
+/* Virtuoso owns virtualization for the session timeline — do not also set
+   content-visibility here (double estimate → jump/stick mis-measure). */
 
 .animate-orbit,
 .animate-orbit-slow,

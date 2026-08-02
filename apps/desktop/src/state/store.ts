@@ -46,6 +46,11 @@ const offlineHistoryComplete = new Set<string>();
 /** Missions with an in-flight offline scan (avoid re-invoke restart storms). */
 const offlineHistoryScanning = new Set<string>();
 /**
+ * Sessions deleted this process lifetime — late disk-history events must not
+ * resurrect them into `sessions` (R3 tombstone).
+ */
+const offlineHistoryDeleted = new Set<string>();
+/**
  * Sessions with an in-flight sendPrompt IIFE (silent bind + prompt).
  * Prevents openSession from coercing running→idle mid-bind (double-prompt race).
  */
@@ -1329,6 +1334,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
           // Always free the scanning slot for this id (including cancelled abandon).
           offlineHistoryScanning.delete(payload.id);
 
+          // Tombstone: deleted missions must not be resurrected by late scan.
+          if (offlineHistoryDeleted.has(payload.id)) {
+            if (get().fullHistoryLoadingId === payload.id) {
+              set({
+                fullHistoryLoadingId: null,
+                historyLoadMode: null,
+                diskHistoryProgress: null,
+              });
+            } else if (get().diskHistoryProgress?.id === payload.id) {
+              set({ diskHistoryProgress: null });
+            }
+            return;
+          }
+
           const loadingId = get().fullHistoryLoadingId;
           const progressId = get().diskHistoryProgress?.id ?? null;
           // Never stop the poll for an unrelated session's terminal event.
@@ -1348,7 +1367,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
             offlineHistoryComplete.add(payload.id);
           }
 
+          // Only merge body if still in catalog or memory (not deleted mid-scan).
+          const stillCatalogued = get().sessionIndex.some((m) => m.id === payload.id);
           const existing = get().sessions[payload.id];
+          if (!stillCatalogued && !existing) {
+            if (get().fullHistoryLoadingId === payload.id && get().historyLoadMode === "disk") {
+              set({
+                fullHistoryLoadingId: null,
+                historyLoadMode: null,
+                diskHistoryProgress: null,
+              });
+            }
+            return;
+          }
+
           const liveBusy =
             existing &&
             (existing.status === "running" ||
@@ -1356,8 +1388,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
               existing.status === "awaiting_input");
           if (!liveBusy && payload.session) {
             const next = normalizeOfflineSession(payload.session, existing);
-            if (next) {
+            if (next && !offlineHistoryDeleted.has(payload.id)) {
               window.setTimeout(() => {
+                if (offlineHistoryDeleted.has(payload.id)) return;
                 set({
                   sessions: { ...get().sessions, [payload.id]: next },
                 });
@@ -1694,9 +1727,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
         const sessionComposers = { ...state.sessionComposers, [id]: composer };
         persistSessionComposers(sessionComposers);
 
+        // Explicit open means the mission is back in play for this process.
+        offlineHistoryDeleted.delete(id);
+
         const kickOfflineHistory = (session?: Session | null) => {
           if (!stillThisOpen()) return;
           if (bridge.kind !== "acp") return;
+          if (offlineHistoryDeleted.has(id)) return;
           if (offlineHistoryComplete.has(id)) return;
           // Already scanning this id — join poll, do not re-invoke.
           if (offlineHistoryScanning.has(id)) {
@@ -2382,6 +2419,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
     closePreview: () => set({ previewOpen: false, previewFile: null, previewError: null }),
 
     async deleteSession(id) {
+      // Tombstone first so late offline scan cannot re-insert the body.
+      offlineHistoryDeleted.add(id);
+      offlineHistoryScanning.delete(id);
+      offlineHistoryComplete.delete(id);
+      if (get().fullHistoryLoadingId === id || get().diskHistoryProgress?.id === id) {
+        stopOfflineScanPoll();
+        // Abandon any in-flight worker; gen bump is enough (start owns finish).
+        if (bridge.kind === "acp") {
+          void invoke("cancel_offline_session_history").catch(() => {});
+        }
+      }
       await bridge.deleteSession(id);
       const { sessionIndex, sessions, activeId, sessionComposers } = get();
       const rest = { ...sessions };
@@ -2395,7 +2443,22 @@ export const useDesktop = create<DesktopState>((set, get) => {
         sessionIndex: nextIndex,
         sessions: rest,
         sessionComposers: nextComposers,
-        ...(activeId === id ? { activeId: null, view: "home" as View } : {}),
+        ...(activeId === id
+          ? {
+              activeId: null,
+              view: "home" as View,
+              fullHistoryLoadingId: null,
+              historyLoadMode: null,
+              diskHistoryProgress: null,
+              agentBindStartedAt: null,
+            }
+          : get().fullHistoryLoadingId === id
+            ? {
+                fullHistoryLoadingId: null,
+                historyLoadMode: null,
+                diskHistoryProgress: null,
+              }
+            : {}),
       });
     },
 

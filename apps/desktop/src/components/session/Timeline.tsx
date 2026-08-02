@@ -413,6 +413,7 @@ export function Timeline({ session }: { session: Session }) {
     diskHistoryProgress?.id === session.id ? diskHistoryProgress : null;
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const followRef = useRef(true);
+  const jumpTimersRef = useRef<number[]>([]);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
   /** true = show entire transcript (default for restored history). */
   const [showAll, setShowAll] = useState(true);
@@ -478,26 +479,37 @@ export function Timeline({ session }: { session: Session }) {
   }, [showAll, turns, isLive]);
   const hiddenCount = turns.length - visibleTurns.length;
 
+  const clearJumpTimers = () => {
+    for (const t of jumpTimersRef.current) window.clearTimeout(t);
+    jumpTimersRef.current = [];
+  };
+
   const jumpToTurn = (id: string) => {
     // Expand live window if the target is outside the visible slice.
     if (!showAll && !visibleTurns.some((turn) => turn.id === id)) {
       setShowAll(true);
     }
     followRef.current = false;
+    clearJumpTimers();
     const run = () => {
-      // Prefer full turns so expand-after-setShowAll lands correctly.
+      // Index against the list Virtuoso currently renders (or full after expand).
+      const list = showAll || turns.length <= LIVE_TURN_WINDOW ? turns : visibleTurns;
+      // After setShowAll, prefer full turns once expanded data commits.
       const target = turns.findIndex((turn) => turn.id === id);
-      if (target < 0) return;
+      const index = target >= 0 && (showAll || turns.length <= LIVE_TURN_WINDOW)
+        ? target
+        : list.findIndex((turn) => turn.id === id);
+      if (index < 0) return;
       virtuosoRef.current?.scrollToIndex({
-        index: target,
+        index,
         align: "start",
         behavior: "auto",
         offset: -48,
       });
     };
     run();
-    window.setTimeout(run, 40);
-    window.setTimeout(run, 160);
+    jumpTimersRef.current.push(window.setTimeout(run, 40));
+    jumpTimersRef.current.push(window.setTimeout(run, 160));
   };
 
   const scrollToBottom = (force = false) => {
@@ -513,6 +525,7 @@ export function Timeline({ session }: { session: Session }) {
 
   // Stick to bottom only on open/switch — never yank on every block_add (user reading up).
   useEffect(() => {
+    clearJumpTimers();
     if (!hasBlocks) return;
     followRef.current = true;
     scrollToBottom(true);
@@ -526,6 +539,7 @@ export function Timeline({ session }: { session: Session }) {
     return () => {
       window.clearTimeout(t1);
       window.clearTimeout(t2);
+      clearJumpTimers();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: session open only
   }, [session.id]);
@@ -586,6 +600,12 @@ export function Timeline({ session }: { session: Session }) {
         ref={virtuosoRef}
         className="h-full min-w-0 flex-1"
         data={visibleTurns}
+        // Open at the end so restored history does not flash top→bottom.
+        initialTopMostItemIndex={
+          visibleTurns.length > 0
+            ? { index: visibleTurns.length - 1, align: "end" }
+            : 0
+        }
         defaultItemHeight={180}
         increaseViewportBy={{ top: 600, bottom: 800 }}
         atBottomThreshold={STICK_BOTTOM_PX}

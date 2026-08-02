@@ -2672,6 +2672,16 @@ export class AcpBridge implements GrokBridge {
 
   async interject(sessionId: string, text: string, options: PromptOptions): Promise<InterjectResult> {
     await this.ready;
+    // Channel-serialize with load/prompt so Computer attach silent-stream cannot
+    // black-hole a live turn's sessionUpdate lines (R3).
+    return this.runOnChannel(() => this.interjectInner(sessionId, text, options));
+  }
+
+  private async interjectInner(
+    sessionId: string,
+    text: string,
+    options: PromptOptions,
+  ): Promise<InterjectResult> {
     // Do not optimistically mark bound — only session/new or successful session/load.
     const trimmed = text.trim();
     await this.ensureComputerAttachedForPrompt(sessionId, trimmed);
