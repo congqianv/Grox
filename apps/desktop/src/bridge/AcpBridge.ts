@@ -810,6 +810,11 @@ export class AcpBridge implements GrokBridge {
   private channelTail: Promise<unknown> = Promise.resolve();
   /** Serialize restartAgent so double activate cannot spawn two children. */
   private restartTail: Promise<void> = Promise.resolve();
+  /** True while we intentionally replace the agent (suppress stale exit noise). */
+  private suppressExitHandling = false;
+  /** Crash auto-reconnect budget for the current agent life. */
+  private reconnectAttempts = 0;
+  private reconnectTimer: number | undefined;
   /**
    * Scheme C + visit memory:
    * 1) Always prefer full-load of the active mission if unbound.
@@ -1425,28 +1430,38 @@ export class AcpBridge implements GrokBridge {
   }
 
   private async restartAgentInner(): Promise<void> {
-    this.flushStreamAppends();
-    this.flushToolPatches();
-    const error = new Error("模型服务已切换，请重新发送尚未完成的请求");
-    for (const request of this.pending.values()) {
-      if (request.timeoutId !== undefined) window.clearTimeout(request.timeoutId);
-      request.reject(error);
+    this.suppressExitHandling = true;
+    if (this.reconnectTimer !== undefined) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
     }
-    this.pending.clear();
-    this.interactions.clear();
-    this.cursors.clear();
-    this.sessionOptions.clear();
-    // Match agent-exit cleanup so silent bind / computer leases cannot leak.
-    this.resetBindStateAfterAgentExit();
-    this.computerLeases.clear();
-    this.activeComputerSessions.clear();
-    this.activeComputerToolCalls.clear();
-    this.channelTail = Promise.resolve();
-    this.authMethodId = undefined;
-    this.modelState = { models: MODELS, currentId: MODELS[0].id };
-    const next = this.initializeAgent();
-    this.ready = next;
-    await next;
+    try {
+      this.flushStreamAppends();
+      this.flushToolPatches();
+      const error = new Error("模型服务已切换，请重新发送尚未完成的请求");
+      for (const request of this.pending.values()) {
+        if (request.timeoutId !== undefined) window.clearTimeout(request.timeoutId);
+        request.reject(error);
+      }
+      this.pending.clear();
+      this.interactions.clear();
+      this.cursors.clear();
+      this.sessionOptions.clear();
+      // Match agent-exit cleanup so silent bind / computer leases cannot leak.
+      this.resetBindStateAfterAgentExit();
+      this.computerLeases.clear();
+      this.activeComputerSessions.clear();
+      this.activeComputerToolCalls.clear();
+      this.channelTail = Promise.resolve();
+      this.authMethodId = undefined;
+      this.modelState = { models: MODELS, currentId: MODELS[0].id };
+      const next = this.initializeAgent();
+      this.ready = next;
+      await next;
+      this.reconnectAttempts = 0;
+    } finally {
+      this.suppressExitHandling = false;
+    }
   }
 
   private async configureAuthentication(responseValue: unknown) {
@@ -1501,10 +1516,13 @@ export class AcpBridge implements GrokBridge {
   }
 
   private onExit(payload: ExitPayload) {
+    // Exit from a process we are intentionally replacing (restart/spawn).
+    if (this.suppressExitHandling) {
+      return;
+    }
     this.flushStreamAppends();
     this.flushToolPatches();
-    // Intentional stop (acp_kill / replace) still must clear bind/lease state —
-    // skipping cleanup left silent-bind and Computer leases sticky across restarts.
+    // Intentional stop (acp_kill) still must clear bind/lease state.
     if (payload.reason === "killed") {
       for (const request of this.pending.values()) {
         if (request.timeoutId !== undefined) window.clearTimeout(request.timeoutId);
@@ -1539,6 +1557,46 @@ export class AcpBridge implements GrokBridge {
     for (const sessionId of bound) {
       this.emit({ type: "error", sessionId, message });
     }
+    // Unexpected crash: auto-reconnect a few times (provider switch uses suppress).
+    this.scheduleCrashReconnect(message);
+  }
+
+  private scheduleCrashReconnect(lastMessage: string): void {
+    if (this.reconnectTimer !== undefined) return;
+    if (this.reconnectAttempts >= 2) {
+      this.setAuthState({
+        required: this.authState.required,
+        inProgress: false,
+        error: `${lastMessage}（已自动重连 2 次仍失败，请重启 Grox 或检查 Grok CLI）`,
+      });
+      return;
+    }
+    this.reconnectAttempts += 1;
+    const attempt = this.reconnectAttempts;
+    const delayMs = 800 * attempt;
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.restartAgent()
+        .then(() => {
+          this.setAuthState({
+            ...this.authState,
+            error: undefined,
+            inProgress: false,
+          });
+        })
+        .catch((error) => {
+          const detail = errorText(error);
+          if (this.reconnectAttempts < 2) {
+            this.scheduleCrashReconnect(detail);
+          } else {
+            this.setAuthState({
+              required: this.authState.required,
+              inProgress: false,
+              error: `Agent 崩溃后自动重连失败：${detail}`,
+            });
+          }
+        });
+    }, delayMs);
   }
 
   private onLine(line: string) {

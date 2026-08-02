@@ -323,7 +323,7 @@ struct StoredProviderProfile {
     resident_models: Vec<String>,
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderProfilesFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -759,7 +759,8 @@ fn ensure_models_default(content: &str, default_id: &str) -> String {
 /// had local `[model.*]` overrides.
 fn compatible_provider_model_config(profile: &StoredProviderProfile) -> Result<String, String> {
     let base = checked_service_url(&profile.base_url, "服务地址")?;
-    let key = checked_api_key(&profile.api_key)?;
+    let plain = profile_api_key_plain(profile)?;
+    let key = checked_api_key(&plain)?;
     let backend = profile.api_backend.resolved(&profile.name, &base);
     let model_ids = provider_resident_model_ids(profile);
     if model_ids.is_empty() {
@@ -1091,9 +1092,12 @@ fn apply_cli_provider_environment(command: &mut Command) {
                 .find(|profile| profile.id == active_id)
         }) {
             if let Ok(base) = checked_service_url(&profile.base_url, "服务地址") {
-                if let Ok(list_url) = compatible_models_url(&base) {
+                if let (Ok(list_url), Ok(plain_key)) = (
+                    compatible_models_url(&base),
+                    profile_api_key_plain(profile),
+                ) {
                     command
-                        .env("XAI_API_KEY", &profile.api_key)
+                        .env("XAI_API_KEY", plain_key)
                         .env("GROK_MODELS_BASE_URL", &base)
                         .env("GROK_MODELS_LIST_URL", list_url)
                         .env(
@@ -5987,6 +5991,144 @@ fn provider_profiles_path() -> Result<PathBuf, String> {
     Ok(grok_home()?.join("grox-providers.json"))
 }
 
+/// At-rest marker for DPAPI-sealed API keys in grox-providers.json.
+const SECRET_SEAL_PREFIX: &str = "enc:v1:";
+
+#[cfg(windows)]
+fn dpapi_protect(plain: &[u8]) -> Result<Vec<u8>, String> {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
+
+    if plain.is_empty() {
+        return Ok(Vec::new());
+    }
+    unsafe {
+        let mut input = CRYPT_INTEGER_BLOB {
+            cbData: plain.len() as u32,
+            pbData: plain.as_ptr() as *mut u8,
+        };
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        CryptProtectData(
+            &mut input,
+            windows::core::PCWSTR::null(),
+            None,
+            None,
+            None,
+            0,
+            &mut output,
+        )
+        .map_err(|error| format!("DPAPI 加密失败：{error}"))?;
+        if output.pbData.is_null() || output.cbData == 0 {
+            return Err("DPAPI 加密返回空数据".into());
+        }
+        let sealed =
+            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        let _ = LocalFree(HLOCAL(output.pbData as *mut _));
+        Ok(sealed)
+    }
+}
+
+#[cfg(windows)]
+fn dpapi_unprotect(sealed: &[u8]) -> Result<Vec<u8>, String> {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+
+    if sealed.is_empty() {
+        return Ok(Vec::new());
+    }
+    unsafe {
+        let mut input = CRYPT_INTEGER_BLOB {
+            cbData: sealed.len() as u32,
+            pbData: sealed.as_ptr() as *mut u8,
+        };
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        CryptUnprotectData(
+            &mut input,
+            None,
+            None,
+            None,
+            None,
+            0,
+            &mut output,
+        )
+        .map_err(|error| format!("DPAPI 解密失败：{error}"))?;
+        if output.pbData.is_null() || output.cbData == 0 {
+            return Err("DPAPI 解密返回空数据".into());
+        }
+        let plain =
+            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        let _ = LocalFree(HLOCAL(output.pbData as *mut _));
+        Ok(plain)
+    }
+}
+
+/// Seal a secret for disk (Windows DPAPI). Non-Windows keeps plaintext (still ACL-limited).
+fn seal_secret_for_storage(plain: &str) -> Result<String, String> {
+    let plain = checked_api_key(plain)?.to_string();
+    if plain.is_empty() {
+        return Ok(String::new());
+    }
+    #[cfg(windows)]
+    {
+        let sealed = dpapi_protect(plain.as_bytes())?;
+        Ok(format!(
+            "{SECRET_SEAL_PREFIX}{}",
+            BASE64.encode(sealed)
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(plain)
+    }
+}
+
+/// Unseal a stored secret. Accepts legacy plaintext for migration.
+fn unseal_secret_from_storage(stored: &str) -> Result<String, String> {
+    let stored = stored.trim();
+    if stored.is_empty() {
+        return Ok(String::new());
+    }
+    if let Some(b64) = stored.strip_prefix(SECRET_SEAL_PREFIX) {
+        #[cfg(windows)]
+        {
+            let sealed = BASE64
+                .decode(b64.trim())
+                .map_err(|error| format!("凭据编码损坏：{error}"))?;
+            let plain = dpapi_unprotect(&sealed)?;
+            let text = String::from_utf8(plain)
+                .map_err(|_| "凭据解密后不是有效 UTF-8".to_string())?;
+            return Ok(checked_api_key(&text)?.to_string());
+        }
+        #[cfg(not(windows))]
+        {
+            return Err("此平台无法解密 Windows DPAPI 凭据".into());
+        }
+    }
+    // Legacy plaintext on disk — still validated.
+    Ok(checked_api_key(stored)?.to_string())
+}
+
+/// Redact sealed or raw API key material from operator-facing export dumps.
+fn redact_secret_for_export(value: &str) -> String {
+    let v = value.trim();
+    if v.is_empty() {
+        return String::new();
+    }
+    if v.starts_with(SECRET_SEAL_PREFIX) {
+        return "[dpapi-sealed]".into();
+    }
+    if v.len() <= 8 {
+        return "********".into();
+    }
+    format!("{}…{}", &v[..4], &v[v.len().saturating_sub(2)..])
+}
+
 fn read_provider_profiles_file() -> Result<ProviderProfilesFile, String> {
     let path = provider_profiles_path()?;
     if !path.exists() {
@@ -5999,7 +6141,15 @@ fn read_provider_profiles_file() -> Result<ProviderProfilesFile, String> {
 
 fn write_provider_profiles_file(value: &ProviderProfilesFile) -> Result<(), String> {
     let path = provider_profiles_path()?;
-    let content = serde_json::to_string_pretty(value)
+    // Seal any legacy plaintext keys before flush (Windows DPAPI).
+    let mut sealed = value.clone();
+    for profile in &mut sealed.profiles {
+        if profile.api_key.is_empty() || profile.api_key.starts_with(SECRET_SEAL_PREFIX) {
+            continue;
+        }
+        profile.api_key = seal_secret_for_storage(&profile.api_key)?;
+    }
+    let content = serde_json::to_string_pretty(&sealed)
         .map_err(|error| format!("无法序列化供应商档案：{error}"))?;
     atomic_write(&path, &content)?;
     restrict_private_file(&path)
@@ -6021,6 +6171,11 @@ fn provider_profile_summary(profile: &StoredProviderProfile) -> ProviderProfileS
         available_models: profile.available_models.clone(),
         resident_models,
     }
+}
+
+/// Plaintext API key for CLI env / HTTP — unseals DPAPI storage.
+fn profile_api_key_plain(profile: &StoredProviderProfile) -> Result<String, String> {
+    unseal_secret_from_storage(&profile.api_key)
 }
 
 fn compatible_models_url(base_url: &str) -> Result<String, String> {
@@ -6104,17 +6259,24 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
     let existing = request
         .id
         .as_deref()
-        .and_then(|id| value.profiles.iter().find(|profile| profile.id == id));
+        .and_then(|id| value.profiles.iter().find(|profile| profile.id == id))
+        .cloned();
     let current_values = parse_env_file(&grok_home()?.join(".env"));
-    let key = request
+    let existing_plain = existing
+        .as_ref()
+        .map(|profile| unseal_secret_from_storage(&profile.api_key))
+        .transpose()?;
+    let plain_key = request
         .api_key
         .as_deref()
         .map(str::trim)
         .filter(|key| !key.is_empty())
-        .or_else(|| existing.map(|profile| profile.api_key.as_str()))
-        .or_else(|| current_values.get("XAI_API_KEY").map(String::as_str))
+        .map(str::to_owned)
+        .or(existing_plain)
+        .or_else(|| current_values.get("XAI_API_KEY").cloned())
         .ok_or("API Key 不能为空")?;
-    compatible_provider_env(key, &request.base_url, name, request.api_backend)?;
+    let plain_key = checked_api_key(&plain_key)?.to_owned();
+    compatible_provider_env(&plain_key, &request.base_url, name, request.api_backend)?;
     let resident_models = checked_model_ids(request.resident_models)?;
     let id = request.id.unwrap_or_else(|| {
         let nanos = SystemTime::now()
@@ -6131,10 +6293,30 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
     {
         return Err("无效的供应商档案 ID".into());
     }
+    // Keep existing sealed blob when the operator left the key field blank.
+    let stored_key = if request
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .is_none()
+    {
+        if let Some(existing) = existing.as_ref() {
+            if existing.api_key.starts_with(SECRET_SEAL_PREFIX) {
+                existing.api_key.clone()
+            } else {
+                seal_secret_for_storage(&plain_key)?
+            }
+        } else {
+            seal_secret_for_storage(&plain_key)?
+        }
+    } else {
+        seal_secret_for_storage(&plain_key)?
+    };
     let profile = StoredProviderProfile {
         id: id.clone(),
         name: name.to_owned(),
-        api_key: checked_api_key(key)?.to_owned(),
+        api_key: stored_key,
         base_url: checked_service_url(&request.base_url, "服务地址")?,
         api_backend: request.api_backend,
         models_url: None,
@@ -6161,13 +6343,14 @@ async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, S
         .find(|profile| profile.id == id)
         .ok_or("供应商档案不存在")?;
     let endpoint = compatible_models_url(&profile.base_url)?;
+    let plain_key = profile_api_key_plain(&profile)?;
     let response = reqwest::Client::builder()
         .user_agent(format!("Grox/{CLIENT_VERSION}"))
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|error| format!("无法创建模型目录客户端：{error}"))?
         .get(endpoint)
-        .bearer_auth(&profile.api_key)
+        .bearer_auth(&plain_key)
         .header("Accept", "application/json")
         .send()
         .await
@@ -6207,8 +6390,9 @@ fn activate_provider_profile(id: String) -> Result<(), String> {
         .find(|profile| profile.id == id)
         .cloned()
         .ok_or("供应商档案不存在")?;
+    let plain_key = profile_api_key_plain(&profile)?;
     let replacement = compatible_provider_env(
-        &profile.api_key,
+        &plain_key,
         &profile.base_url,
         &profile.name,
         profile.api_backend,
@@ -6314,6 +6498,7 @@ fn configure_provider(request: ProviderConfig) -> Result<(), String> {
         let synthetic = StoredProviderProfile {
             id: "compatible".into(),
             name: "compatible".into(),
+            // In-memory only for config.toml pin — not written to grox-providers.json.
             api_key: checked_api_key(key)?.to_owned(),
             base_url: checked_service_url(base_url, "服务地址")?,
             api_backend: ProviderApiBackend::ChatCompletions,
@@ -7360,6 +7545,32 @@ api_key = "local-key"
         assert!(!is_allowed_update_download_host(Some("github.com.evil.com")));
         assert!(!is_allowed_update_download_host(Some("")));
         assert!(!is_allowed_update_download_host(None));
+    }
+
+    #[test]
+    fn redact_secret_for_export_masks_keys() {
+        assert_eq!(redact_secret_for_export(""), "");
+        assert_eq!(redact_secret_for_export("short"), "********");
+        let redacted = redact_secret_for_export("sk-abcdefghijklmnopqrstuvwxyz");
+        assert!(redacted.starts_with("sk-a"));
+        assert!(!redacted.contains("bcdefghijklmnop"));
+        assert_eq!(
+            redact_secret_for_export("enc:v1:AAAA"),
+            "[dpapi-sealed]"
+        );
+    }
+
+    #[test]
+    fn secret_seal_roundtrip_or_plaintext_fallback() {
+        let plain = "sk-test-key-for-seal-roundtrip-01";
+        let stored = seal_secret_for_storage(plain).expect("seal");
+        let opened = unseal_secret_from_storage(&stored).expect("unseal");
+        assert_eq!(opened, plain);
+        // Legacy plaintext still opens.
+        assert_eq!(
+            unseal_secret_from_storage(plain).expect("legacy"),
+            plain
+        );
     }
 
     #[test]
