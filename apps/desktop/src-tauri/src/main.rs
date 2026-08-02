@@ -6197,10 +6197,40 @@ fn redact_config_document_secrets(content: &str) -> String {
         .join("\n")
 }
 
-/// TOML table header line? e.g. `[model.foo]` or `[model."grok-4.5"]` (not array `[[`).
+/// Strip trailing `#` comments from a TOML line (not inside quotes — best-effort).
+fn toml_line_without_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (i, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_double => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double => return line[..i].trim_end(),
+            _ => {}
+        }
+    }
+    line.trim_end()
+}
+
+/// TOML table header key e.g. `[model.foo]` / `[model."grok-4.5"]` (not array `[[`).
+/// R15: tolerates trailing comments (`[model.foo] # prod`).
+fn toml_table_header_key(trimmed: &str) -> Option<String> {
+    let t = toml_line_without_comment(trimmed).trim();
+    if t.starts_with('[') && t.ends_with(']') && !t.starts_with("[[") {
+        Some(t.to_string())
+    } else {
+        None
+    }
+}
+
 fn is_toml_table_header(trimmed: &str) -> bool {
-    let t = trimmed.trim();
-    t.starts_with('[') && t.ends_with(']') && !t.starts_with("[[")
+    toml_table_header_key(trimmed).is_some()
 }
 
 fn parse_toml_api_key_value(trimmed: &str) -> Option<&str> {
@@ -6219,8 +6249,8 @@ fn collect_api_keys_by_table(content: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for line in content.lines() {
         let trimmed = line.trim();
-        if is_toml_table_header(trimmed) {
-            table = trimmed.to_string();
+        if let Some(header) = toml_table_header_key(trimmed) {
+            table = header;
             continue;
         }
         if let Some(val) = parse_toml_api_key_value(trimmed) {
@@ -6265,16 +6295,21 @@ fn merge_config_secrets_from_existing(existing: &str, incoming: &str) -> Result<
     let mut out: Vec<String> = Vec::new();
     for line in incoming.lines() {
         let trimmed = line.trim();
-        if is_toml_table_header(trimmed) {
-            table = trimmed.to_string();
+        if let Some(header) = toml_table_header_key(trimmed) {
+            table = header;
             out.push(line.to_string());
             continue;
         }
         if let Some(val) = parse_toml_api_key_value(trimmed) {
             if is_redacted_config_secret(val) {
                 let Some(real) = prior_api.get(&table) else {
+                    let where_table = if table.is_empty() {
+                        "文件顶部（不在任何 TOML 表内）".to_string()
+                    } else {
+                        format!("表 {table}")
+                    };
                     return Err(format!(
-                        "无法安全恢复密钥：表 {table} 在磁盘上没有对应 api_key（可能已删改模型段）。请重新输入该表的 API Key。"
+                        "无法安全恢复密钥：{where_table} 在磁盘上没有对应 api_key（可能已删改模型段）。请重新输入该段的 API Key。"
                     ));
                 };
                 let indent_len = line.len() - line.trim_start().len();
@@ -6363,12 +6398,29 @@ fn write_config_document(request: WriteConfigDocument) -> Result<ConfigDocument,
     } else if id == "config" {
         // Brand-new config file: refuse pure-redacted placeholders with no disk prior.
         for line in request.content.lines() {
-            if let Some(val) = parse_toml_api_key_value(line.trim()) {
+            let trimmed = line.trim();
+            if let Some(val) = parse_toml_api_key_value(trimmed) {
                 if is_redacted_config_secret(val) {
                     return Err(
                         "新配置不能只含脱敏占位符：请填写真实 API Key，或先激活供应商档案。"
                             .into(),
                     );
+                }
+            }
+            // R15: same refuse for env-style secrets on create.
+            if let Some((key, raw)) = trimmed.split_once('=') {
+                let key = key.trim();
+                if key.eq_ignore_ascii_case("XAI_API_KEY")
+                    || key.eq_ignore_ascii_case("OPENAI_API_KEY")
+                    || key.eq_ignore_ascii_case("ANTHROPIC_API_KEY")
+                {
+                    let val = raw.trim().trim_matches('"').trim_matches('\'');
+                    if is_redacted_config_secret(val) {
+                        return Err(
+                            "新配置不能只含脱敏环境变量密钥：请填写真实 API Key，或先激活供应商档案。"
+                                .into(),
+                        );
+                    }
                 }
             }
         }
@@ -8217,6 +8269,25 @@ api_key = "********"
 "#;
         let err = merge_config_secrets_from_existing(existing, incoming).unwrap_err();
         assert!(err.contains("model.bar") || err.contains("无法安全恢复"));
+    }
+
+    #[test]
+    fn toml_table_header_tolerates_trailing_comment() {
+        assert!(is_toml_table_header(r#"[model.foo] # prod"#));
+        assert_eq!(
+            toml_table_header_key(r#"[model."grok-4.5"] # x"#).as_deref(),
+            Some(r#"[model."grok-4.5"]"#)
+        );
+        let existing = r#"
+[model.foo] # local
+api_key = "sk-commented-header"
+"#;
+        let incoming = r#"
+[model.foo] # local
+api_key = "********"
+"#;
+        let merged = merge_config_secrets_from_existing(existing, incoming).expect("merge");
+        assert!(merged.contains("sk-commented-header"));
     }
 
     #[test]

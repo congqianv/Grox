@@ -3043,6 +3043,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
         } finally {
           promptInFlightSessions.delete(session.id);
           flushPendingOfflineMerge(session.id);
+          // R15: if agent_reconnected skipped drain while we were in-flight,
+          // pick up local queue once this turn fully ends.
+          window.setTimeout(() => drainPromptQueue(session.id), 0);
         }
       })();
     },

@@ -827,6 +827,15 @@ export class AcpBridge implements GrokBridge {
   /** When true, restartAgentInner must not steal `ready` from runCrashReconnect. */
   private restartFromCrashReconnect = false;
   /**
+   * R15: wall-clock of successful crash-reconnect publishes (sliding window).
+   * Too many flaps → cool down auto-reconnect so we don't spin forever.
+   */
+  private reconnectSuccessTimes: number[] = [];
+  private reconnectCoolingUntil = 0;
+  private static readonly RECONNECT_FLAP_WINDOW_MS = 60_000;
+  private static readonly RECONNECT_FLAP_MAX = 4;
+  private static readonly RECONNECT_COOLDOWN_MS = 120_000;
+  /**
    * Scheme C + visit memory:
    * 1) Always prefer full-load of the active mission if unbound.
    * 2) After active is complete, full-load other *visited* unbound missions
@@ -1611,14 +1620,40 @@ export class AcpBridge implements GrokBridge {
       this.reconnectChildDied = true;
       return;
     }
+    this.beginCrashReconnect(message);
+  }
+
+  /** Start (or re-enter) crash auto-reconnect ownership of `ready`. */
+  private beginCrashReconnect(message: string): void {
+    const now = Date.now();
+    if (now < this.reconnectCoolingUntil) {
+      const secs = Math.ceil((this.reconnectCoolingUntil - now) / 1000);
+      const coolMsg = `${message}（Agent 短时内多次崩溃，已暂停自动重连 ${secs}s，请检查 Grok CLI 或重启 Grox）`;
+      this.setAuthState({
+        required: this.authState.required,
+        inProgress: false,
+        error: coolMsg,
+      });
+      const fail = new Error(coolMsg);
+      this.ready = Promise.reject(fail);
+      void this.ready.catch(() => undefined);
+      return;
+    }
     // Park `ready` on the reconnect promise so queue drain / prompt cannot race
-    // a dead stdio child while the 800ms backoff runs (R12 / R14.1).
+    // a dead stdio child while the 800ms backoff runs (R12 / R14.1 / R15).
     this.crashReconnectInFlight = true;
     this.reconnectChildDied = false;
     const epoch = this.reconnectEpoch;
     this.ready = this.runCrashReconnect(message, epoch).finally(() => {
-      if (this.reconnectEpoch === epoch) {
-        this.crashReconnectInFlight = false;
+      if (this.reconnectEpoch !== epoch) return;
+      this.crashReconnectInFlight = false;
+      // Death after success publish but before finally: re-enter recovery (R15).
+      if (this.reconnectChildDied) {
+        this.reconnectChildDied = false;
+        queueMicrotask(() => {
+          if (this.crashReconnectInFlight || this.suppressExitHandling) return;
+          this.beginCrashReconnect("Agent 在重连成功后再次退出");
+        });
       }
     });
     void this.ready.catch(() => undefined);
@@ -1694,6 +1729,16 @@ export class AcpBridge implements GrokBridge {
           return;
         }
         this.ready = Promise.resolve();
+        // R15 flap guard: too many successful reconnects in one minute → cooldown.
+        const now = Date.now();
+        this.reconnectSuccessTimes = this.reconnectSuccessTimes.filter(
+          (t) => now - t < AcpBridge.RECONNECT_FLAP_WINDOW_MS,
+        );
+        this.reconnectSuccessTimes.push(now);
+        if (this.reconnectSuccessTimes.length >= AcpBridge.RECONNECT_FLAP_MAX) {
+          this.reconnectCoolingUntil = now + AcpBridge.RECONNECT_COOLDOWN_MS;
+          this.reconnectSuccessTimes = [];
+        }
         // Rebind active mission in the background so the next send is cheap.
         const active = this.activeSessionId();
         if (active) {
@@ -3486,7 +3531,9 @@ export class AcpBridge implements GrokBridge {
     sessionId: string,
     text: string,
   ): Promise<"ok" | "refused"> {
-    return this.ensureComputerAttachedForPrompt(sessionId, text);
+    // R15: same channel as silent bind / prompt so concurrent queue CU attach
+    // cannot stack multi-minute session/load over a live turn.
+    return this.runOnChannel(() => this.ensureComputerAttachedForPrompt(sessionId, text));
   }
 
   /** Drop one session lease and sticky-stop / revoke its MCP surface. */
