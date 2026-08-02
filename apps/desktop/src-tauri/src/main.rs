@@ -1547,7 +1547,8 @@ fn github_api_http_client() -> Result<reqwest::Client, String> {
 }
 
 /// Prefer absolute package-manager installs so PATH-planted shims cannot run preview.
-fn resolve_package_manager_command(manager: &str) -> PathBuf {
+/// R18: fail-closed — never fall back to a bare name resolved via `%PATH%`.
+fn resolve_package_manager_command(manager: &str) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         let names: &[&str] = match manager {
@@ -1579,11 +1580,11 @@ fn resolve_package_manager_command(manager: &str) -> PathBuf {
             for name in names {
                 let candidate = root.join(name);
                 if candidate.is_file() {
-                    return candidate;
+                    return Some(candidate);
                 }
             }
         }
-        return PathBuf::from(names[0]);
+        return None;
     }
     #[cfg(not(windows))]
     {
@@ -1602,11 +1603,11 @@ fn resolve_package_manager_command(manager: &str) -> PathBuf {
             for name in names {
                 let candidate = PathBuf::from(dir).join(name);
                 if candidate.is_file() {
-                    return candidate;
+                    return Some(candidate);
                 }
             }
         }
-        PathBuf::from(names[0])
+        None
     }
 }
 
@@ -1685,7 +1686,19 @@ fn is_safe_preview_dev_script(script: &str) -> bool {
         || s.contains("bash ")
         || s.contains("/bin/")
         || s.contains("node -e")
+        || s.contains("node -p")
+        || s.contains("node --eval")
+        || s.contains("bun -e")
+        || s.contains("deno eval")
         || s.contains("python -c")
+        || s.contains("python3 -c")
+        || s.contains("mshta")
+        || s.contains("wscript")
+        || s.contains("cscript")
+        || s.contains("rundll")
+        || s.contains("regsvr")
+        || s.contains("bitsadmin")
+        || s.contains("certutil")
         || s.contains("eval ")
     {
         return false;
@@ -2021,14 +2034,24 @@ fn configured_grok_command(app: &tauri::AppHandle) -> GrokRuntimeInfo {
         .find(|candidate| !bundled_paths.iter().any(|bundled| bundled == candidate));
     let preference = read_runtime_preference(app);
 
-    if let Some(path) = std::env::var_os("GROK_DESKTOP_CLI").filter(|value| !value.is_empty()) {
-        return runtime_info(
-            PathBuf::from(path).to_string_lossy().into_owned(),
-            "override",
-            preference,
-            system.as_deref().map(path_for_webview),
-            bundled.as_deref().map(path_for_webview),
-            false,
+    // R18: override must be an absolute, existing file — never a relative PATH name.
+    if let Some(raw) = std::env::var_os("GROK_DESKTOP_CLI").filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(&raw);
+        if path.is_absolute() {
+            if let Some(canonical) = normalized_existing_path(&path) {
+                return runtime_info(
+                    canonical.to_string_lossy().into_owned(),
+                    "override",
+                    preference,
+                    system.as_deref().map(path_for_webview),
+                    bundled.as_deref().map(path_for_webview),
+                    false,
+                );
+            }
+        }
+        eprintln!(
+            "grox: 警告：GROK_DESKTOP_CLI 无效（需为已存在的绝对可执行路径），已忽略：{}",
+            path.display()
         );
     }
 
@@ -2322,7 +2345,16 @@ async fn start_project_preview(
         ));
     }
 
-    let executable = resolve_package_manager_command(target.manager);
+    let Some(executable) = resolve_package_manager_command(target.manager) else {
+        return Ok(preview_response(
+            &target,
+            "error",
+            Some(format!(
+                "未找到 {} 的绝对安装路径（已拒绝 %PATH% 裸名回落，防劫持）",
+                target.manager
+            )),
+        ));
+    };
     let mut command = Command::new(&executable);
     match target.manager {
         "yarn" => {
@@ -4576,6 +4608,19 @@ fn save_media_reference(cwd: String, name: String, data: String) -> Result<Strin
     if bytes.len() > 24 * 1024 * 1024 {
         return Err("参考图片不能超过 24 MB".into());
     }
+    // R18: magic-byte gate — extension alone must not accept HTML/polyglot payloads.
+    let detected = image_mime(&bytes).ok_or_else(|| "参考图片内容不是有效图片".to_string())?;
+    let expected = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => return Err("参考图片仅支持 PNG、JPEG 或 WebP".into()),
+    };
+    if detected != expected {
+        return Err(format!(
+            "参考图片内容与扩展名不符（内容 {detected}，扩展名 .{extension}）"
+        ));
+    }
     let directory = cwd.join(".grox").join("media-input");
     fs::create_dir_all(&directory).map_err(|error| format!("无法创建媒体输入目录：{error}"))?;
     let path = directory.join(format!(
@@ -4687,6 +4732,14 @@ fn read_hidden_projects() -> Result<Vec<String>, String> {
 
 #[tauri::command]
 fn write_hidden_projects(ids: Vec<String>) -> Result<(), String> {
+    // R18: bound list size so a compromised webview cannot thrash disk/JSON.
+    const MAX_HIDDEN_PROJECTS: usize = 512;
+    const MAX_HIDDEN_ID_LEN: usize = 256;
+    if ids.len() > MAX_HIDDEN_PROJECTS {
+        return Err(format!(
+            "隐藏项目列表过长（最多 {MAX_HIDDEN_PROJECTS} 项）"
+        ));
+    }
     let path = hidden_projects_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("无法创建配置目录：{error}"))?;
@@ -4694,10 +4747,17 @@ fn write_hidden_projects(ids: Vec<String>) -> Result<(), String> {
     let mut unique = ids
         .into_iter()
         .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= MAX_HIDDEN_ID_LEN
+                && !id.chars().any(char::is_control)
+        })
         .collect::<Vec<_>>();
     unique.sort();
     unique.dedup();
+    if unique.len() > MAX_HIDDEN_PROJECTS {
+        unique.truncate(MAX_HIDDEN_PROJECTS);
+    }
     let body = serde_json::to_string_pretty(&unique)
         .map_err(|error| format!("无法序列化隐藏项目列表：{error}"))?;
     atomic_write(&path, &body)?;
@@ -7380,6 +7440,12 @@ async fn acp_spawn(
                     if line.is_empty() {
                         continue;
                     }
+                    // R18: cap ACP event payload size before crossing into the webview.
+                    const MAX_ACP_EVENT_BYTES: usize = 2 * 1024 * 1024;
+                    if line.len() > MAX_ACP_EVENT_BYTES {
+                        // Oversized flood (or pathological binary-as-json) — drop.
+                        continue;
+                    }
                     // Silent agent-bind: drop history floods only for sessions in
                     // silent_sessions (per-session — other chats keep streaming).
                     if should_drop_silent_history_line(&stdout_state, line) {
@@ -7454,15 +7520,22 @@ fn acp_set_silent_stream(
     silent: bool,
     session_id: Option<String>,
 ) {
+    // R18: bound silent-session set against webview thrash / unbounded growth.
+    const MAX_SILENT_SESSIONS: usize = 64;
+    const MAX_SESSION_ID_LEN: usize = 200;
     let Ok(mut guard) = state.silent_sessions.lock() else {
         return;
     };
     let sid = session_id.unwrap_or_default();
     let sid = sid.trim();
     if silent {
-        if !sid.is_empty() {
-            guard.insert(sid.to_string());
+        if sid.is_empty() || sid.len() > MAX_SESSION_ID_LEN {
+            return;
         }
+        if guard.len() >= MAX_SILENT_SESSIONS && !guard.contains(sid) {
+            return;
+        }
+        guard.insert(sid.to_string());
     } else if sid.is_empty() {
         guard.clear();
     } else {
@@ -8354,20 +8427,49 @@ api_key = "local-key"
     }
 
     #[test]
-    fn resolve_package_manager_command_returns_manager_basename() {
+    fn resolve_package_manager_command_is_absolute_or_none() {
         for manager in ["npm", "pnpm", "yarn", "bun"] {
-            let path = resolve_package_manager_command(manager);
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            assert!(
-                name.contains(manager),
-                "manager={manager} path={}",
-                path.display()
-            );
+            match resolve_package_manager_command(manager) {
+                Some(path) => {
+                    assert!(
+                        path.is_absolute(),
+                        "manager={manager} must be absolute: {}",
+                        path.display()
+                    );
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    assert!(
+                        name.contains(manager),
+                        "manager={manager} path={}",
+                        path.display()
+                    );
+                }
+                None => {
+                    // Fail-closed when no known install root has the binary — OK.
+                }
+            }
         }
+    }
+
+    #[test]
+    fn preview_dev_script_rejects_script_host_abuse() {
+        assert!(!is_safe_preview_dev_script("vite && mshta evil.hta"));
+        assert!(!is_safe_preview_dev_script("node --eval require('fs')"));
+        assert!(!is_safe_preview_dev_script("certutil -urlcache"));
+        assert!(is_safe_preview_dev_script("vite"));
+    }
+
+    #[test]
+    fn image_mime_detects_common_headers() {
+        assert_eq!(image_mime(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(image_mime(b"\xff\xd8\xff\xe0rest"), Some("image/jpeg"));
+        // 12-byte minimum for WEBP RIFF header
+        let webp_buf = b"RIFF\x00\x00\x00\x00WEBPdata";
+        assert_eq!(image_mime(webp_buf), Some("image/webp"));
+        assert_eq!(image_mime(b"<html>"), None);
     }
 
     #[test]
