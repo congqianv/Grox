@@ -2046,7 +2046,14 @@ export class AcpBridge implements GrokBridge {
       toolName: tool.toolName ?? tool.tool_name,
       rawInput: tool.rawInput ?? tool.raw_input ?? params.rawInput,
     });
-    if (isComputerUseOperatorEnabled() && isComputerUseMcpTool(toolName)) {
+    // Auto-select when product mode is Auto/Bypass (CLI may still raise
+    // request_permission — FE must not stall the turn), or when CU opt-in
+    // already authorized the desktop harness for grok_desktop_computer tools.
+    const modeAuto =
+      this.permissionMode === "auto" || this.permissionMode === "bypass";
+    const cuAuto =
+      isComputerUseOperatorEnabled() && isComputerUseMcpTool(toolName);
+    if (modeAuto || cuAuto) {
       const autoOptionId = optionIds.allow_always ?? optionIds.allow_once;
       if (autoOptionId) {
         void this.sendRaw({

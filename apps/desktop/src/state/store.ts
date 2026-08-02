@@ -40,7 +40,11 @@ import type {
   RewindResult,
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
-import { loadSessionCache, scheduleSaveSessionCache } from "../lib/sessionCache";
+import {
+  cancelSaveSessionCache,
+  loadSessionCache,
+  scheduleSaveSessionCache,
+} from "../lib/sessionCache";
 
 /** Missions whose offline disk history scan finished this process lifetime. */
 const offlineHistoryComplete = new Set<string>();
@@ -302,13 +306,9 @@ function normalizeOfflineSession(raw: unknown, fallback?: Session | null): Sessi
         contextMax: 0,
         turns: 0,
       },
-    // Never force-running from a disk snapshot.
-    status:
-      fallback?.status === "running" ||
-      fallback?.status === "awaiting_permission" ||
-      fallback?.status === "awaiting_input"
-        ? fallback.status
-        : "idle",
+    // Disk / deferred offline snapshots must never re-apply busy turn status
+    // (would stick send after flush when a scan finished mid-turn).
+    status: "idle",
     demo: s.demo ?? fallback?.demo,
     pinned: s.pinned ?? fallback?.pinned,
     archived: s.archived ?? fallback?.archived,
@@ -535,7 +535,12 @@ interface DesktopState {
    * Same-turn interjection (Ctrl+Enter while busy).
    * Tries `x.ai/interject`; on older CLIs pins the message at the queue head.
    */
-  interjectPrompt(text: string, attachments?: PromptAttachment[], sessionId?: string): Promise<void>;
+  /** Returns false when Computer Use refuse kept the draft (do not clear composer). */
+  interjectPrompt(
+    text: string,
+    attachments?: PromptAttachment[],
+    sessionId?: string,
+  ): Promise<boolean>;
   removeQueuedPrompt(sessionId: string, queueId: string): void;
   /** Reorder a pending follow-up before it drains (fromIndex → toIndex). */
   reorderQueuedPrompt(sessionId: string, fromIndex: number, toIndex: number): void;
@@ -1143,7 +1148,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
       case "permission_resolved":
         withSession(e.sessionId, (s) => ({
           ...s,
-          status: "running",
+          // Do not resurrect running after idle/error.
+          status: s.status === "awaiting_permission" ? "running" : s.status,
           blocks: s.blocks.map((b) =>
             b.id === e.blockId && b.type === "permission"
               ? { ...b, resolved: e.option }
@@ -1164,7 +1170,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       case "question_resolved":
         withSession(e.sessionId, (s) => ({
           ...s,
-          status: "running",
+          status: s.status === "awaiting_input" ? "running" : s.status,
           blocks: s.blocks.map((b) =>
             b.id === e.blockId && b.type === "question"
               ? { ...b, response: e.response }
@@ -1266,6 +1272,28 @@ export const useDesktop = create<DesktopState>((set, get) => {
     get().sendPrompt(next.text, next.attachments, sessionId);
   };
 
+  /** Merge offline history with any live-only blocks still on the session. */
+  function mergeOfflineWithLive(pending: Session, cur: Session | undefined): Session {
+    if (!cur || cur.blocks.length === 0) {
+      return { ...pending, status: "idle" };
+    }
+    // Live longer than offline: keep live (already has the offline prefix + turn).
+    if (cur.blocks.length > pending.blocks.length) {
+      return { ...cur, status: "idle" };
+    }
+    const pendingIds = new Set(pending.blocks.map((b) => b.id));
+    const liveOnly = cur.blocks.filter((b) => !pendingIds.has(b.id));
+    if (liveOnly.length === 0) {
+      return { ...pending, status: "idle" };
+    }
+    return {
+      ...pending,
+      status: "idle",
+      blocks: [...pending.blocks, ...liveOnly],
+      usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
+    };
+  }
+
   /** Apply offline transcript deferred because a turn was in flight. */
   function flushPendingOfflineMerge(sessionId: string): void {
     const pending = pendingOfflineMerge.get(sessionId);
@@ -1285,12 +1313,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
       return;
     }
     pendingOfflineMerge.delete(sessionId);
-    if (cur && cur.blocks.length > pending.blocks.length) {
-      offlineHistoryComplete.add(sessionId);
-      return;
-    }
-    set({ sessions: { ...get().sessions, [sessionId]: pending } });
-    if (pending.blocks.length > 0) scheduleSaveSessionCache(pending);
+    const merged = mergeOfflineWithLive(pending, cur);
+    set({ sessions: { ...get().sessions, [sessionId]: merged } });
+    if (merged.blocks.length > 0) scheduleSaveSessionCache(merged);
     offlineHistoryComplete.add(sessionId);
   }
 
@@ -1441,11 +1466,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
                     return;
                   }
                   const cur = get().sessions[payload.id];
-                  // Never clobber a longer live transcript with a late offline scan.
-                  if (cur && cur.blocks.length > next.blocks.length) {
-                    if (phaseComplete) offlineHistoryComplete.add(payload.id);
-                    return;
-                  }
                   if (
                     cur &&
                     (cur.status === "running" ||
@@ -1455,10 +1475,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
                     pendingOfflineMerge.set(payload.id, next);
                     return;
                   }
+                  const merged = mergeOfflineWithLive(next, cur);
                   set({
-                    sessions: { ...get().sessions, [payload.id]: next },
+                    sessions: { ...get().sessions, [payload.id]: merged },
                   });
-                  if (next.blocks.length > 0) scheduleSaveSessionCache(next);
+                  if (merged.blocks.length > 0) scheduleSaveSessionCache(merged);
                   if (phaseComplete) offlineHistoryComplete.add(payload.id);
                 }, 0);
               }
@@ -2564,6 +2585,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       offlineHistoryDeleted.add(id);
       pendingOfflineMerge.delete(id);
       promptInFlightSessions.delete(id);
+      cancelSaveSessionCache(id);
       // Only abort openSession if it targets this id (do not cancel opening B when deleting A).
       if (openSessionTargetId === id || get().activeId === id) {
         bumpOpenSessionGeneration();
@@ -2907,19 +2929,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
         get();
       const targetId = sessionId ?? activeId;
       const session = targetId ? sessions[targetId] : null;
-      if (!session) return;
+      if (!session) return false;
 
       const trimmed = text.trim();
-      if (!trimmed && attachments.length === 0) return;
+      if (!trimmed && attachments.length === 0) return false;
 
       if (session.status === "idle") {
         get().sendPrompt(trimmed, attachments, session.id);
-        return;
+        return true;
       }
 
       if (session.status === "awaiting_permission" || session.status === "awaiting_input") {
         get().sendPrompt(trimmed, attachments, session.id);
-        return;
+        return true;
       }
 
       const composer = sessionComposers[session.id] ?? {
@@ -2950,7 +2972,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
               at: Date.now(),
             },
           });
-          return;
+          return false;
         }
 
         const nextComposers = {
@@ -2981,7 +3003,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
               at: Date.now(),
             },
           });
-          return;
+          return true;
         }
 
         set({
@@ -2994,6 +3016,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             at: Date.now(),
           },
         });
+        return true;
       } catch (error) {
         // Hard failure — still pin to queue head so the operator does not lose text.
         const entry: QueuedPrompt = {
@@ -3026,6 +3049,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             at: Date.now(),
           },
         });
+        return true;
       }
     },
 
