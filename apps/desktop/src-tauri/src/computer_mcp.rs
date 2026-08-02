@@ -1902,7 +1902,44 @@ mod tests {
         assert!(deny_focus_stealing_chord(&["ALT", "TAB"]).is_err());
         assert!(deny_focus_stealing_chord(&["CTRL", "ESC"]).is_err());
         assert!(deny_focus_stealing_chord(&["WIN"]).is_err());
+        assert!(deny_focus_stealing_chord(&["ALT", "SPACE"]).is_err());
+        assert!(deny_focus_stealing_chord(&["CTRL", "SHIFT", "ESC"]).is_err());
+        assert!(deny_focus_stealing_chord(&["ALT", "F4"]).is_err());
         assert!(deny_focus_stealing_chord(&["CTRL", "C"]).is_ok());
         assert!(deny_focus_stealing_chord(&["ENTER"]).is_ok());
+    }
+
+    #[test]
+    fn parse_key_chord_enforces_limits_and_denylist() {
+        let args = json!({"keys": ["CTRL", "S"]});
+        let ok = parse_key_chord(&args).expect("ok chord");
+        assert_eq!(ok, vec!["CTRL", "S"]);
+        assert!(parse_key_chord(&json!({"keys": []})).is_err());
+        assert!(parse_key_chord(&json!({"keys": ["ALT", "TAB"]})).is_err());
+        // max 8 keys
+        let nine: Vec<&str> = (0..9).map(|_| "A").collect();
+        assert!(parse_key_chord(&json!({"keys": nine})).is_err());
+    }
+
+    #[test]
+    fn clamp_type_text_enforces_max_length() {
+        let hi = json!({"text": "hi"});
+        assert!(clamp_type_text(&hi).is_ok());
+        let huge = json!({"text": "x".repeat(20_001)});
+        assert!(clamp_type_text(&huge).is_err());
+    }
+
+    #[test]
+    fn mcp_stop_revokes_http_bearer() {
+        let lease = format!("{:032x}", 0xddddu128);
+        let live = serve_http(lease).expect("start");
+        let mut state = ComputerState {
+            lease_id: Some(format!("{:032x}", 0xddddu128)),
+            ..ComputerState::default()
+        };
+        call_tool_inner("stop", &json!({}), &mut state).expect("stop");
+        assert!(state.stopped);
+        let auth = current_http_auth().expect("auth");
+        assert_ne!(auth.0, live.token, "stop must revoke prior bearer");
     }
 }

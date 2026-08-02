@@ -6586,4 +6586,73 @@ api_key = "local-key"
         let _ = fs::remove_dir_all(&workspace);
     }
 
+    #[test]
+    fn is_loopback_host_rejects_prefix_lookalikes() {
+        assert!(is_loopback_host(Some("localhost")));
+        assert!(is_loopback_host(Some("127.0.0.1")));
+        assert!(is_loopback_host(Some("::1")));
+        assert!(!is_loopback_host(Some("localhost.evil.com")));
+        assert!(!is_loopback_host(Some("127.0.0.1.attacker")));
+        assert!(!is_loopback_host(Some("example.com")));
+        assert!(!is_loopback_host(None));
+    }
+
+    #[test]
+    fn extract_media_rejects_localhost_prefix_tricks() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("grox-media-url-{stamp}"));
+        fs::create_dir_all(&workspace).unwrap();
+        let evil = "http://localhost.evil.com/a.png\nhttp://127.0.0.1.attacker/b.png\nhttp://127.0.0.1/ok.png\n";
+        let artifacts = extract_media_artifacts(evil, &workspace).unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .any(|a| a.url.as_deref() == Some("http://127.0.0.1/ok.png")),
+            "true loopback kept: {artifacts:?}"
+        );
+        assert!(
+            !artifacts.iter().any(|a| {
+                a.url
+                    .as_deref()
+                    .is_some_and(|u| u.contains("evil") || u.contains("attacker"))
+            }),
+            "prefix tricks dropped: {artifacts:?}"
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn cli_env_denylist_blocks_host_sensitive_keys() {
+        assert!(is_denied_cli_env_key("PATH"));
+        assert!(is_denied_cli_env_key("path"));
+        assert!(is_denied_cli_env_key("SSLKEYLOGFILE"));
+        assert!(is_denied_cli_env_key("HTTP_PROXY"));
+        assert!(is_denied_cli_env_key("LD_PRELOAD"));
+        assert!(is_denied_cli_env_key("NODE_OPTIONS"));
+        assert!(!is_denied_cli_env_key("XAI_API_KEY"));
+        assert!(!is_denied_cli_env_key("GROK_MODELS_BASE_URL"));
+    }
+
+    #[test]
+    fn scan_progress_finish_if_is_gen_scoped() {
+        // Simulate: newer gen owns the scan; older worker must not finish atomics.
+        let gen_old = OFFLINE_HISTORY_GEN.load(Ordering::SeqCst);
+        OFFLINE_HISTORY_GEN.store(gen_old.wrapping_add(10), Ordering::SeqCst);
+        SCAN_DONE.store(0, Ordering::Relaxed);
+        scan_progress_finish_if(gen_old, "cancelled");
+        assert_eq!(
+            SCAN_DONE.load(Ordering::Relaxed),
+            0,
+            "stale gen must not set DONE"
+        );
+        let gen_now = OFFLINE_HISTORY_GEN.load(Ordering::SeqCst);
+        scan_progress_finish_if(gen_now, "complete");
+        assert_eq!(SCAN_DONE.load(Ordering::Relaxed), 1);
+        // Restore done for other tests (best-effort).
+        SCAN_DONE.store(0, Ordering::Relaxed);
+    }
+
 }
