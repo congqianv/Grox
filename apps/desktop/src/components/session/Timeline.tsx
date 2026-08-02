@@ -442,7 +442,12 @@ export function Timeline({ session }: { session: Session }) {
   const hasBlocks = session.blocks.length > 0;
   // Latest turn id — only this row uses live process chrome while the session runs.
   const lastTurnId = turns.at(-1)?.id;
-  const isLive = session.status === "running";
+  // Follow stream during tool turns AND while waiting for operator input so
+  // permission/question cards are not left off-screen (R4 M1).
+  const isLive =
+    session.status === "running" ||
+    session.status === "awaiting_permission" ||
+    session.status === "awaiting_input";
 
   const markers = useMemo<RequestMarker[]>(() => {
     const requests = turns

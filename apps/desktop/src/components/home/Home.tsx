@@ -48,6 +48,7 @@ export function Home() {
   const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState("");
   const [readingFiles, setReadingFiles] = useState(false);
+  const [launching, setLaunching] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -184,16 +185,21 @@ export function Home() {
 
   const launch = async () => {
     const prompt = q.trim();
-    if ((!prompt && attachments.length === 0) || readingFiles) return;
+    if ((!prompt && attachments.length === 0) || readingFiles || launching) return;
     // newSession focuses the mission and returns its id; sendPrompt needs that
     // id (activeId was null on Home → silent no-op before this fix).
-    const id = await newSession();
-    if (!id) return;
-    sendPrompt(prompt, attachments, id);
-    setQ("");
-    setCursor(0);
-    setAttachments([]);
-    setAttachmentError("");
+    setLaunching(true);
+    try {
+      const id = await newSession();
+      if (!id) return;
+      sendPrompt(prompt, attachments, id);
+      setQ("");
+      setCursor(0);
+      setAttachments([]);
+      setAttachmentError("");
+    } finally {
+      setLaunching(false);
+    }
   };
 
   const pickAtFile = (entry: WorkspaceEntry) => {

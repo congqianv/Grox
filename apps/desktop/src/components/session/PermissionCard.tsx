@@ -49,6 +49,20 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
   useEffect(() => {
     if (resolved || !isActive) return;
     const onKey = (e: KeyboardEvent) => {
+      // Do not steal 1/2/3 while the operator is typing in the composer.
+      const t = e.target;
+      if (t instanceof HTMLElement) {
+        const tag = t.tagName;
+        if (
+          tag === "TEXTAREA" ||
+          tag === "INPUT" ||
+          tag === "SELECT" ||
+          t.isContentEditable
+        ) {
+          return;
+        }
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       const idx = ["1", "2", "3"].indexOf(e.key);
       if (idx >= 0 && options[idx]) {
         e.preventDefault();

@@ -3181,6 +3181,14 @@ export class AcpBridge implements GrokBridge {
     await invoke("computer_revoke_http_auth").catch(() => {});
   }
 
+  /** Public wrapper for busy-queue CU gating (store enqueue path). */
+  async prepareComputerForPrompt(
+    sessionId: string,
+    text: string,
+  ): Promise<"ok" | "refused"> {
+    return this.ensureComputerAttachedForPrompt(sessionId, text);
+  }
+
   /** Drop one session lease and sticky-stop / revoke its MCP surface. */
   private async revokeComputerLease(sessionId: string): Promise<void> {
     const leaseId = this.computerLeases.get(sessionId);
@@ -3339,6 +3347,10 @@ export class AcpBridge implements GrokBridge {
         await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(
           () => {},
         );
+      }
+      // Process-wide MCP bearer rotates on each serve_http — sibling leases are stale.
+      for (const sid of [...this.computerLeases.keys()]) {
+        if (sid !== sessionId) this.computerLeases.delete(sid);
       }
       this.computerLeases.set(sessionId, attachLease);
       this.emit({

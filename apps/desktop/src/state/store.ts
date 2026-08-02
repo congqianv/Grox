@@ -8,6 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { bridge } from "../bridge";
 import { DEFAULT_PERMISSION_MODE, MODELS, readStoredPermissionMode } from "../bridge/types";
+import { COMPUTER_USE_OPT_IN_REFUSE_MESSAGE } from "../lib/computerUse";
 import type {
   AgentMode,
   AccountInfo,
@@ -57,6 +58,16 @@ const offlineHistoryDeleted = new Set<string>();
 const promptInFlightSessions = new Set<string>();
 /** Monotonic token so superseded openSession awaits do not steal focus. */
 let openSessionGeneration = 0;
+/** Target of the latest openSession — applyChrome only if still this id. */
+let openSessionTargetId: string | null = null;
+/** Offline scan finished while turn was live — merge on idle. */
+const pendingOfflineMerge = new Map<string, Session>();
+
+/** Invalidate in-flight openSession applyChrome (Home / new mission / workspace). */
+function bumpOpenSessionGeneration(clearTarget = true): void {
+  openSessionGeneration += 1;
+  if (clearTarget) openSessionTargetId = null;
+}
 /** Poll timer for offline scan progress (atomics in Rust — no event flood). */
 let offlineScanPollTimer: number | null = null;
 
@@ -996,6 +1007,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
         break;
       }
       case "session_ready": {
+        // Deleted missions must not reappear via late session/new|load.
+        if (offlineHistoryDeleted.has(e.session.id)) break;
         const { blocks: _b, usage: _u, status: _st, ...meta } = e.session;
         const nextIndex = [
           decorateSessions([meta])[0],
@@ -1163,7 +1176,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         withSession(e.sessionId, (s) => ({ ...s, status: e.status }));
         if (e.status === "idle") {
           // Drain CLI-style follow-up queue once the active turn settles.
-          window.setTimeout(() => drainPromptQueue(e.sessionId), 0);
+          window.setTimeout(() => {
+            flushPendingOfflineMerge(e.sessionId);
+            drainPromptQueue(e.sessionId);
+          }, 0);
         }
         break;
       case "usage":
@@ -1178,7 +1194,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
             { type: "system", id: uid(), text: e.message, ts: Date.now(), kind: "error" },
           ],
         }));
-        window.setTimeout(() => drainPromptQueue(e.sessionId), 0);
+        window.setTimeout(() => {
+          flushPendingOfflineMerge(e.sessionId);
+          drainPromptQueue(e.sessionId);
+        }, 0);
         break;
       case "prompt_queue": {
         // CLI is authoritative: merge text/state/version, keep local attachment payloads by id.
@@ -1246,6 +1265,34 @@ export const useDesktop = create<DesktopState>((set, get) => {
     });
     get().sendPrompt(next.text, next.attachments, sessionId);
   };
+
+  /** Apply offline transcript deferred because a turn was in flight. */
+  function flushPendingOfflineMerge(sessionId: string): void {
+    const pending = pendingOfflineMerge.get(sessionId);
+    if (!pending) return;
+    if (offlineHistoryDeleted.has(sessionId)) {
+      pendingOfflineMerge.delete(sessionId);
+      return;
+    }
+    if (promptInFlightSessions.has(sessionId)) return;
+    const cur = get().sessions[sessionId];
+    if (
+      cur &&
+      (cur.status === "running" ||
+        cur.status === "awaiting_permission" ||
+        cur.status === "awaiting_input")
+    ) {
+      return;
+    }
+    pendingOfflineMerge.delete(sessionId);
+    if (cur && cur.blocks.length > pending.blocks.length) {
+      offlineHistoryComplete.add(sessionId);
+      return;
+    }
+    set({ sessions: { ...get().sessions, [sessionId]: pending } });
+    if (pending.blocks.length > 0) scheduleSaveSessionCache(pending);
+    offlineHistoryComplete.add(sessionId);
+  }
 
   return {
     ready: false,
@@ -1352,15 +1399,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
             startOfflineScanPoll(loadingId);
           }
 
-          // cancelled/error are retryable — do not permanent-complete.
-          if (
-            payload.phase === "complete" ||
-            payload.phase === "no-updates" ||
-            payload.phase === "missing"
-          ) {
-            offlineHistoryComplete.add(payload.id);
-          }
-
           // Only merge body if still in catalog or memory (not deleted mid-scan).
           const stillCatalogued = get().sessionIndex.some((m) => m.id === payload.id);
           const existing = get().sessions[payload.id];
@@ -1379,30 +1417,56 @@ export const useDesktop = create<DesktopState>((set, get) => {
             existing &&
             (existing.status === "running" ||
               existing.status === "awaiting_permission" ||
-              existing.status === "awaiting_input");
-          if (!liveBusy && payload.session) {
+              existing.status === "awaiting_input" ||
+              promptInFlightSessions.has(payload.id));
+
+          const phaseComplete =
+            payload.phase === "complete" ||
+            payload.phase === "no-updates" ||
+            payload.phase === "missing";
+
+          // cancelled/error are retryable — do not permanent-complete until merge
+          // can run. Live turn must not mark complete (else re-open never rescans).
+          if (payload.session) {
             const next = normalizeOfflineSession(payload.session, existing);
             if (next && !offlineHistoryDeleted.has(payload.id)) {
-              window.setTimeout(() => {
-                if (offlineHistoryDeleted.has(payload.id)) return;
-                if (promptInFlightSessions.has(payload.id)) return;
-                const cur = get().sessions[payload.id];
-                // Never clobber a longer live transcript with a late offline scan.
-                if (cur && cur.blocks.length > next.blocks.length) return;
-                if (
-                  cur &&
-                  (cur.status === "running" ||
-                    cur.status === "awaiting_permission" ||
-                    cur.status === "awaiting_input")
-                ) {
-                  return;
-                }
-                set({
-                  sessions: { ...get().sessions, [payload.id]: next },
-                });
-                if (next.blocks.length > 0) scheduleSaveSessionCache(next);
-              }, 0);
+              if (liveBusy) {
+                pendingOfflineMerge.set(payload.id, next);
+              } else {
+                pendingOfflineMerge.delete(payload.id);
+                window.setTimeout(() => {
+                  if (offlineHistoryDeleted.has(payload.id)) return;
+                  if (promptInFlightSessions.has(payload.id)) {
+                    pendingOfflineMerge.set(payload.id, next);
+                    return;
+                  }
+                  const cur = get().sessions[payload.id];
+                  // Never clobber a longer live transcript with a late offline scan.
+                  if (cur && cur.blocks.length > next.blocks.length) {
+                    if (phaseComplete) offlineHistoryComplete.add(payload.id);
+                    return;
+                  }
+                  if (
+                    cur &&
+                    (cur.status === "running" ||
+                      cur.status === "awaiting_permission" ||
+                      cur.status === "awaiting_input")
+                  ) {
+                    pendingOfflineMerge.set(payload.id, next);
+                    return;
+                  }
+                  set({
+                    sessions: { ...get().sessions, [payload.id]: next },
+                  });
+                  if (next.blocks.length > 0) scheduleSaveSessionCache(next);
+                  if (phaseComplete) offlineHistoryComplete.add(payload.id);
+                }, 0);
+              }
+            } else if (phaseComplete && !liveBusy) {
+              offlineHistoryComplete.add(payload.id);
             }
+          } else if (phaseComplete && !liveBusy) {
+            offlineHistoryComplete.add(payload.id);
           }
 
           if (get().fullHistoryLoadingId === payload.id && get().historyLoadMode === "disk") {
@@ -1504,6 +1568,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     goHome: () => {
+      bumpOpenSessionGeneration();
       if (bridge.kind === "acp") {
         void invoke("cancel_offline_session_history").catch(() => {});
       }
@@ -1724,8 +1789,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
           stopOfflineScanPoll();
         }
 
+        openSessionTargetId = id;
         const openGen = ++openSessionGeneration;
-        const stillThisOpen = () => openGen === openSessionGeneration;
+        const stillThisOpen = () =>
+          openGen === openSessionGeneration && openSessionTargetId === id;
 
         const meta = current.sessionIndex.find((entry) => entry.id === id);
         if (meta) bridge.rememberSessionMeta?.(meta);
@@ -1951,6 +2018,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     async newSession() {
       try {
+        // Invalidate in-flight openSession so a late applyChrome cannot steal focus.
+        bumpOpenSessionGeneration();
         // session_ready fires during this await while activeId is often still null
         // (Home). That path only *stores* the session — it does not focus. Focus
         // here so Home launch + sendPrompt actually target the new id.
@@ -2110,6 +2179,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async setWorkspace(cwd) {
+      bumpOpenSessionGeneration();
       await bridge.setWorkspace(cwd);
       const workspace = await bridge.getWorkspace();
       const fetchedSessions = await bridge.listSessions(workspace);
@@ -2492,7 +2562,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
     async deleteSession(id) {
       // Tombstone first so late offline scan / in-flight openSession cannot resurrect.
       offlineHistoryDeleted.add(id);
-      openSessionGeneration += 1;
+      pendingOfflineMerge.delete(id);
+      promptInFlightSessions.delete(id);
+      // Only abort openSession if it targets this id (do not cancel opening B when deleting A).
+      if (openSessionTargetId === id || get().activeId === id) {
+        bumpOpenSessionGeneration();
+      }
       offlineHistoryScanning.delete(id);
       offlineHistoryComplete.delete(id);
       if (get().fullHistoryLoadingId === id || get().diskHistoryProgress?.id === id) {
@@ -2503,7 +2578,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         }
       }
       await bridge.deleteSession(id);
-      const { sessionIndex, sessions, activeId, sessionComposers } = get();
+      const { sessionIndex, sessions, activeId, sessionComposers, promptQueues } = get();
       const rest = { ...sessions };
       delete rest[id];
       const nextComposers = { ...sessionComposers };
@@ -2511,10 +2586,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
       persistSessionComposers(nextComposers);
       const nextIndex = sessionIndex.filter((m) => m.id !== id);
       persistSessionCatalog(nextIndex);
+      const nextQueues = { ...promptQueues };
+      delete nextQueues[id];
       set({
         sessionIndex: nextIndex,
         sessions: rest,
         sessionComposers: nextComposers,
+        promptQueues: nextQueues,
         ...(activeId === id
           ? {
               activeId: null,
@@ -2644,20 +2722,40 @@ export const useDesktop = create<DesktopState>((set, get) => {
           },
         });
 
-        // Try CLI queue path (concurrent prompt) — if it succeeds, CLI owns execution.
-        void bridge
-          .enqueuePrompt(
-            session.id,
-            trimmed,
-            {
-              model: composer.model,
-              effort: composer.effort,
-              mode: composer.mode,
-              attachments,
-            },
-            { promptId: entry.id },
-          )
-          .then(() => {
+        // CU ensure on concurrent queue (same refuse/attach policy as promptInner).
+        void (async () => {
+          if (bridge.prepareComputerForPrompt) {
+            const cu = await bridge.prepareComputerForPrompt(session.id, trimmed);
+            if (cu === "refused") {
+              // Drop the queue entry we just added — do not send to agent.
+              const q = get().promptQueues[session.id] ?? [];
+              set({
+                promptQueues: {
+                  ...get().promptQueues,
+                  [session.id]: q.filter((item) => item.id !== entry.id),
+                },
+                queueNotice: {
+                  id: uid(),
+                  message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
+                  state: "blocked",
+                  at: Date.now(),
+                },
+              });
+              return;
+            }
+          }
+          try {
+            await bridge.enqueuePrompt(
+              session.id,
+              trimmed,
+              {
+                model: composer.model,
+                effort: composer.effort,
+                mode: composer.mode,
+                attachments,
+              },
+              { promptId: entry.id },
+            );
             const current = get().promptQueues[session.id] ?? [];
             if (!current.some((item) => item.id === entry.id)) return;
             set({
@@ -2668,10 +2766,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
                 ),
               },
             });
-          })
-          .catch(() => {
+          } catch {
             // CLI rejected — keep local ownership and drain on idle.
-          });
+          }
+        })();
         return;
       }
 
@@ -2769,6 +2867,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
           });
         } catch (error) {
           const s = get();
+          // Never resurrect a deleted mission from a late prompt failure.
+          if (offlineHistoryDeleted.has(session.id) || !s.sessions[session.id]) {
+            return;
+          }
           const clearAgent =
             s.fullHistoryLoadingId === session.id && s.historyLoadMode === "agent";
           set({
@@ -2788,13 +2890,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
             sessions: {
               ...get().sessions,
               [session.id]: {
-                ...(get().sessions[session.id] ?? session),
+                ...get().sessions[session.id],
                 status: "idle",
               },
             },
           });
         } finally {
           promptInFlightSessions.delete(session.id);
+          flushPendingOfflineMerge(session.id);
         }
       })();
     },
@@ -2836,13 +2939,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
           attachments,
         });
 
-        const nextComposers = {
-          ...sessionComposers,
-          [session.id]: { ...composer, text: "", attachments: [] },
-        };
-        persistSessionComposers(nextComposers);
-
         // Computer Use opt-in refuse: show notice, keep composer text, no queue.
+        // Do not persist empty composer (would wipe draft on reload).
         if (result.state === "refused") {
           set({
             queueNotice: {
@@ -2854,6 +2952,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
           });
           return;
         }
+
+        const nextComposers = {
+          ...sessionComposers,
+          [session.id]: { ...composer, text: "", attachments: [] },
+        };
+        persistSessionComposers(nextComposers);
 
         if (result.fallback || result.state === "queued_head") {
           const entry: QueuedPrompt = {

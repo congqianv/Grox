@@ -137,11 +137,8 @@ export const COMPUTER_USE_OPT_IN_REFUSE_MESSAGE =
 export function isComputerUseMcpTool(name: string | null | undefined): boolean {
   if (!name) return false;
   const n = name.toLowerCase().replace(/-/g, "_");
-  return (
-    n.includes("grok_desktop_computer") ||
-    n.includes("desktop_computer__") ||
-    n.startsWith("computer__")
-  );
+  // Prefer exact Grox harness prefix — avoid auto-approving unrelated "computer__*" tools.
+  return n.startsWith("grok_desktop_computer");
 }
 
 /**

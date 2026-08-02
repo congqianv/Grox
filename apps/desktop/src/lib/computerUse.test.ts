@@ -203,6 +203,7 @@ describe("computer MCP tool permission auto-allow helpers", () => {
     expect(isComputerUseMcpTool("grok_desktop_computer__start")).toBe(true);
     expect(isComputerUseMcpTool("bash")).toBe(false);
     expect(isComputerUseMcpTool("read_file")).toBe(false);
+    expect(isComputerUseMcpTool("computer__evil")).toBe(false);
   });
 
   it("extracts tool_name from UseTool rawInput JSON", () => {

@@ -177,4 +177,13 @@ export interface GrokBridge {
    * MCP bearer so disable-after-attach cannot leave control live (R4A-CU-01).
    */
   revokeComputerUseCapability?(): Promise<void>;
+
+  /**
+   * Prompt-time Computer Use attach/refuse (same policy as session/prompt).
+   * Used before concurrent CLI queue sends so busy-session CU intent is gated.
+   */
+  prepareComputerForPrompt?(
+    sessionId: string,
+    text: string,
+  ): Promise<"ok" | "refused">;
 }
