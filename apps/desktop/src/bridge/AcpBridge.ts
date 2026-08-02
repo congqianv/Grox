@@ -2504,7 +2504,7 @@ export class AcpBridge implements GrokBridge {
     return sessions;
   }
 
-  async newSession(cwd: string): Promise<void> {
+  async newSession(cwd: string): Promise<string> {
     const metaRequest = await this.sessionMeta(cwd);
     const preferredModel = localStorage.getItem("grok.model")?.trim();
     // Soft-fail when CU opt-in is off: empty MCP/plugin lists, session still creates.
@@ -2562,6 +2562,7 @@ export class AcpBridge implements GrokBridge {
     this.cursors.set(sessionId, { toolBlocks: new Map() });
     this.usage.set(sessionId, { ...EMPTY_USAGE });
     this.emit({ type: "session_ready", session: emptySession(meta) });
+    return sessionId;
   }
 
   async loadSession(

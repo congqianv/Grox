@@ -77,8 +77,8 @@ export interface GrokBridge {
   /** Change the real Grok Build harness mode for an existing session. */
   setSessionMode(sessionId: string, mode: AgentMode): Promise<void>;
 
-  /** ACP: session/new — emits session_ready. */
-  newSession(cwd: string): Promise<void>;
+  /** ACP: session/new — emits session_ready; resolves to the new session id. */
+  newSession(cwd: string): Promise<string>;
 
   /**
    * ACP: session/load — binds the session in the agent process.

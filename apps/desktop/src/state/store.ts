@@ -468,7 +468,8 @@ interface DesktopState {
   installAppUpdate(): Promise<void>;
   goHome(): void;
   openSession(id: string): Promise<void>;
-  newSession(): Promise<void>;
+  /** Create a mission; focuses it and returns its id (null on failure). */
+  newSession(): Promise<string | null>;
   newProject(): Promise<void>;
   /**
    * Import one or more folders as projects (e.g. drag onto the sidebar list).
@@ -1500,8 +1501,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const prompt = params.get("prompt");
       if (open) void get().openSession(open);
       else if (prompt) {
-        await get().newSession();
-        get().sendPrompt(prompt);
+        const id = await get().newSession();
+        if (id) get().sendPrompt(prompt, [], id);
       }
     },
 
@@ -1953,10 +1954,44 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     async newSession() {
       try {
-        await bridge.newSession(get().workspace);
-        set({ startupError: null });
+        // session_ready fires during this await while activeId is often still null
+        // (Home). That path only *stores* the session — it does not focus. Focus
+        // here so Home launch + sendPrompt actually target the new id.
+        const id = await bridge.newSession(get().workspace);
+        const session = get().sessions[id];
+        const projects = session
+          ? ensureProject(get().projects, session.cwd, { force: true })
+          : get().projects;
+        const composer = normalizeComposer(get().sessionComposers[id], {
+          model: get().model || get().models[0]?.id || MODELS[0]?.id || "grok-build",
+          effort: get().effort || "high",
+          mode: get().mode || "agent",
+          permissionMode: get().permissionMode || "default",
+        });
+        const sessionComposers = { ...get().sessionComposers, [id]: composer };
+        persistSessionComposers(sessionComposers);
+        bridge.setPermissionMode(composer.permissionMode);
+        set({
+          startupError: null,
+          activeId: id,
+          view: "session",
+          sessionComposers,
+          model: composer.model,
+          effort: composer.effort,
+          mode: composer.mode,
+          permissionMode: composer.permissionMode,
+          ...(session
+            ? {
+                workspace: session.cwd,
+                activeProjectId: projectId(session.cwd),
+                projects,
+              }
+            : {}),
+        });
+        return id;
       } catch (error) {
         set({ startupError: error instanceof Error ? error.message : String(error) });
+        return null;
       }
     },
 

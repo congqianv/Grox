@@ -185,8 +185,11 @@ export function Home() {
   const launch = async () => {
     const prompt = q.trim();
     if ((!prompt && attachments.length === 0) || readingFiles) return;
-    await newSession();
-    sendPrompt(prompt, attachments);
+    // newSession focuses the mission and returns its id; sendPrompt needs that
+    // id (activeId was null on Home → silent no-op before this fix).
+    const id = await newSession();
+    if (!id) return;
+    sendPrompt(prompt, attachments, id);
     setQ("");
     setCursor(0);
     setAttachments([]);
