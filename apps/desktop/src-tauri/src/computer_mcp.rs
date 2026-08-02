@@ -402,7 +402,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "computer_key",
-            "按下组合键，例如 CTRL+L、ALT+TAB、ENTER、ESC。",
+            "按下组合键，例如 CTRL+L、ENTER、ESC（禁止 ALT+TAB / WIN 等焦点跳转键）。",
             json!({"type":"object","properties":{"keys":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8},"stateId":{"type":"integer"}},"required":["keys","stateId"],"additionalProperties":false}),
         ),
         tool(
@@ -568,14 +568,20 @@ fn call_tool_inner(name: &str, args: &Value, state: &mut ComputerState) -> Resul
         "set_value" => {
             check_state(args, state)?;
             let hwnd = state.active_window.ok_or("尚未选择窗口")?;
+            let value = args
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or("缺少 value")?;
+            const MAX_VALUE_CHARS: usize = 20_000;
+            if value.chars().count() > MAX_VALUE_CHARS {
+                return Err(format!("value 超过 {MAX_VALUE_CHARS} 字符上限"));
+            }
             platform::set_value(
                 hwnd,
                 args.get("elementId")
                     .and_then(Value::as_str)
                     .ok_or("缺少 elementId")?,
-                args.get("value")
-                    .and_then(Value::as_str)
-                    .ok_or("缺少 value")?,
+                value,
             )?;
             observe(state)
         }

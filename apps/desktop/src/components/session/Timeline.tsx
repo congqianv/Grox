@@ -402,6 +402,11 @@ const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
 const LIVE_TURN_WINDOW = 40;
 const STICK_BOTTOM_PX = 48;
 
+/** Stable Footer type — inline `Footer: () => …` remounts Virtuoso chrome every stream tick. */
+function TimelineVirtuosoFooter() {
+  return <div className="h-8" />;
+}
+
 export function Timeline({ session }: { session: Session }) {
   const { language } = useI18n();
   const fullHistoryLoadingId = useDesktop((s) => s.fullHistoryLoadingId);
@@ -594,6 +599,91 @@ export function Timeline({ session }: { session: Session }) {
         ? `First send: binding agent context… ${bindElapsedSec}s elapsed`
         : "First send: silently binding agent context…";
 
+  // Stable component types for Virtuoso chrome — only rebuild when banner inputs change
+  // (not on every streaming block_patch).
+  const virtuosoComponents = useMemo(
+    () => ({
+      Header: function TimelineListHeader() {
+        return (
+          <div className="mx-auto max-w-[860px] px-8 pt-8">
+            {loadingFullHistory && (
+              <div className="mb-4 rounded-md border border-line/80 bg-raise/50 px-3 py-2.5">
+                <div className="flex items-center justify-center gap-2 text-[11.5px] text-mute">
+                  <BlackHole size={14} spin />
+                  <span className="min-w-0 text-center">
+                    {historyLoadMode === "disk"
+                      ? language === "zh-CN"
+                        ? scanProgress
+                          ? `正在从磁盘补全历史… ${scanProgress.percent}%` +
+                            (scanProgress.totalBytes > 0
+                              ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
+                              : "") +
+                            (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} 条` : "")
+                          : "正在从磁盘补全完整历史（工具调用等）… 可切换其他对话"
+                        : scanProgress
+                          ? `Loading history from disk… ${scanProgress.percent}%` +
+                            (scanProgress.totalBytes > 0
+                              ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
+                              : "") +
+                            (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} blocks` : "")
+                          : "Loading full history from disk… switching chats is fine"
+                      : agentBindLabel}
+                  </span>
+                </div>
+                {historyLoadMode === "disk" && scanProgress && (
+                  <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-line/60">
+                    <div
+                      className="h-full rounded-full bg-acc/80 transition-[width] duration-200 ease-out"
+                      style={{ width: `${Math.min(100, Math.max(2, scanProgress.percent))}%` }}
+                    />
+                  </div>
+                )}
+                {historyLoadMode === "agent" && bindElapsedSec >= 3 && (
+                  <p className="mt-1.5 text-center text-[10.5px] text-faint">
+                    {language === "zh-CN"
+                      ? "大会话绑定可能较久 · 界面仍可滚动与切换对话"
+                      : "Large sessions can take a while · UI stays interactive"}
+                  </p>
+                )}
+                {historyLoadMode === "disk" && (
+                  <p className="mt-1.5 text-center text-[10.5px] text-faint">
+                    {language === "zh-CN"
+                      ? "可切换其他对话，不会卡住 · 完成后下次打开会更快"
+                      : "You can switch chats · next open will be faster"}
+                  </p>
+                )}
+              </div>
+            )}
+            {hiddenCount > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  followRef.current = false;
+                  setShowAll(true);
+                }}
+                className="mb-6 flex w-full items-center justify-center gap-2 rounded-md border border-line bg-raise/60 py-2 text-[12px] text-mute transition-colors hover:bg-high hover:text-fg2"
+              >
+                {language === "zh-CN"
+                  ? `显示更早的 ${hiddenCount} 轮对话`
+                  : `Show ${hiddenCount} earlier turns`}
+              </button>
+            )}
+          </div>
+        );
+      },
+      Footer: TimelineVirtuosoFooter,
+    }),
+    [
+      loadingFullHistory,
+      historyLoadMode,
+      scanProgress,
+      agentBindLabel,
+      bindElapsedSec,
+      language,
+      hiddenCount,
+    ],
+  );
+
   return (
     <div className="relative flex min-h-0 flex-1">
       <Virtuoso
@@ -620,75 +710,7 @@ export function Timeline({ session }: { session: Session }) {
           return isLive ? true : "auto";
         }}
         computeItemKey={(_index, turn) => turn.id}
-        components={{
-          Header: () => (
-            <div className="mx-auto max-w-[860px] px-8 pt-8">
-              {loadingFullHistory && (
-                <div className="mb-4 rounded-md border border-line/80 bg-raise/50 px-3 py-2.5">
-                  <div className="flex items-center justify-center gap-2 text-[11.5px] text-mute">
-                    <BlackHole size={14} spin />
-                    <span className="min-w-0 text-center">
-                      {historyLoadMode === "disk"
-                        ? language === "zh-CN"
-                          ? scanProgress
-                            ? `正在从磁盘补全历史… ${scanProgress.percent}%` +
-                              (scanProgress.totalBytes > 0
-                                ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
-                                : "") +
-                              (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} 条` : "")
-                            : "正在从磁盘补全完整历史（工具调用等）… 可切换其他对话"
-                          : scanProgress
-                            ? `Loading history from disk… ${scanProgress.percent}%` +
-                              (scanProgress.totalBytes > 0
-                                ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
-                                : "") +
-                              (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} blocks` : "")
-                            : "Loading full history from disk… switching chats is fine"
-                        : agentBindLabel}
-                    </span>
-                  </div>
-                  {historyLoadMode === "disk" && scanProgress && (
-                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-line/60">
-                      <div
-                        className="h-full rounded-full bg-acc/80 transition-[width] duration-200 ease-out"
-                        style={{ width: `${Math.min(100, Math.max(2, scanProgress.percent))}%` }}
-                      />
-                    </div>
-                  )}
-                  {historyLoadMode === "agent" && bindElapsedSec >= 3 && (
-                    <p className="mt-1.5 text-center text-[10.5px] text-faint">
-                      {language === "zh-CN"
-                        ? "大会话绑定可能较久 · 界面仍可滚动与切换对话"
-                        : "Large sessions can take a while · UI stays interactive"}
-                    </p>
-                  )}
-                  {historyLoadMode === "disk" && (
-                    <p className="mt-1.5 text-center text-[10.5px] text-faint">
-                      {language === "zh-CN"
-                        ? "可切换其他对话，不会卡住 · 完成后下次打开会更快"
-                        : "You can switch chats · next open will be faster"}
-                    </p>
-                  )}
-                </div>
-              )}
-              {hiddenCount > 0 && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    followRef.current = false;
-                    setShowAll(true);
-                  }}
-                  className="mb-6 flex w-full items-center justify-center gap-2 rounded-md border border-line bg-raise/60 py-2 text-[12px] text-mute transition-colors hover:bg-high hover:text-fg2"
-                >
-                  {language === "zh-CN"
-                    ? `显示更早的 ${hiddenCount} 轮对话`
-                    : `Show ${hiddenCount} earlier turns`}
-                </button>
-              )}
-            </div>
-          ),
-          Footer: () => <div className="h-8" />,
-        }}
+        components={virtuosoComponents}
         itemContent={(_index, turn) => {
           const active = turn.id === lastTurnId;
           return (

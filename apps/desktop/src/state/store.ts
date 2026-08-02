@@ -2554,8 +2554,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
         return;
       }
 
-      // Busy turn → enqueue follow-up (Grok Build CLI-style queue).
-      if (session.status !== "idle") {
+      // Busy turn (or first-send still binding) → enqueue follow-up.
+      if (session.status !== "idle" || promptInFlightSessions.has(session.id)) {
         const entry: QueuedPrompt = {
           id: uid(),
           text: trimmed,
@@ -2624,6 +2624,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
       );
       persistSessionCatalog(nextIndex);
 
+      // Claim the in-flight slot before any await/set so double-click cannot dual-paint.
+      if (promptInFlightSessions.has(session.id)) return;
+      promptInFlightSessions.add(session.id);
+
       const nextComposers = {
         ...sessionComposers,
         [session.id]: { ...composer, text: "", attachments: [] },
@@ -2664,7 +2668,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
       bridge.setPermissionMode(composer.permissionMode);
       // Bind agent only when the user actually continues the chat (first send).
       // Opening/switching never does session/load — that was the freeze source.
-      promptInFlightSessions.add(session.id);
       void (async () => {
         const clearAgentBannerIfOurs = () => {
           const s = get();

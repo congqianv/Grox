@@ -3089,6 +3089,13 @@ export class AcpBridge implements GrokBridge {
     this.knownSessions.delete(id);
     this.cursors.delete(id);
     this.usage.delete(id);
+    // Drop inflight load so a late loadSessionInner cannot re-bind a deleted id.
+    this.loadPromises.delete(id);
+    this.silentReplaying.delete(id);
+    this.replaying.delete(id);
+    this.sessionOptions.delete(id);
+    this.cliQueues.delete(id);
+    void this.setSilentStream(this.silentReplaying.size > 0);
   }
 
   async emergencyStopComputer(sessionId: string): Promise<void> {

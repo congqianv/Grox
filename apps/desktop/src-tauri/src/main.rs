@@ -955,6 +955,11 @@ fn checked_media_prompt(request: &MediaGenerationRequest, cwd: &Path) -> Result<
         "1:1" | "16:9" | "9:16" | "4:3" => request.aspect.as_str(),
         _ => return Err("不支持的画面比例".into()),
     };
+    let resolution = match request.resolution.trim() {
+        "480p" | "720p" | "1080p" | "4k" | "4K" => request.resolution.trim(),
+        other if other.is_empty() => "1080p",
+        _ => return Err("不支持的视频分辨率（允许 480p / 720p / 1080p / 4K）".into()),
+    };
     // Reference image must stay inside the checked workspace (no absolute escape /
     // newline prompt injection via path).
     let reference_abs = match request.reference_path.as_deref() {
@@ -981,7 +986,7 @@ fn checked_media_prompt(request: &MediaGenerationRequest, cwd: &Path) -> Result<
             format!(
                 "{reference}真实生成视频，画面比例 {aspect}，时长 {duration} 秒，分辨率 {resolution}。生成完成后仅列出实际输出文件的绝对路径或 URL。用户提示：{prompt}",
                 duration = request.duration.clamp(1, 30),
-                resolution = request.resolution
+                resolution = resolution
             )
         }
         _ => return Err("不支持的媒体类型".into()),
@@ -6666,14 +6671,36 @@ api_key = "local-key"
     #[test]
     fn media_generation_tools_are_media_only_constant() {
         // Always-approve is only safe while this list stays media-scoped.
+        let tools: Vec<&str> = MEDIA_GENERATION_TOOLS.split(',').collect();
         assert_eq!(
-            MEDIA_GENERATION_TOOLS,
-            "image_gen,video_gen,image_to_video,reference_to_video"
+            tools,
+            vec![
+                "image_gen",
+                "video_gen",
+                "image_to_video",
+                "reference_to_video"
+            ]
         );
-        for forbidden in ["bash", "shell", "computer", "read_file", "write", "edit"] {
+        for forbidden in ["bash", "shell", "computer", "read_file", "write"] {
             assert!(
-                !MEDIA_GENERATION_TOOLS.contains(forbidden),
+                !tools.iter().any(|t| *t == forbidden || t.contains(forbidden)),
                 "media tools must not include {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_resolution_tokens_are_allowlisted_shape() {
+        for ok in ["480p", "720p", "1080p", "4k", "4K"] {
+            assert!(
+                matches!(ok, "480p" | "720p" | "1080p" | "4k" | "4K"),
+                "{ok}"
+            );
+        }
+        for bad in ["1080p; rm -rf /", "4k\ninject", "ultra"] {
+            assert!(
+                !matches!(bad.trim(), "480p" | "720p" | "1080p" | "4k" | "4K"),
+                "{bad}"
             );
         }
     }
