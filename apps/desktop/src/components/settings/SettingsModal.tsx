@@ -219,8 +219,8 @@ function ComputerUseOptIn({ zh }: { zh: boolean }) {
             ? "已由环境变量 GROX_COMPUTER_USE=1 启用（高级）。关闭设置开关仍会吊销本机 MCP，但 env 在下次启动仍会打开门控。"
             : "Enabled by host env GROX_COMPUTER_USE=1 (advanced). Turning the switch off revokes MCP now; env re-opens the gate on next ensure."
           : zh
-            ? "默认关闭。开启后 Agent 可在明确请求时控制本机窗口（键鼠）。关闭会立即吊销本机 MCP。仅在可信环境使用。"
-            : "Off by default. When on, the Agent may control local windows on explicit request. Turning off revokes the local MCP. Trusted environments only."
+            ? "默认关闭。开启后挂载桌面控制 MCP，并对 Computer 工具自动批准（不必再点「仅本次允许」）。其它工具仍受上方「权限模式」约束。关闭会立即吊销本机 MCP。"
+            : "Off by default. When on, attaches the desktop MCP and auto-approves Computer tools (no extra Allow). Other tools still follow Permission mode above. Off revokes local MCP."
       }
     >
       <label className="flex items-center gap-2 font-mono text-[10px] text-fg2">

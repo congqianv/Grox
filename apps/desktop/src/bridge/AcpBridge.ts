@@ -7,8 +7,10 @@ import { MODELS } from "./types";
 import {
   COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
   computerLeaseIfAttached,
+  computerToolNameFromPermissionTool,
   decideComputerAttachForPrompt,
   hasActiveComputerLease,
+  isComputerUseMcpTool,
   isComputerUseOperatorEnabled,
   setComputerUseHostEnvEnabled,
 } from "../lib/computerUse";
@@ -2037,6 +2039,31 @@ export class AcpBridge implements GrokBridge {
     const options = (["allow_once", "allow_always", "deny"] as PermissionOption[]).filter(
       (option) => optionIds[option] !== undefined || option === "deny",
     );
+
+    // Settings 「允许 Computer Use」 already authorizes the desktop harness.
+    // Under DEFAULT permission mode the CLI still raises session/request_permission
+    // for every MCP tool — auto-select allow so the operator is not double-gated.
+    const toolName = computerToolNameFromPermissionTool({
+      title: tool.title,
+      kind: tool.kind,
+      name: tool.name,
+      toolName: tool.toolName ?? tool.tool_name,
+      rawInput: tool.rawInput ?? tool.raw_input ?? params.rawInput,
+    });
+    if (isComputerUseOperatorEnabled() && isComputerUseMcpTool(toolName)) {
+      const autoOptionId = optionIds.allow_always ?? optionIds.allow_once;
+      if (autoOptionId) {
+        void this.sendRaw({
+          jsonrpc: "2.0",
+          id: rpcId,
+          result: { outcome: { outcome: "selected", optionId: autoOptionId } },
+        }).catch((error) => {
+          this.emit({ type: "error", sessionId, message: errorText(error) });
+        });
+        return;
+      }
+    }
+
     this.interactions.set(blockId, {
       rpcId,
       sessionId,

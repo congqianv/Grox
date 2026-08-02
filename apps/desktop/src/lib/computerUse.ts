@@ -128,3 +128,55 @@ export function decideComputerAttachForPrompt(input: {
 /** Operator-facing copy when Computer Use is refused (Settings General). */
 export const COMPUTER_USE_OPT_IN_REFUSE_MESSAGE =
   "Computer Use 未启用。请在 设置 中打开「允许 Computer Use」后再试。";
+
+/**
+ * True when a permission tool name is the Grox desktop Computer Use MCP surface.
+ * Opt-in already means the operator authorized desktop control — these tools
+ * should not re-prompt under DEFAULT permission mode (UX: 勾了仍要批准).
+ */
+export function isComputerUseMcpTool(name: string | null | undefined): boolean {
+  if (!name) return false;
+  const n = name.toLowerCase().replace(/-/g, "_");
+  return (
+    n.includes("grok_desktop_computer") ||
+    n.includes("desktop_computer__") ||
+    n.startsWith("computer__")
+  );
+}
+
+/**
+ * Best-effort tool name from ACP session/request_permission toolCall payload.
+ * Live wire often puts `tool_name` inside rawInput JSON (UseTool variant).
+ */
+export function computerToolNameFromPermissionTool(tool: {
+  title?: unknown;
+  kind?: unknown;
+  name?: unknown;
+  toolName?: unknown;
+  rawInput?: unknown;
+}): string {
+  const direct =
+    (typeof tool.toolName === "string" && tool.toolName) ||
+    (typeof tool.name === "string" && tool.name) ||
+    "";
+  if (direct) return direct;
+  const raw = tool.rawInput;
+  if (typeof raw === "string" && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw) as { tool_name?: unknown; name?: unknown };
+      if (typeof parsed.tool_name === "string") return parsed.tool_name;
+      if (typeof parsed.name === "string") return parsed.name;
+    } catch {
+      /* not JSON */
+    }
+    if (/grok_desktop_computer|desktop_computer/i.test(raw)) return raw;
+  }
+  if (raw && typeof raw === "object") {
+    const obj = raw as { tool_name?: unknown; name?: unknown };
+    if (typeof obj.tool_name === "string") return obj.tool_name;
+    if (typeof obj.name === "string") return obj.name;
+  }
+  if (typeof tool.title === "string" && /computer/i.test(tool.title)) return tool.title;
+  if (typeof tool.kind === "string") return tool.kind;
+  return "";
+}

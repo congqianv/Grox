@@ -4,9 +4,11 @@ import {
   COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
   COMPUTER_USE_STORAGE_KEY,
   computerLeaseIfAttached,
+  computerToolNameFromPermissionTool,
   decideComputerAttachForPrompt,
   hasActiveComputerLease,
   isComputerUseEnvFlag,
+  isComputerUseMcpTool,
   isComputerUseOperatorEnabled,
   resetComputerUseHostEnvCache,
   setComputerUseHostEnvEnabled,
@@ -192,5 +194,27 @@ describe("decideComputerAttachForPrompt (R4A-CU-01)", () => {
   it("exports refuse message for UI parity", () => {
     expect(COMPUTER_USE_OPT_IN_REFUSE_MESSAGE).toMatch(/Computer Use/);
     expect(COMPUTER_USE_OPT_IN_REFUSE_MESSAGE).toMatch(/设置/);
+  });
+});
+
+describe("computer MCP tool permission auto-allow helpers", () => {
+  it("recognizes grok_desktop_computer tool names from live payload", () => {
+    expect(isComputerUseMcpTool("grok_desktop_computer__list_apps")).toBe(true);
+    expect(isComputerUseMcpTool("grok_desktop_computer__start")).toBe(true);
+    expect(isComputerUseMcpTool("bash")).toBe(false);
+    expect(isComputerUseMcpTool("read_file")).toBe(false);
+  });
+
+  it("extracts tool_name from UseTool rawInput JSON", () => {
+    const name = computerToolNameFromPermissionTool({
+      title: "other",
+      rawInput: JSON.stringify({
+        variant: "UseTool",
+        tool_name: "grok_desktop_computer__list_apps",
+        tool_input: {},
+      }),
+    });
+    expect(name).toBe("grok_desktop_computer__list_apps");
+    expect(isComputerUseMcpTool(name)).toBe(true);
   });
 });
