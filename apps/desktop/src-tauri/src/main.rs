@@ -56,21 +56,25 @@ const GROX_GITHUB_REPO: &str = "congqianv/Grox";
 const GROX_RELEASES_LATEST_API: &str =
     "https://api.github.com/repos/congqianv/Grox/releases/latest";
 const GROX_RELEASES_PAGE: &str = "https://github.com/congqianv/Grox/releases";
-const GROX_PRIVACY_ENV: [(&str, &str); 12] = [
+const GROX_PRIVACY_ENV: [(&str, &str); 16] = [
     ("GROX_PRIVACY_MODE", "1"),
     // Legacy fallbacks also protect users who point GROK_DESKTOP_CLI at an
     // older Grok binary that does not yet understand GROX_PRIVACY_MODE.
     ("DISABLE_TELEMETRY", "1"),
     ("DISABLE_ERROR_REPORTING", "1"),
+    ("DO_NOT_TRACK", "1"),
     ("GROK_TELEMETRY_ENABLED", "0"),
     ("GROK_TELEMETRY_TRACE_UPLOAD", "0"),
     ("GROK_TELEMETRY_MIXPANEL_ENABLED", "0"),
+    ("GROK_ANALYTICS_ENABLED", "0"),
     ("GROK_FEEDBACK_ENABLED", "0"),
     ("GROK_ERROR_REPORTING", "0"),
     ("GROK_EXTERNAL_OTEL", "0"),
+    ("XAI_TELEMETRY_ENABLED", "0"),
     ("OTEL_TRACES_EXPORTER", "none"),
     ("OTEL_METRICS_EXPORTER", "none"),
     ("OTEL_LOGS_EXPORTER", "none"),
+    ("OTEL_SDK_DISABLED", "true"),
 ];
 
 struct AgentProcess {
@@ -500,9 +504,64 @@ fn restrict_private_file(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("无法限制凭据文件权限 {}：{error}", path.display()))
 }
 
-#[cfg(not(unix))]
+/// Absolute System32 tool path — never resolve bare names via %PATH% (hijack).
+#[cfg(windows)]
+fn system32_tool(name: &str) -> PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    root.join("System32").join(name)
+}
+
+#[cfg(windows)]
+fn restrict_private_file(path: &Path) -> Result<(), String> {
+    // Cred files (~/.grok/.env, grox-providers.json) hold API keys in plaintext.
+    // Drop inherited ACLs and grant only the current user R/W via System32\icacls.
+    if !path.exists() {
+        return Ok(());
+    }
+    let user = std::env::var("USERNAME")
+        .map_err(|_| "无法读取 USERNAME 以设置凭据 ACL".to_string())?;
+    let user = user.rsplit('\\').next().unwrap_or(user.as_str()).trim();
+    if user.is_empty()
+        || user
+            .chars()
+            .any(|c| c.is_control() || "\"&|<>".contains(c))
+    {
+        return Err("用户名无效，无法设置凭据 ACL".into());
+    }
+    let icacls = system32_tool("icacls.exe");
+    if !icacls.is_file() {
+        eprintln!(
+            "grox: 警告：找不到 {}，跳过凭据 ACL 收紧",
+            icacls.display()
+        );
+        return Ok(());
+    }
+    let path_arg = path.to_string_lossy().to_string();
+    let grant = format!("{user}:(R,W)");
+    let status = std::process::Command::new(&icacls)
+        .arg(&path_arg)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(&grant)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("无法调用 icacls：{error}"))?;
+    if !status.success() {
+        // Do not fail the save — still warn so operators can inspect.
+        eprintln!(
+            "grox: 警告：icacls 收紧凭据 ACL 失败：{}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn restrict_private_file(_path: &Path) -> Result<(), String> {
-    // Windows user profiles inherit a per-user ACL from their parent folder.
     Ok(())
 }
 
@@ -872,10 +931,25 @@ fn apply_grox_provider_environment(command: &mut Command) {
     }
 }
 
+/// Keys that look like provider prefixes but must never be taken from ~/.grok/.env
+/// (desktop always injects privacy/telemetry values last from GROX_PRIVACY_ENV).
+fn is_telemetry_or_analytics_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.contains("TELEMETRY")
+        || upper.contains("ANALYTICS")
+        || upper.contains("MIXPANEL")
+        || upper.contains("SENTRY")
+        || upper.contains("SEGMENT")
+        || upper.starts_with("OTEL_")
+        || upper == "DO_NOT_TRACK"
+        || upper == "DISABLE_TELEMETRY"
+        || upper == "DISABLE_ERROR_REPORTING"
+}
+
 /// Allowlist of operator .env keys that may reach CLI children.
 /// Belt-and-braces with [`is_denied_cli_env_key`] — deny always wins.
 fn is_allowed_cli_env_key(key: &str) -> bool {
-    if is_denied_cli_env_key(key) {
+    if is_denied_cli_env_key(key) || is_telemetry_or_analytics_env_key(key) {
         return false;
     }
     let upper = key.to_ascii_uppercase();
@@ -7306,6 +7380,12 @@ api_key = "local-key"
         // Host identity must not be rewritten from .env.
         assert!(!is_allowed_cli_env_key("HOME"));
         assert!(!is_allowed_cli_env_key("USERPROFILE"));
+        // Telemetry/analytics must not be re-enabled from a polluted .env
+        // (desktop injects GROX_PRIVACY_ENV last).
+        assert!(!is_allowed_cli_env_key("GROK_TELEMETRY_ENABLED"));
+        assert!(!is_allowed_cli_env_key("OTEL_TRACES_EXPORTER"));
+        assert!(!is_allowed_cli_env_key("XAI_TELEMETRY_ENABLED"));
+        assert!(is_telemetry_or_analytics_env_key("GROK_TELEMETRY_ENABLED"));
     }
 
     #[test]

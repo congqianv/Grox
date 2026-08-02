@@ -1368,19 +1368,45 @@ export class AcpBridge implements GrokBridge {
     // Diagnostics belong to one concrete child process. Keeping stderr from a
     // process replaced during a Tauri hot reload produces misleading errors.
     this.diagnostics = [];
-    await invoke("acp_spawn", { cwd: this.workspace });
-    const response = await this.requestRaw(ACP_METHODS.initialize, {
-      protocolVersion: 1,
-      clientCapabilities: {
-        fs: { readTextFile: false, writeTextFile: false },
-        terminal: false,
-      },
-      clientInfo: { name: "grox-desktop", title: "Grox Desktop", version: "0.1.0" },
-      _meta: {
-        clientIdentifier: "grok-desktop",
-        clientType: "desktop",
-      },
-    }, 15_000);
+    try {
+      await Promise.race([
+        invoke("acp_spawn", { cwd: this.workspace }),
+        new Promise<never>((_, reject) => {
+          window.setTimeout(
+            () => reject(new Error("启动 Grok Agent 超时（30 秒）")),
+            30_000,
+          );
+        }),
+      ]);
+    } catch (error) {
+      const detail = errorText(error);
+      throw new Error(
+        `无法启动 Grok Agent：${detail}。请确认 Grok Build CLI 已安装，或通过 GROK_DESKTOP_CLI 指定可执行文件。`,
+      );
+    }
+    let response: unknown;
+    try {
+      response = await this.requestRaw(
+        ACP_METHODS.initialize,
+        {
+          protocolVersion: 1,
+          clientCapabilities: {
+            fs: { readTextFile: false, writeTextFile: false },
+            terminal: false,
+          },
+          clientInfo: { name: "grox-desktop", title: "Grox Desktop", version: "0.1.0" },
+          _meta: {
+            clientIdentifier: "grok-desktop",
+            clientType: "desktop",
+          },
+        },
+        20_000,
+      );
+    } catch (error) {
+      throw new Error(
+        `Grok Agent 初始化失败：${errorText(error)}。CLI 已启动但未在 20 秒内完成握手。`,
+      );
+    }
     this.captureModelState(response);
     await this.configureAuthentication(response);
   }
