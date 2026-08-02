@@ -4,7 +4,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { GrokBridge } from "./GrokBridge";
 import { MODELS } from "./types";
-import { isComputerUseOperatorEnabled } from "../lib/computerUse";
+import {
+  computerLeaseIfAttached,
+  hasActiveComputerLease,
+  isComputerUseOperatorEnabled,
+} from "../lib/computerUse";
 import { shouldDropSilentInbound } from "../lib/silentAcp";
 import type {
   AccountInfo,
@@ -2507,7 +2511,9 @@ export class AcpBridge implements GrokBridge {
     const response = record(responseValue);
     const sessionId = string(response?.sessionId);
     if (!sessionId) throw new Error("session/new 未返回 sessionId");
-    if (attachedComputer) this.computerLeases.set(sessionId, computer.leaseId);
+    // Soft-fail CU returns empty MCP — only store a real lease when attached.
+    const newLease = attachedComputer ? computerLeaseIfAttached(computer) : null;
+    if (newLease) this.computerLeases.set(sessionId, newLease);
     this.captureModelState(response);
     const detail = record(record(response?._meta)?.["x.ai/sessionDetail"]);
     const now = Date.now();
@@ -2628,14 +2634,17 @@ export class AcpBridge implements GrokBridge {
           silentBind ? 10 * 60_000 : 2 * 60_000,
         );
       }
-      if (computer) {
+      // Soft-fail CU (opt-in off) returns non-null computer with empty lists —
+      // must NOT write computerLeases or ensureComputerAttachedForPrompt short-circuits.
+      const loadLease = computerLeaseIfAttached(computer);
+      if (loadLease) {
         const previousLease = this.computerLeases.get(id);
-        if (previousLease && previousLease !== computer.leaseId) {
+        if (previousLease && previousLease !== loadLease) {
           await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(
             () => {},
           );
         }
-        this.computerLeases.set(id, computer.leaseId);
+        this.computerLeases.set(id, loadLease);
       }
       this.flushStreamAppends(id);
       this.flushToolPatches(id);
@@ -2685,7 +2694,7 @@ export class AcpBridge implements GrokBridge {
     // Computer attach must be channel-serialized (silent filter is session-scoped).
     // The interject RPC itself must NOT wait behind an in-flight session/prompt
     // (that would block mid-turn 插话 until the turn ends — R3 regression).
-    if (this.promptRequestsComputer(trimmed) && !this.computerLeases.has(sessionId)) {
+    if (this.promptRequestsComputer(trimmed) && !hasActiveComputerLease(this.computerLeases, sessionId)) {
       await this.runOnChannel(() => this.ensureComputerAttachedForPrompt(sessionId, trimmed));
     }
     const interjectionId = crypto.randomUUID();
@@ -3137,7 +3146,8 @@ export class AcpBridge implements GrokBridge {
     sessionId: string,
     text: string,
   ): Promise<void> {
-    if (this.computerLeases.has(sessionId)) return;
+    // Empty-string leases must not count as attached (soft-fail CU path).
+    if (hasActiveComputerLease(this.computerLeases, sessionId)) return;
     if (!this.promptRequestsComputer(text)) return;
     if (!this.knownSessions.has(sessionId)) return;
     if (!isComputerUseOperatorEnabled()) {
@@ -3164,8 +3174,9 @@ export class AcpBridge implements GrokBridge {
       throw new Error(`找不到会话，无法附加 Computer Use：${sessionId}`);
     }
     const computer = await this.invokeComputerSessionExtensions();
-    if (computer.mcpServers.length === 0 && computer.pluginDirs.length === 0) {
-      // Non-Windows or harness unavailable — leave the turn to run without MCP.
+    const attachLease = computerLeaseIfAttached(computer);
+    if (!attachLease) {
+      // Soft-fail / non-Windows / harness unavailable — leave turn without MCP.
       return;
     }
     const metaRequest = await this.sessionMeta(meta.cwd);
@@ -3196,12 +3207,12 @@ export class AcpBridge implements GrokBridge {
         return;
       }
       const previousLease = this.computerLeases.get(sessionId);
-      if (previousLease && previousLease !== computer.leaseId) {
+      if (previousLease && previousLease !== attachLease) {
         await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(
           () => {},
         );
       }
-      this.computerLeases.set(sessionId, computer.leaseId);
+      this.computerLeases.set(sessionId, attachLease);
       this.emit({
         type: "status",
         sessionId,
