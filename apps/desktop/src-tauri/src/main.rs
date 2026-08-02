@@ -157,7 +157,7 @@ struct MediaGenerationRequest {
     cwd: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaArtifact {
     path: Option<String>,
@@ -3578,54 +3578,6 @@ fn open_file_with_application(cwd: String, path: String, application: String) ->
     }
 }
 
-/// Create a sibling Git worktree for the Codex-style “permanent worktree”
-/// actions. The target is never inside the current project, and an available
-/// suffix is chosen instead of overwriting an existing directory.
-#[tauri::command]
-fn create_permanent_worktree(cwd: String) -> Result<String, String> {
-    let root = checked_workspace(&cwd)?;
-    if !root.join(".git").exists() {
-        return Err("当前项目不是 Git 仓库，无法创建永久工作树".into());
-    }
-    let parent = root
-        .parent()
-        .ok_or_else(|| "无法确定工作树所在目录".to_string())?;
-    let base = root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("grox-project");
-    let mut target = parent.join(format!("{base}-worktree"));
-    let mut suffix = 2u32;
-    while target.exists() {
-        target = parent.join(format!("{base}-worktree-{suffix}"));
-        suffix = suffix.saturating_add(1);
-        if suffix > 10_000 {
-            return Err("可用的工作树目录过多".into());
-        }
-    }
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let branch = format!("grox/worktree-{timestamp}");
-    let output = std::process::Command::new("git")
-        .current_dir(&root)
-        .args(["worktree", "add", "-b", &branch])
-        .arg(&target)
-        .output()
-        .map_err(|error| format!("无法执行 git worktree：{error}"))?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if message.is_empty() {
-            "创建永久工作树失败".into()
-        } else {
-            format!("创建永久工作树失败：{message}")
-        });
-    }
-    Ok(path_for_webview(&target))
-}
-
 /// Let the operating system present its application chooser for a workspace
 /// file.  macOS has no `open` flag for this, so use LaunchServices through a
 /// short, escaped AppleScript; Windows exposes the same chooser via
@@ -6330,6 +6282,43 @@ api_key = "local-key"
         assert_eq!(values.get("GROK_TELEMETRY_TRACE_UPLOAD"), Some(&"0"));
         assert_eq!(values.get("GROK_EXTERNAL_OTEL"), Some(&"0"));
         assert_eq!(values.get("OTEL_LOGS_EXPORTER"), Some(&"none"));
+    }
+
+    #[test]
+    fn extract_media_artifacts_rejects_paths_outside_workspace() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("grox-media-ws-{stamp}"));
+        fs::create_dir_all(&workspace).unwrap();
+        let inside = workspace.join("inside.png");
+        fs::write(&inside, b"png-bytes").unwrap();
+        let outside = std::env::temp_dir().join(format!("grox-media-out-{stamp}.png"));
+        fs::write(&outside, b"outside").unwrap();
+        let output = format!("{}\n{}\nhttps://cdn.example/a.png\n", inside.display(), outside.display());
+        let artifacts = extract_media_artifacts(&output, &workspace).unwrap();
+        assert_eq!(artifacts.len(), 2, "{artifacts:?}");
+        assert!(
+            artifacts.iter().any(|item| item
+                .path
+                .as_deref()
+                .is_some_and(|path| path.replace('\\', "/").contains("inside.png"))),
+            "workspace file must be kept: {artifacts:?}"
+        );
+        assert!(
+            artifacts.iter().any(|item| item.url.as_deref() == Some("https://cdn.example/a.png")),
+            "https URLs remain allowed: {artifacts:?}"
+        );
+        assert!(
+            !artifacts.iter().any(|item| item
+                .path
+                .as_deref()
+                .is_some_and(|path| path.contains("grox-media-out-"))),
+            "paths outside the workspace must be dropped: {artifacts:?}"
+        );
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&workspace);
     }
 
 }

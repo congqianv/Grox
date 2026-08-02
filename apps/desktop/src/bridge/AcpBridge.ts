@@ -2663,6 +2663,7 @@ export class AcpBridge implements GrokBridge {
     await this.ready;
     // Do not optimistically mark bound — only session/new or successful session/load.
     const trimmed = text.trim();
+    await this.ensureComputerAttachedForPrompt(sessionId, trimmed);
     const interjectionId = crypto.randomUUID();
     const content = promptContent(trimmed, options.attachments ?? []);
     try {
@@ -2834,6 +2835,9 @@ export class AcpBridge implements GrokBridge {
     this.cursor(sessionId).planId = undefined;
     this.emit({ type: "status", sessionId, status: "running" });
     try {
+      // Silent-bound sessions skip Computer MCP at load time; attach once when
+      // the operator's prompt explicitly needs desktop control.
+      await this.ensureComputerAttachedForPrompt(sessionId, text);
       const previous = this.sessionOptions.get(sessionId);
       if (!previous || previous.model !== options.model || previous.effort !== options.effort) {
         await this.requestRaw(ACP_METHODS.sessionSetModel, {
@@ -3063,6 +3067,91 @@ export class AcpBridge implements GrokBridge {
       await invoke("computer_emergency_stop", { leaseId });
     }
     this.cancel(sessionId);
+  }
+
+  /**
+   * Explicit Computer Use intent in the operator prompt (slash, @-mention, or
+   * common CN/EN phrases). Silent loads intentionally skip MCP; attach only
+   * when these fire so offline first-send stays cheap.
+   */
+  private promptRequestsComputer(text: string): boolean {
+    const raw = text.trim();
+    if (!raw) return false;
+    if (/^\/computer(?:\s|$)/i.test(raw)) return true;
+    if (/(^|[\s,，])@computer(?:\b|$)/i.test(raw)) return true;
+    if (/\bcomputer\s*use\b/i.test(raw)) return true;
+    if (/电脑控制|桌面控制|屏幕控制|Computer\s*Use/i.test(raw)) return true;
+    return false;
+  }
+
+  /**
+   * Secondary attach for sessions that were silent/background-bound without
+   * Computer MCP. Re-issues session/load with MCP extensions under the silent
+   * stream filter so offline history is not flooded.
+   */
+  private async ensureComputerAttachedForPrompt(
+    sessionId: string,
+    text: string,
+  ): Promise<void> {
+    if (this.computerLeases.has(sessionId)) return;
+    if (!this.promptRequestsComputer(text)) return;
+    if (!this.knownSessions.has(sessionId)) return;
+    await this.attachComputerMcp(sessionId);
+  }
+
+  private async attachComputerMcp(sessionId: string): Promise<void> {
+    const meta = this.catalogue.get(sessionId);
+    if (!meta) {
+      throw new Error(`找不到会话，无法附加 Computer Use：${sessionId}`);
+    }
+    const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+    if (computer.mcpServers.length === 0 && computer.pluginDirs.length === 0) {
+      // Non-Windows or harness unavailable — leave the turn to run without MCP.
+      return;
+    }
+    const metaRequest = await this.sessionMeta(meta.cwd);
+    this.silentReplaying.add(sessionId);
+    await this.setSilentStream(true);
+    try {
+      try {
+        await this.request(
+          ACP_METHODS.sessionLoad,
+          {
+            sessionId,
+            cwd: meta.cwd,
+            mcpServers: computer.mcpServers,
+            _meta: { ...metaRequest, pluginDirs: computer.pluginDirs },
+          },
+          2 * 60_000,
+        );
+      } catch (error) {
+        const message = errorText(error).toLowerCase();
+        const looksLikeExtensionReject =
+          message.includes("mcp") ||
+          message.includes("plugin") ||
+          message.includes("unknown") ||
+          message.includes("invalid") ||
+          message.includes("unsupported");
+        if (!looksLikeExtensionReject) throw error;
+        // CLI rejected extensions — continue without Computer Use.
+        return;
+      }
+      const previousLease = this.computerLeases.get(sessionId);
+      if (previousLease && previousLease !== computer.leaseId) {
+        await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(
+          () => {},
+        );
+      }
+      this.computerLeases.set(sessionId, computer.leaseId);
+      this.emit({
+        type: "status",
+        sessionId,
+        status: "running",
+      });
+    } finally {
+      this.silentReplaying.delete(sessionId);
+      await this.setSilentStream(this.silentReplaying.size > 0);
+    }
   }
 
   private async refreshSessionInfo(sessionId: string): Promise<void> {

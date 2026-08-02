@@ -1750,4 +1750,22 @@ mod tests {
         clear_emergency_stop(&lease_id).expect("clear emergency stop");
         assert!(!emergency_stop_requested(&lease_id));
     }
+
+    #[test]
+    fn http_server_reuses_one_listener_and_rotates_tokens() {
+        let lease_a = format!("{:032x}", 0xaaaau128);
+        let lease_b = format!("{:032x}", 0xbbbbu128);
+        let first = serve_http(lease_a).expect("start computer mcp http");
+        let second = serve_http(lease_b).expect("reuse computer mcp http");
+        assert_eq!(
+            first.url, second.url,
+            "singleton must keep the same localhost endpoint"
+        );
+        assert_ne!(
+            first.token, second.token,
+            "lease rotation must issue a fresh bearer token"
+        );
+        assert!(first.url.starts_with("http://127.0.0.1:"));
+        assert!(first.url.ends_with("/mcp"));
+    }
 }
