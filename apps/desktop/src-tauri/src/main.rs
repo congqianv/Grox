@@ -82,6 +82,9 @@ struct AgentProcess {
 #[derive(Default)]
 struct AcpState {
     process: Mutex<Option<AgentProcess>>,
+    /// Serializes acp_spawn so concurrent reload/restart cannot race generation
+    /// vs process slot (wrong child Drop / kill_on_drop).
+    spawn_lock: Mutex<()>,
     next_generation: AtomicU64,
     /// Session ids currently in silent agent-bind. Only history-flood lines
     /// whose `sessionId` is in this set are dropped — other sessions keep streaming.
@@ -868,7 +871,7 @@ fn apply_grox_provider_environment(command: &mut Command) {
 }
 
 /// Denylist of host-sensitive env keys that must never be taken from ~/.grok/.env
-/// into CLI children (PATH hijack / proxy / TLS keylog class).
+/// into CLI children (PATH hijack / proxy / TLS keylog / toolchain injection).
 fn is_denied_cli_env_key(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
     matches!(
@@ -886,6 +889,7 @@ fn is_denied_cli_env_key(key: &str) -> bool {
             | "HTTPS_PROXY"
             | "ALL_PROXY"
             | "NO_PROXY"
+            | "FTP_PROXY"
             | "LD_PRELOAD"
             | "LD_LIBRARY_PATH"
             | "DYLD_INSERT_LIBRARIES"
@@ -902,9 +906,35 @@ fn is_denied_cli_env_key(key: &str) -> bool {
             | "JAVA_TOOL_OPTIONS"
             | "JDK_JAVA_OPTIONS"
             | "DOTNET_STARTUP_HOOKS"
+            | "CORECLR_PROFILER"
+            | "CORECLR_PROFILER_PATH"
+            | "COR_ENABLE_PROFILING"
+            | "COR_PROFILER"
+            | "COR_PROFILER_PATH"
             | "GIT_SSH_COMMAND"
             | "GIT_CONFIG_GLOBAL"
             | "GIT_CONFIG_SYSTEM"
+            | "BASH_ENV"
+            | "ENV"
+            | "SHELLOPTS"
+            | "GCONV_PATH"
+            | "LOCPATH"
+            | "RUSTC_WRAPPER"
+            | "RUSTFLAGS"
+            | "CARGO_ENCODED_RUSTFLAGS"
+            | "CC"
+            | "CXX"
+            | "MAKEFLAGS"
+            | "GOFLAGS"
+            | "GOROOT"
+            | "PERL5LIB"
+            | "PERL5OPT"
+            | "RUBYOPT"
+            | "PHPRC"
+            | "DOCKER_HOST"
+            | "KUBECONFIG"
+            | "AWS_CA_BUNDLE"
+            | "GRPC_PROXY"
     ) || upper.starts_with("LD_")
         || upper.starts_with("DYLD_")
         || upper.starts_with("PYTHON")
@@ -915,6 +945,13 @@ fn is_denied_cli_env_key(key: &str) -> bool {
         || upper.starts_with("GIT_")
         || upper.starts_with("SSL_")
         || upper.starts_with("OPENSSL_")
+        || upper.starts_with("CORECLR_")
+        || upper.starts_with("COR_")
+        || upper.starts_with("RUST")
+        || upper.starts_with("CARGO_")
+        || upper.starts_with("GO")
+        || upper.starts_with("PERL")
+        || upper.starts_with("RUBY")
 }
 
 /// Same provider resolution used by `acp_spawn`: full ~/.grok/.env, then the
@@ -2685,14 +2722,15 @@ fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Resolve a path the user themselves supplied in the composer. This does not
-/// change the agent's filesystem authority: only image files explicitly named
-/// in a message become that message's multimodal attachments.
+/// Resolve a path the user themselves supplied in the composer.
+/// Only image files under the current workspace become multimodal attachments
+/// (same containment as `checked_workspace_file` — no absolute/home escape).
 fn checked_explicit_prompt_image(workspace: &Path, requested: &str) -> Result<PathBuf, String> {
     let requested = requested.trim();
     if requested.is_empty() {
         return Err("图片路径不能为空".into());
     }
+    // Resolve ~ / file:// / absolute / relative; then hard-require workspace containment.
     let candidate = if requested == "~" || requested.starts_with("~/") || requested.starts_with("~\\") {
         let home = user_home()?;
         if requested == "~" {
@@ -2724,6 +2762,10 @@ fn checked_explicit_prompt_image(workspace: &Path, requested: &str) -> Result<Pa
     let canonical = candidate
         .canonicalize()
         .map_err(|error| format!("无法解析图片路径 {}：{error}", candidate.display()))?;
+    // Hard workspace boundary — same as checked_workspace_file.
+    if !canonical.starts_with(workspace) {
+        return Err("只能附加当前项目内的图片".into());
+    }
     let metadata = fs::metadata(&canonical)
         .map_err(|error| format!("无法读取图片 {}：{error}", canonical.display()))?;
     if !metadata.is_file() {
@@ -6086,6 +6128,9 @@ async fn acp_spawn(
     state: tauri::State<'_, Arc<AcpState>>,
     cwd: String,
 ) -> Result<(), String> {
+    // One spawn at a time: terminate → spawn → store must not interleave.
+    let _spawn_guard = state.spawn_lock.lock().await;
+
     // New child never inherits a previous silent-load filter.
     if let Ok(mut guard) = state.silent_sessions.lock() {
         guard.clear();
@@ -6934,8 +6979,47 @@ api_key = "local-key"
         assert!(is_denied_cli_env_key("HTTP_PROXY"));
         assert!(is_denied_cli_env_key("LD_PRELOAD"));
         assert!(is_denied_cli_env_key("NODE_OPTIONS"));
+        assert!(is_denied_cli_env_key("CORECLR_PROFILER"));
+        assert!(is_denied_cli_env_key("RUSTC_WRAPPER"));
+        assert!(is_denied_cli_env_key("BASH_ENV"));
+        assert!(is_denied_cli_env_key("DOCKER_HOST"));
+        assert!(is_denied_cli_env_key("RUSTFLAGS"));
         assert!(!is_denied_cli_env_key("XAI_API_KEY"));
         assert!(!is_denied_cli_env_key("GROK_MODELS_BASE_URL"));
+    }
+
+    #[test]
+    fn prompt_image_stays_inside_workspace() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let workspace = std::env::temp_dir().join(format!("grox-img-ws-{stamp}"));
+        fs::create_dir_all(&workspace).unwrap();
+        let inside = workspace.join("ok.png");
+        // Minimal PNG header is enough for size checks; mime may fail — write real-ish bytes.
+        // 1x1 PNG
+        let png = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xfe,
+            0xd4, 0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        fs::write(&inside, png).unwrap();
+        let ws = workspace.canonicalize().unwrap();
+        assert!(checked_explicit_prompt_image(&ws, "ok.png").is_ok());
+        let outside = std::env::temp_dir().join(format!("grox-img-out-{stamp}.png"));
+        fs::write(&outside, png).unwrap();
+        let outside_s = outside.to_string_lossy().to_string();
+        let err = checked_explicit_prompt_image(&ws, &outside_s).unwrap_err();
+        assert!(
+            err.contains("只能附加当前项目内"),
+            "expected workspace containment, got {err}"
+        );
+        let _ = fs::remove_file(&inside);
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&workspace);
     }
 
     #[test]
