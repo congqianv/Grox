@@ -6115,6 +6115,7 @@ fn unseal_secret_from_storage(stored: &str) -> Result<String, String> {
 }
 
 /// Redact sealed or raw API key material from operator-facing export dumps.
+#[allow(dead_code)] // Used by unit tests + ready for future export/support dumps.
 fn redact_secret_for_export(value: &str) -> String {
     let v = value.trim();
     if v.is_empty() {
