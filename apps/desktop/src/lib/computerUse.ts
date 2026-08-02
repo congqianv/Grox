@@ -57,3 +57,33 @@ export function hasActiveComputerLease(
   const lease = leases.get(sessionId);
   return typeof lease === "string" && lease.length > 0;
 }
+
+/**
+ * Prompt-time Computer Use attach policy (R4A-CU-01).
+ * Opt-in is re-checked even when a lease is already mapped so Settings OFF
+ * revokes stale control instead of short-circuiting as "already attached".
+ */
+export type ComputerAttachDecision =
+  | "skip"
+  | "already_attached"
+  | "refuse_opt_in"
+  | "revoke_stale_and_refuse"
+  | "attach";
+
+export function decideComputerAttachForPrompt(input: {
+  requestsComputer: boolean;
+  knownSession: boolean;
+  optIn: boolean;
+  hasActiveLease: boolean;
+}): ComputerAttachDecision {
+  if (!input.requestsComputer || !input.knownSession) return "skip";
+  if (!input.optIn) {
+    return input.hasActiveLease ? "revoke_stale_and_refuse" : "refuse_opt_in";
+  }
+  if (input.hasActiveLease) return "already_attached";
+  return "attach";
+}
+
+/** Operator-facing copy when Computer Use is refused (Settings General). */
+export const COMPUTER_USE_OPT_IN_REFUSE_MESSAGE =
+  "Computer Use 未启用。请在 设置 中打开「允许 Computer Use」后再试。";

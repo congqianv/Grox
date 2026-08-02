@@ -3,6 +3,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { bridge } from "../../bridge";
 import type { ConfigDocument, ProviderApiBackend, ProviderKind } from "../../bridge/types";
 import { EFFORTS } from "../../bridge/types";
+import {
+  isComputerUseOperatorEnabled,
+  setComputerUseOperatorEnabled,
+} from "../../lib/computerUse";
 import { useDesktop } from "../../state/store";
 import { usePreferences } from "../../state/preferences";
 import { useI18n } from "../../lib/i18n";
@@ -191,20 +195,14 @@ function General() {
 }
 
 function ComputerUseOptIn({ zh }: { zh: boolean }) {
-  const [enabled, setEnabled] = useState(() => {
-    try {
-      return localStorage.getItem("grox.computerUseEnabled") === "1";
-    } catch {
-      return false;
-    }
-  });
+  const [enabled, setEnabled] = useState(() => isComputerUseOperatorEnabled());
   return (
     <Row
       label={zh ? "允许 Computer Use" : "Allow Computer Use"}
       hint={
         zh
-          ? "默认关闭。开启后 Agent 可在明确请求时控制本机窗口（键鼠）。仅在可信环境使用。"
-          : "Off by default. When on, the Agent may control local windows on explicit request. Trusted environments only."
+          ? "默认关闭。开启后 Agent 可在明确请求时控制本机窗口（键鼠）。关闭会立即吊销本机 MCP。仅在可信环境使用。"
+          : "Off by default. When on, the Agent may control local windows on explicit request. Turning off revokes the local MCP. Trusted environments only."
       }
     >
       <label className="flex items-center gap-2 font-mono text-[10px] text-fg2">
@@ -214,12 +212,9 @@ function ComputerUseOptIn({ zh }: { zh: boolean }) {
           onChange={(event) => {
             const next = event.target.checked;
             setEnabled(next);
-            try {
-              if (next) localStorage.setItem("grox.computerUseEnabled", "1");
-              else localStorage.removeItem("grox.computerUseEnabled");
-            } catch {
-              /* ignore */
-            }
+            setComputerUseOperatorEnabled(next);
+            // R4A-CU-01: disable-after-attach must not leave control live.
+            if (!next) void bridge.revokeComputerUseCapability?.().catch(() => {});
           }}
         />
         {enabled ? (zh ? "已启用" : "Enabled") : zh ? "已关闭" : "Disabled"}

@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
   COMPUTER_USE_STORAGE_KEY,
   computerLeaseIfAttached,
+  decideComputerAttachForPrompt,
   hasActiveComputerLease,
   isComputerUseOperatorEnabled,
   setComputerUseOperatorEnabled,
@@ -91,5 +93,59 @@ describe("computerLeaseIfAttached (soft-fail CU)", () => {
     expect(hasActiveComputerLease(leases, "sess-empty")).toBe(false);
     expect(hasActiveComputerLease(leases, "sess-missing")).toBe(false);
     expect(hasActiveComputerLease(leases, "sess-real")).toBe(true);
+  });
+});
+
+describe("decideComputerAttachForPrompt (R4A-CU-01)", () => {
+  const base = {
+    requestsComputer: true,
+    knownSession: true,
+    optIn: true,
+    hasActiveLease: false,
+  };
+
+  it("skips when no computer intent or unknown session", () => {
+    expect(
+      decideComputerAttachForPrompt({ ...base, requestsComputer: false }),
+    ).toBe("skip");
+    expect(decideComputerAttachForPrompt({ ...base, knownSession: false })).toBe(
+      "skip",
+    );
+  });
+
+  it("refuses opt-in without lease", () => {
+    expect(decideComputerAttachForPrompt({ ...base, optIn: false })).toBe(
+      "refuse_opt_in",
+    );
+  });
+
+  it("revokes stale lease when opt-in off (disable-after-attach)", () => {
+    // Ship path: Settings OFF after prior attach must not return already_attached.
+    expect(
+      decideComputerAttachForPrompt({
+        ...base,
+        optIn: false,
+        hasActiveLease: true,
+      }),
+    ).toBe("revoke_stale_and_refuse");
+  });
+
+  it("keeps already_attached only while opt-in still on", () => {
+    expect(
+      decideComputerAttachForPrompt({
+        ...base,
+        optIn: true,
+        hasActiveLease: true,
+      }),
+    ).toBe("already_attached");
+  });
+
+  it("attaches when opt-in on and no lease yet", () => {
+    expect(decideComputerAttachForPrompt(base)).toBe("attach");
+  });
+
+  it("exports refuse message for UI parity", () => {
+    expect(COMPUTER_USE_OPT_IN_REFUSE_MESSAGE).toMatch(/Computer Use/);
+    expect(COMPUTER_USE_OPT_IN_REFUSE_MESSAGE).toMatch(/设置/);
   });
 });

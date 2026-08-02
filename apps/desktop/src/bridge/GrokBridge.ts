@@ -171,4 +171,10 @@ export interface GrokBridge {
 
   /** Ctrl+Alt+Esc emergency stop for Windows Computer Use harness. */
   emergencyStopComputer?(sessionId: string): Promise<void>;
+
+  /**
+   * Settings opt-out: drop all Computer Use leases and revoke the localhost
+   * MCP bearer so disable-after-attach cannot leave control live (R4A-CU-01).
+   */
+  revokeComputerUseCapability?(): Promise<void>;
 }

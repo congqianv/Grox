@@ -5,7 +5,9 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { GrokBridge } from "./GrokBridge";
 import { MODELS } from "./types";
 import {
+  COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
   computerLeaseIfAttached,
+  decideComputerAttachForPrompt,
   hasActiveComputerLease,
   isComputerUseOperatorEnabled,
 } from "../lib/computerUse";
@@ -2694,7 +2696,9 @@ export class AcpBridge implements GrokBridge {
     // Computer attach must be channel-serialized (silent filter is session-scoped).
     // The interject RPC itself must NOT wait behind an in-flight session/prompt
     // (that would block mid-turn 插话 until the turn ends — R3 regression).
-    if (this.promptRequestsComputer(trimmed) && !hasActiveComputerLease(this.computerLeases, sessionId)) {
+    // Always enter ensure on Computer intent — even with an existing lease —
+    // so opt-in OFF can revoke stale MCP (R4A-CU-01).
+    if (this.promptRequestsComputer(trimmed)) {
       await this.runOnChannel(() => this.ensureComputerAttachedForPrompt(sessionId, trimmed));
     }
     const interjectionId = crypto.randomUUID();
@@ -3123,6 +3127,38 @@ export class AcpBridge implements GrokBridge {
   }
 
   /**
+   * Settings opt-out: revoke every lease + process-wide MCP bearer so
+   * disable-after-attach cannot leave desktop control live (R4A-CU-01).
+   */
+  async revokeComputerUseCapability(): Promise<void> {
+    const sessionIds = [...this.computerLeases.keys()];
+    for (const sessionId of sessionIds) {
+      await this.revokeComputerLease(sessionId);
+    }
+    this.computerLeases.clear();
+    this.activeComputerSessions.clear();
+    this.activeComputerToolCalls.clear();
+    await invoke("computer_revoke_http_auth").catch(() => {});
+  }
+
+  /** Drop one session lease and sticky-stop / revoke its MCP surface. */
+  private async revokeComputerLease(sessionId: string): Promise<void> {
+    const leaseId = this.computerLeases.get(sessionId);
+    this.computerLeases.delete(sessionId);
+    this.activeComputerSessions.delete(sessionId);
+    for (const key of [...this.activeComputerToolCalls]) {
+      if (key.startsWith(`${sessionId}:`)) this.activeComputerToolCalls.delete(key);
+    }
+    if (leaseId) {
+      try {
+        await invoke("computer_emergency_stop", { leaseId });
+      } catch {
+        await invoke("computer_revoke_http_auth").catch(() => {});
+      }
+    }
+  }
+
+  /**
    * Explicit Computer Use intent in the operator prompt (slash, @-mention, or
    * common CN/EN phrases). Silent loads intentionally skip MCP; attach only
    * when these fire so offline first-send stays cheap.
@@ -3141,25 +3177,48 @@ export class AcpBridge implements GrokBridge {
    * Secondary attach for sessions that were silent/background-bound without
    * Computer MCP. Re-issues session/load with MCP extensions under the silent
    * stream filter so offline history is not flooded.
+   *
+   * Re-checks opt-in even when a lease is already mapped (R4A-CU-01).
    */
   private async ensureComputerAttachedForPrompt(
     sessionId: string,
     text: string,
   ): Promise<void> {
-    // Empty-string leases must not count as attached (soft-fail CU path).
-    if (hasActiveComputerLease(this.computerLeases, sessionId)) return;
-    if (!this.promptRequestsComputer(text)) return;
-    if (!this.knownSessions.has(sessionId)) return;
-    if (!isComputerUseOperatorEnabled()) {
-      this.emit({
-        type: "error",
-        sessionId,
-        message:
-          "Computer Use 未启用。请在 设置 → 代理 中打开「允许 Computer Use」后再试。",
-      });
-      return;
+    const decision = decideComputerAttachForPrompt({
+      requestsComputer: this.promptRequestsComputer(text),
+      knownSession: this.knownSessions.has(sessionId),
+      optIn: isComputerUseOperatorEnabled(),
+      hasActiveLease: hasActiveComputerLease(this.computerLeases, sessionId),
+    });
+    switch (decision) {
+      case "skip":
+      case "already_attached":
+        return;
+      case "refuse_opt_in":
+        this.emit({
+          type: "error",
+          sessionId,
+          message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
+        });
+        return;
+      case "revoke_stale_and_refuse":
+        await this.revokeComputerLease(sessionId);
+        // Process-wide bearer may still be live for other sessions; if this
+        // was the last lease, revoke. Always best-effort revoke after opt-out
+        // path so a single-session app cannot leave MCP open.
+        if (this.computerLeases.size === 0) {
+          await invoke("computer_revoke_http_auth").catch(() => {});
+        }
+        this.emit({
+          type: "error",
+          sessionId,
+          message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
+        });
+        return;
+      case "attach":
+        await this.attachComputerMcp(sessionId);
+        return;
     }
-    await this.attachComputerMcp(sessionId);
   }
 
   private async invokeComputerSessionExtensions(): Promise<ComputerSessionExtensions> {
