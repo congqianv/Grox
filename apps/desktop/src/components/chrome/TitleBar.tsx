@@ -227,7 +227,6 @@ function DefaultOpenMenu({ language }: { language: "zh-CN" | "en-US" }) {
   const zh = language === "zh-CN";
 
   useEffect(() => {
-    let alive = true;
     const syncApplications = (event: Event) => {
       const value = (event as CustomEvent<OpenApplicationOption[]>).detail;
       if (Array.isArray(value)) setApplications(value);
@@ -244,13 +243,10 @@ function DefaultOpenMenu({ language }: { language: "zh-CN" | "en-US" }) {
     window.addEventListener("grox:default-open-application", sync);
     document.addEventListener("pointerdown", close, true);
     document.addEventListener("keydown", escape);
-    void refreshOpenApplications().then((next) => {
-      if (!alive) return;
-      setApplications(next);
-      setApplication(getDefaultOpenApplication());
-    });
+    // Do not scan installed apps on mount — that spawns powershell.exe on
+    // Windows and was flashing a blue console at cold start. Discovery runs
+    // only when the operator opens this menu.
     return () => {
-      alive = false;
       window.removeEventListener("grox:open-applications", syncApplications);
       window.removeEventListener("grox:default-open-application", sync);
       document.removeEventListener("pointerdown", close, true);

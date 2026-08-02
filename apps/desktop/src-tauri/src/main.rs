@@ -2823,16 +2823,26 @@ $apps.Values | Sort-Object name | ConvertTo-Json -Compress
 
 #[cfg(windows)]
 fn list_windows_open_applications() -> Result<Vec<OpenApplicationOption>, String> {
+    // CREATE_NO_WINDOW is required: TitleBar mounts DefaultOpenMenu on every
+    // cold start and immediately calls this helper. Without the flag, Windows
+    // flashes a full PowerShell console (the blank blue window operators saw).
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = std::process::Command::new("powershell.exe")
         .args([
+            "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
             windows_application_discovery_script(),
         ])
+        .stdin(Stdio::null())
         .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("无法读取 Windows 应用注册表：{error}"))?;
     if !output.status.success() {
