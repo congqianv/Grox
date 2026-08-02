@@ -6229,6 +6229,7 @@ fn toml_table_header_key(trimmed: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn is_toml_table_header(trimmed: &str) -> bool {
     toml_table_header_key(trimmed).is_some()
 }
