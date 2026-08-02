@@ -148,6 +148,26 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// R21: parse Content-Length when present (fail closed on garbage / oversize).
+fn parse_content_length(headers: &str) -> Result<Option<usize>, ()> {
+    const MAX_BODY: usize = 512 * 1024;
+    let mut found = None;
+    for line in headers.lines() {
+        let lower = line.to_ascii_lowercase();
+        let Some(rest) = lower.strip_prefix("content-length:") else {
+            continue;
+        };
+        let Ok(n) = rest.trim().parse::<usize>() else {
+            return Err(());
+        };
+        if n > MAX_BODY {
+            return Err(());
+        }
+        found = Some(n);
+    }
+    Ok(found)
+}
+
 fn handle_http(mut stream: TcpStream, state: Arc<Mutex<ComputerState>>) {
     let mut buffer = vec![0_u8; 1024 * 1024];
     let Ok(size) = stream.read(&mut buffer) else { return };
@@ -168,11 +188,29 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<ComputerState>>) {
         let presented = line.trim()[PREFIX.len()..].trim();
         constant_time_eq(presented.as_bytes(), token.as_bytes())
     });
+    // R21: Content-Length must not exceed buffer body; incomplete bodies rejected.
+    let content_length_ok = match parse_content_length(headers) {
+        Ok(None) => body.len() <= 512 * 1024,
+        Ok(Some(n)) => body.len() >= n && n <= 512 * 1024,
+        Err(()) => false,
+    };
+    let request_line = headers.lines().next().unwrap_or_default();
+    let post_mcp = request_line.starts_with("POST ")
+        && (request_line.contains(" /mcp ")
+            || request_line.starts_with("POST /mcp ")
+            || request_line.contains(" /mcp?")
+            || request_line == "POST /mcp");
     let (status, reason, response) = if !authorized {
         (401, "Unauthorized", Some(json!({"error":"Unauthorized"})))
-    } else if !headers.starts_with("POST ") {
+    } else if !content_length_ok {
+        (413, "Payload Too Large", Some(json!({"error":"body too large or incomplete"})))
+    } else if !post_mcp {
         (405, "Method Not Allowed", Some(json!({"error":"Method Not Allowed"})))
     } else {
+        let body = match parse_content_length(headers).ok().flatten() {
+            Some(n) => &body[..n.min(body.len())],
+            None => body,
+        };
         match serde_json::from_str::<Value>(body.trim()) {
             Ok(request) => {
                 let id = request.get("id").cloned();
@@ -1847,6 +1885,17 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn parse_content_length_bounds() {
+        assert_eq!(
+            parse_content_length("POST /mcp HTTP/1.1\r\nContent-Length: 12\r\n"),
+            Ok(Some(12))
+        );
+        assert_eq!(parse_content_length("POST /mcp HTTP/1.1\r\n"), Ok(None));
+        assert!(parse_content_length("Content-Length: not-a-number\r\n").is_err());
+        assert!(parse_content_length("Content-Length: 99999999\r\n").is_err());
     }
 
     #[test]

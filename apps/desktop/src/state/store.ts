@@ -1701,7 +1701,23 @@ export const useDesktop = create<DesktopState>((set, get) => {
     async openAppUpdateDownload() {
       const info = get().appUpdate;
       const url = info?.downloadUrl || info?.releaseUrl || "https://github.com/congqianv/Grox/releases";
-      await invoke("open_external", { url });
+      // R21: dual-gate with Rust open_external (HTTPS + non-metadata only).
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== "https:" || parsed.username || parsed.password) return;
+        const host = parsed.hostname.toLowerCase();
+        if (
+          host === "169.254.169.254"
+          || host.startsWith("169.254.")
+          || host === "metadata.google.internal"
+          || host === "100.100.100.200"
+        ) {
+          return;
+        }
+        await invoke("open_external", { url: parsed.toString() });
+      } catch {
+        // invalid URL — ignore
+      }
     },
 
     async installAppUpdate() {

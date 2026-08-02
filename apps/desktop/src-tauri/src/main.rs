@@ -3553,6 +3553,13 @@ fn git_push(cwd: String) -> Result<String, String> {
     if branch.is_empty() {
         return Err("当前处于 detached HEAD，无法直接推送".into());
     }
+    // R21: refuse odd/control branch names before they become git argv.
+    if branch.len() > 200
+        || branch.starts_with('-')
+        || branch.chars().any(|c| c.is_control() || c == ':' || c == '\\')
+    {
+        return Err("当前分支名无效，已拒绝推送".into());
+    }
     let has_upstream = optional_git_text(
         &root,
         &[
@@ -3916,16 +3923,15 @@ foreach ($registryRoot in $registryRoots) {
   }
 }
 
-# File Explorer and installed terminal shells are OS applications, not always
-# present below HKCR\Applications. Add them only when the command actually
-# exists on this machine.
+# File Explorer / shells: absolute SystemRoot paths only (R21 — never Get-Command PATH).
+$sys = [Environment]::GetFolderPath('System')
+if ([string]::IsNullOrWhiteSpace($sys)) { $sys = Join-Path $env:SystemRoot 'System32' }
 foreach ($entry in @(
-  @{ id = 'file-explorer'; name = 'File Explorer'; command = 'explorer.exe' },
-  @{ id = 'windows-terminal'; name = 'Windows Terminal'; command = 'wt.exe' },
-  @{ id = 'powershell'; name = 'PowerShell'; command = 'powershell.exe' }
+  @{ id = 'file-explorer'; name = 'File Explorer'; path = (Join-Path $env:SystemRoot 'explorer.exe') },
+  @{ id = 'powershell'; name = 'PowerShell'; path = (Join-Path $sys 'WindowsPowerShell\v1.0\powershell.exe') },
+  @{ id = 'windows-terminal'; name = 'Windows Terminal'; path = (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\wt.exe') }
 )) {
-  $command = Get-Command $entry.command
-  if ($null -ne $command) { Add-App $entry.id $entry.name $command.Source }
+  if (Test-Path -LiteralPath $entry.path) { Add-App $entry.id $entry.name $entry.path }
 }
 $apps.Values | Sort-Object name | ConvertTo-Json -Compress
 "#
