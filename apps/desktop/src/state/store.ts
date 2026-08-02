@@ -45,6 +45,13 @@ import { loadSessionCache, scheduleSaveSessionCache } from "../lib/sessionCache"
 const offlineHistoryComplete = new Set<string>();
 /** Missions with an in-flight offline scan (avoid re-invoke restart storms). */
 const offlineHistoryScanning = new Set<string>();
+/**
+ * Sessions with an in-flight sendPrompt IIFE (silent bind + prompt).
+ * Prevents openSession from coercing running→idle mid-bind (double-prompt race).
+ */
+const promptInFlightSessions = new Set<string>();
+/** Monotonic token so superseded openSession awaits do not steal focus. */
+let openSessionGeneration = 0;
 /** Poll timer for offline scan progress (atomics in Rust — no event flood). */
 let offlineScanPollTimer: number | null = null;
 
@@ -82,11 +89,12 @@ function startOfflineScanPoll(sessionId: string): void {
         const state = useDesktop.getState();
         const active = state.activeId;
         const loading = state.fullHistoryLoadingId;
+        // Strict id match: never treat another session's atomics as ours.
+        if (p.id && p.id !== "" && p.id !== sessionId) {
+          return;
+        }
         // Only paint for the session we care about.
-        if (
-          (p.id && p.id !== sessionId && p.id !== "") ||
-          (active !== sessionId && loading !== sessionId)
-        ) {
+        if (active !== sessionId && loading !== sessionId) {
           return;
         }
 
@@ -121,16 +129,19 @@ function startOfflineScanPoll(sessionId: string): void {
             // ~15s with no byte movement after scan actually started.
             if (stuckTicks >= 60) {
               offlineHistoryScanning.delete(sessionId);
-              // Soft-complete so we keep chat_history UI and do not thrash retries.
-              offlineHistoryComplete.add(sessionId);
+              // Soft-cancel only: do NOT mark complete — next open may retry.
               stopOfflineScanPoll();
               void invoke("cancel_offline_session_history").catch(() => {});
-              useDesktop.setState({
-                fullHistoryLoadingId: null,
-                historyLoadMode: null,
-                diskHistoryProgress: null,
-                // No blocking toast — Wave 0: preview stays usable.
-              });
+              if (
+                useDesktop.getState().fullHistoryLoadingId === sessionId &&
+                useDesktop.getState().historyLoadMode === "disk"
+              ) {
+                useDesktop.setState({
+                  fullHistoryLoadingId: null,
+                  historyLoadMode: null,
+                  diskHistoryProgress: null,
+                });
+              }
             }
           } else {
             stuckTicks = 0;
@@ -141,17 +152,29 @@ function startOfflineScanPoll(sessionId: string): void {
 
         // Terminal: session body arrives via disk-history-progress event.
         offlineHistoryScanning.delete(sessionId);
-        stopOfflineScanPoll();
-        if (phase === "complete" || phase === "no-updates" || phase === "missing") {
+        // Only stop the global poll when it still belongs to this session.
+        if (
+          useDesktop.getState().fullHistoryLoadingId === sessionId ||
+          useDesktop.getState().diskHistoryProgress?.id === sessionId
+        ) {
+          stopOfflineScanPoll();
+        }
+        // Require progress id match before permanent complete (stale atomics).
+        const progressOwned = !p.id || p.id === sessionId;
+        if (
+          progressOwned &&
+          (phase === "complete" || phase === "no-updates" || phase === "missing")
+        ) {
           offlineHistoryComplete.add(sessionId);
         }
-        // cancelled/error from our soft watchdog or real failure: drop banner only.
+        // cancelled/error: drop banner only — allow retry on next open.
         if (
-          phase === "error" ||
-          phase === "cancelled" ||
-          phase === "missing" ||
-          phase === "complete" ||
-          phase === "no-updates"
+          progressOwned &&
+          (phase === "error" ||
+            phase === "cancelled" ||
+            phase === "missing" ||
+            phase === "complete" ||
+            phase === "no-updates")
         ) {
           // complete keeps banner until session event; clear if still loading after a beat.
           if (phase !== "complete" && useDesktop.getState().fullHistoryLoadingId === sessionId) {
@@ -1303,14 +1326,24 @@ export const useDesktop = create<DesktopState>((set, get) => {
           const payload = event.payload;
           if (!payload?.id || !payload.done) return;
 
+          // Always free the scanning slot for this id (including cancelled abandon).
           offlineHistoryScanning.delete(payload.id);
-          stopOfflineScanPoll();
 
+          const loadingId = get().fullHistoryLoadingId;
+          const progressId = get().diskHistoryProgress?.id ?? null;
+          // Never stop the poll for an unrelated session's terminal event.
+          if (loadingId === payload.id || progressId === payload.id) {
+            stopOfflineScanPoll();
+          } else if (loadingId && loadingId !== payload.id && offlineHistoryScanning.has(loadingId)) {
+            // Keep progress alive for the session that is still scanning.
+            startOfflineScanPoll(loadingId);
+          }
+
+          // cancelled/error are retryable — do not permanent-complete.
           if (
             payload.phase === "complete" ||
             payload.phase === "no-updates" ||
-            payload.phase === "missing" ||
-            payload.phase === "error"
+            payload.phase === "missing"
           ) {
             offlineHistoryComplete.add(payload.id);
           }
@@ -1427,15 +1460,27 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (bridge.kind === "acp") {
         void invoke("cancel_offline_session_history").catch(() => {});
       }
-      set({
-        view: "home",
-        activeId: null,
-        planPreviewOpen: false,
-        fullHistoryLoadingId:
-          get().historyLoadMode === "disk" ? null : get().fullHistoryLoadingId,
-        historyLoadMode: get().historyLoadMode === "disk" ? null : get().historyLoadMode,
-        diskHistoryProgress: get().historyLoadMode === "disk" ? null : get().diskHistoryProgress,
-      });
+      stopOfflineScanPoll();
+      offlineHistoryScanning.clear();
+      if (get().historyLoadMode === "agent") {
+        // Keep agent-bind chrome if first-send is mid-flight; drop disk banner only.
+        set({
+          view: "home",
+          activeId: null,
+          planPreviewOpen: false,
+          diskHistoryProgress: null,
+        });
+      } else {
+        set({
+          view: "home",
+          activeId: null,
+          planPreviewOpen: false,
+          fullHistoryLoadingId: null,
+          historyLoadMode: null,
+          agentBindStartedAt: null,
+          diskHistoryProgress: null,
+        });
+      }
     },
 
     async checkAppUpdate(opts) {
@@ -1601,6 +1646,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           ) {
             offlineHistoryScanning.add(id);
             set({ fullHistoryLoadingId: id, historyLoadMode: "disk" });
+            startOfflineScanPoll(id);
             void invoke("start_offline_session_history", {
               id,
               title: current.sessions[id]?.title ?? null,
@@ -1620,6 +1666,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
           return;
         }
 
+        // Switching missions: cancel previous offline worker + free scanning slots.
+        const prevId = current.activeId;
+        if (bridge.kind === "acp" && prevId && prevId !== id) {
+          void invoke("cancel_offline_session_history").catch(() => {});
+          offlineHistoryScanning.delete(prevId);
+          stopOfflineScanPoll();
+        }
+
+        const openGen = ++openSessionGeneration;
+        const stillThisOpen = () => openGen === openSessionGeneration;
+
         const meta = current.sessionIndex.find((entry) => entry.id === id);
         if (meta) bridge.rememberSessionMeta?.(meta);
 
@@ -1635,6 +1692,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         persistSessionComposers(sessionComposers);
 
         const kickOfflineHistory = (session?: Session | null) => {
+          if (!stillThisOpen()) return;
           if (bridge.kind !== "acp") return;
           if (offlineHistoryComplete.has(id)) return;
           // Already scanning this id — join poll, do not re-invoke.
@@ -1673,16 +1731,28 @@ export const useDesktop = create<DesktopState>((set, get) => {
         };
 
         const applyChrome = (session?: Session | null, opts?: { loadingDisk?: boolean }) => {
+          if (!stillThisOpen()) return;
           const crossProject = meta && !samePath(meta.cwd, get().workspace);
           const projects =
             meta && crossProject
               ? ensureProject(get().projects, meta.cwd, { force: true })
               : get().projects;
           let painted = session ?? null;
-          if (painted && !bridge.isSessionBound?.(painted.id) && painted.status === "running") {
+          // Do not force idle while a send/bind is in flight (double-prompt race).
+          if (
+            painted &&
+            !bridge.isSessionBound?.(painted.id) &&
+            painted.status === "running" &&
+            !promptInFlightSessions.has(painted.id)
+          ) {
             painted = { ...painted, status: "idle" };
           }
           const loadingDisk = Boolean(opts?.loadingDisk) && !offlineHistoryComplete.has(id);
+          // Preserve in-flight agent bind chrome for another session.
+          const keepAgent =
+            get().historyLoadMode === "agent" &&
+            get().fullHistoryLoadingId != null &&
+            get().fullHistoryLoadingId !== id;
           set({
             activeId: id,
             view: "session",
@@ -1692,9 +1762,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
             permissionMode: composer.permissionMode,
             sessionComposers,
             startupError: null,
-            queueNotice: null,
-            fullHistoryLoadingId: loadingDisk ? id : null,
-            historyLoadMode: loadingDisk ? "disk" : null,
+            queueNotice: keepAgent ? get().queueNotice : null,
+            fullHistoryLoadingId: loadingDisk
+              ? id
+              : keepAgent
+                ? get().fullHistoryLoadingId
+                : null,
+            historyLoadMode: loadingDisk
+              ? "disk"
+              : keepAgent
+                ? "agent"
+                : null,
             ...(painted ? { sessions: { ...get().sessions, [id]: painted } } : {}),
             ...(meta && crossProject
               ? {
@@ -1738,6 +1816,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (bridge.kind === "acp") {
           try {
             const raw = await invoke<string | null>("get_ui_transcript", { id });
+            if (!stillThisOpen()) return;
             if (raw) {
               const transcript = normalizeOfflineSession(JSON.parse(raw) as Session);
               if (transcript && transcript.id === id && transcript.blocks.length > 0) {
@@ -1751,6 +1830,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             console.warn("get_ui_transcript failed", error);
           }
         }
+        if (!stillThisOpen()) return;
 
         // 3) Disk chat_history.jsonl — real conversation text, ~instant
         try {
@@ -1760,6 +1840,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             cwd: meta?.cwd ?? null,
             model: meta?.model ?? null,
           });
+          if (!stillThisOpen()) return;
           if (raw) {
             const preview = normalizeOfflineSession(JSON.parse(raw) as Session);
             if (preview && preview.id === id && preview.blocks.length > 0) {
@@ -1771,9 +1852,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
         } catch (error) {
           console.warn("preview_session_from_disk failed", error);
         }
+        if (!stillThisOpen()) return;
 
         // 4) App UI cache (thin live-stream snapshot)
         const cached = await loadSessionCache(id);
+        if (!stillThisOpen()) return;
         if (cached) {
           applyChrome(cached, { loadingDisk: !offlineHistoryComplete.has(id) });
           kickOfflineHistory(cached);
@@ -1806,6 +1889,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
           activeId: null,
           fullHistoryLoadingId: null,
           historyLoadMode: null,
+          agentBindStartedAt: null,
+          diskHistoryProgress: null,
         });
       }
     },
@@ -2459,7 +2544,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
       bridge.setPermissionMode(composer.permissionMode);
       // Bind agent only when the user actually continues the chat (first send).
       // Opening/switching never does session/load — that was the freeze source.
+      promptInFlightSessions.add(session.id);
       void (async () => {
+        const clearAgentBannerIfOurs = () => {
+          const s = get();
+          if (s.fullHistoryLoadingId === session.id && s.historyLoadMode === "agent") {
+            set({
+              fullHistoryLoadingId: null,
+              historyLoadMode: null,
+              agentBindStartedAt: null,
+              queueNotice: null,
+            });
+          }
+        };
         try {
           if (!bridge.isSessionBound?.(session.id)) {
             set({
@@ -2477,12 +2574,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
             // silent: drop ACP stream replay — UI already has offline history.
             // Without silent, session/load floods the shell and freezes on send.
             await bridge.loadSession(session.id, { background: true, silent: true });
-            set({
-              fullHistoryLoadingId: null,
-              historyLoadMode: null,
-              agentBindStartedAt: null,
-              queueNotice: null,
-            });
+            // Only clear if this session still owns the agent banner (not B's disk scan).
+            clearAgentBannerIfOurs();
           }
           // Always prompt the mission that initiated the send — switching the UI
           // mid-bind must not orphan the already-painted user message.
@@ -2493,10 +2586,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
             attachments,
           });
         } catch (error) {
+          const s = get();
+          const clearAgent =
+            s.fullHistoryLoadingId === session.id && s.historyLoadMode === "agent";
           set({
-            fullHistoryLoadingId: null,
-            historyLoadMode: null,
-            agentBindStartedAt: null,
+            ...(clearAgent
+              ? {
+                  fullHistoryLoadingId: null,
+                  historyLoadMode: null,
+                  agentBindStartedAt: null,
+                }
+              : {}),
             queueNotice: {
               id: uid(),
               message: error instanceof Error ? error.message : String(error),
@@ -2511,6 +2611,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
               },
             },
           });
+        } finally {
+          promptInFlightSessions.delete(session.id);
         }
       })();
     },

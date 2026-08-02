@@ -887,14 +887,30 @@ fn apply_cli_provider_environment(command: &mut Command) {
     }
 }
 
-fn checked_media_prompt(request: &MediaGenerationRequest) -> Result<String, String> {
+fn checked_media_prompt(request: &MediaGenerationRequest, cwd: &Path) -> Result<String, String> {
     let prompt = request.prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 4_000 {
         return Err("媒体提示词必须为 1–4000 个字符".into());
     }
+    if prompt.chars().any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t') {
+        return Err("媒体提示词包含非法控制字符".into());
+    }
     let aspect = match request.aspect.as_str() {
         "1:1" | "16:9" | "9:16" | "4:3" => request.aspect.as_str(),
         _ => return Err("不支持的画面比例".into()),
+    };
+    // Reference image must stay inside the checked workspace (no absolute escape /
+    // newline prompt injection via path).
+    let reference_abs = match request.reference_path.as_deref() {
+        None => None,
+        Some(p) if p.trim().is_empty() => None,
+        Some(p) => {
+            if p.chars().any(|c| c.is_control()) {
+                return Err("参考图片路径包含非法字符".into());
+            }
+            let path = checked_workspace_file(cwd, p)?;
+            Some(path_for_webview(&path))
+        }
     };
     let instruction = match request.kind.as_str() {
         "image" => format!(
@@ -902,7 +918,8 @@ fn checked_media_prompt(request: &MediaGenerationRequest) -> Result<String, Stri
             count = request.count.clamp(1, 4)
         ),
         "video" => {
-            let reference = request.reference_path.as_deref()
+            let reference = reference_abs
+                .as_deref()
                 .map(|path| format!("参考图片绝对路径：{path}。必须使用 image_to_video 或 reference_to_video。"))
                 .unwrap_or_else(|| "必须使用 video_gen。".to_string());
             format!(
@@ -3795,7 +3812,7 @@ async fn generate_media(
     request: MediaGenerationRequest,
 ) -> Result<MediaGenerationResult, String> {
     let cwd = checked_workspace(&request.cwd)?;
-    let prompt = checked_media_prompt(&request)?;
+    let prompt = checked_media_prompt(&request, &cwd)?;
     let runtime = configured_grok_command(&app);
     let mut command = Command::new(&runtime.path);
     command
@@ -4400,6 +4417,14 @@ fn scan_progress_finish(phase: &str) {
     SCAN_PHASE_CODE.store(phase_code(phase), Ordering::Relaxed);
 }
 
+/// Only finish global progress atomics when this worker still owns the gen token.
+/// Abandoned workers must not clobber a newer session's scan (CRITICAL race).
+fn scan_progress_finish_if(gen: u64, phase: &str) {
+    if OFFLINE_HISTORY_GEN.load(Ordering::SeqCst) == gen {
+        scan_progress_finish(phase);
+    }
+}
+
 /// Bump generation so any in-flight offline history worker exits without emitting.
 #[tauri::command]
 fn cancel_offline_session_history() {
@@ -4609,7 +4634,7 @@ fn start_offline_session_history(
             };
 
             let Some(dir) = find_grok_session_dir(&safe) else {
-                scan_progress_finish("missing");
+                scan_progress_finish_if(gen, "missing");
                 emit_done(None, "missing");
                 clear_active();
                 return;
@@ -4618,7 +4643,9 @@ fn start_offline_session_history(
             // Publish total size ASAP so the UI can show 0/xxx MB while we prepare.
             let updates_path_early = dir.join("updates.jsonl");
             if let Some((sz, _)) = file_size_mtime_ms(&updates_path_early) {
-                SCAN_TOTAL.store(sz, Ordering::Relaxed);
+                if !abandoned() {
+                    SCAN_TOTAL.store(sz, Ordering::Relaxed);
+                }
             }
 
             // Wave 1: durable fingerprint cache — skip multi-hundred-MB rescan.
@@ -4630,7 +4657,7 @@ fn start_offline_session_history(
                         .map(|a| a.len())
                         .unwrap_or(0);
                     scan_progress_set(0, 0, blocks_n as u64);
-                    scan_progress_finish("complete");
+                    scan_progress_finish_if(gen, "complete");
                     let payload = serde_json::json!({
                         "id": safe,
                         "gen": gen,
@@ -4645,6 +4672,17 @@ fn start_offline_session_history(
                         "blocks": blocks_n,
                     });
                     let _ = app.emit("disk-history-progress", payload);
+                } else {
+                    // Still notify FE so offlineHistoryScanning can drop this id.
+                    let _ = app.emit(
+                        "disk-history-progress",
+                        serde_json::json!({
+                            "id": safe,
+                            "gen": gen,
+                            "done": true,
+                            "phase": "cancelled",
+                        }),
+                    );
                 }
                 clear_active();
                 return;
@@ -4677,7 +4715,7 @@ fn start_offline_session_history(
             // Phase 2: stream updates.jsonl for full tool + message fidelity.
             let updates_path = dir.join("updates.jsonl");
             if !updates_path.is_file() {
-                scan_progress_finish("no-updates");
+                scan_progress_finish_if(gen, "no-updates");
                 emit(
                     pack_offline_session(
                         &safe, &title_s, &cwd_s, &model_s, created_at, updated_at, &[],
@@ -4692,18 +4730,30 @@ fn start_offline_session_history(
             let file = match File::open(&updates_path) {
                 Ok(f) => f,
                 Err(e) => {
-                    scan_progress_finish("error");
-                    let _ = app.emit(
-                        "disk-history-progress",
-                        serde_json::json!({
-                            "id": safe,
-                            "gen": gen,
-                            "done": true,
-                            "phase": "error",
-                            "error": format!("open updates: {e}"),
-                            "session": null,
-                        }),
-                    );
+                    if !abandoned() {
+                        scan_progress_finish_if(gen, "error");
+                        let _ = app.emit(
+                            "disk-history-progress",
+                            serde_json::json!({
+                                "id": safe,
+                                "gen": gen,
+                                "done": true,
+                                "phase": "error",
+                                "error": format!("open updates: {e}"),
+                                "session": null,
+                            }),
+                        );
+                    } else {
+                        let _ = app.emit(
+                            "disk-history-progress",
+                            serde_json::json!({
+                                "id": safe,
+                                "gen": gen,
+                                "done": true,
+                                "phase": "cancelled",
+                            }),
+                        );
+                    }
                     clear_active();
                     return;
                 }
@@ -4785,10 +4835,27 @@ fn start_offline_session_history(
                 scan_progress_set(shown, line_i as u64, block_count as u64);
             };
 
+            // Always notify FE on abandon so offlineHistoryScanning can drop this id.
+            // Never touch progress atomics if a newer gen owns them.
+            let exit_cancelled = || {
+                if OFFLINE_HISTORY_GEN.load(Ordering::SeqCst) == gen {
+                    scan_progress_finish("cancelled");
+                }
+                let _ = app.emit(
+                    "disk-history-progress",
+                    serde_json::json!({
+                        "id": safe,
+                        "gen": gen,
+                        "done": true,
+                        "phase": "cancelled",
+                    }),
+                );
+                clear_active();
+            };
+
             loop {
                 if abandoned() {
-                    scan_progress_finish("cancelled");
-                    clear_active();
+                    exit_cancelled();
                     return;
                 }
                 line_buf.clear();
@@ -4830,8 +4897,7 @@ fn start_offline_session_history(
                     );
                 }
                 if line_i & 0xFFF == 0 && abandoned() {
-                    scan_progress_finish("cancelled");
-                    clear_active();
+                    exit_cancelled();
                     return;
                 }
 
@@ -4879,10 +4945,19 @@ fn start_offline_session_history(
                         let delta = json_text_content(
                             update.get("content").unwrap_or(&serde_json::Value::Null),
                         );
+                        // Cap user body like assistant — pathological multi-MB streams.
+                        const USER_CAP: usize = 48 * 1024;
                         if let Some(ref mut text) = user_open {
-                            text.push_str(&delta);
+                            if text.len() < USER_CAP {
+                                let room = USER_CAP - text.len();
+                                if delta.len() <= room {
+                                    text.push_str(&delta);
+                                } else {
+                                    text.push_str(&trunc_str(&delta, room));
+                                }
+                            }
                         } else {
-                            user_open = Some(delta);
+                            user_open = Some(trunc_str(&delta, USER_CAP));
                         }
                     }
                     "agent_message_chunk" => {
@@ -4983,6 +5058,11 @@ fn start_offline_session_history(
                             "ts": updated_at,
                             "call": call,
                         }));
+                        // Continuous cap — avoid multi-hundred-MB peaks before final pack.
+                        const MAX_SCAN: usize = 1500;
+                        if blocks.len() > MAX_SCAN {
+                            blocks = blocks.split_off(blocks.len() - MAX_SCAN);
+                        }
                     }
                     "tool_call_update" => {
                         let tool_id = update
@@ -5117,8 +5197,7 @@ fn start_offline_session_history(
             }
 
             if abandoned() {
-                scan_progress_finish("cancelled");
-                clear_active();
+                exit_cancelled();
                 return;
             }
             flush_user(
@@ -5150,8 +5229,15 @@ fn start_offline_session_history(
             }
             // Attach tool outputs from small chat_history.jsonl (safe; not from huge updates).
             enrich_tools_from_chat_history(&dir, &mut blocks);
+            if abandoned() {
+                // Cache may still be useful for this session id, but never finish
+                // global atomics or claim complete for a superseded gen.
+                exit_cancelled();
+                return;
+            }
 
             // Timeline windows initial paint; 1500 blocks covers long missions.
+            // Cap continuously during scan via push sites; final belt-and-braces here.
             const MAX_FINAL_BLOCKS: usize = 1500;
             if blocks.len() > MAX_FINAL_BLOCKS {
                 blocks = blocks.split_off(blocks.len() - MAX_FINAL_BLOCKS);
@@ -5159,18 +5245,24 @@ fn start_offline_session_history(
             let packed = pack_offline_session(
                 &safe, &title_s, &cwd_s, &model_s, created_at, updated_at, &blocks,
             );
-            // Durable fingerprint cache for next cold open.
+            // Durable fingerprint cache for next cold open (even if later cancelled).
             let _ = write_ui_transcript(&dir, &safe, &packed, &updates_path);
+            if abandoned() {
+                exit_cancelled();
+                return;
+            }
             let final_bytes = total_bytes.max(bytes_read);
             scan_progress_set(final_bytes, line_i as u64, blocks.len() as u64);
-            scan_progress_finish("complete");
+            scan_progress_finish_if(gen, "complete");
             emit_done(Some(packed), "complete");
             clear_active();
             }));
             if result.is_err() {
-                // Panic inside worker — unlock UI and allow retry.
-                SCAN_DONE.store(1, Ordering::Relaxed);
-                SCAN_PHASE_CODE.store(phase_code("error"), Ordering::Relaxed);
+                // Panic inside worker — unlock UI only if this gen still owns the scan.
+                if OFFLINE_HISTORY_GEN.load(Ordering::SeqCst) == gen {
+                    SCAN_DONE.store(1, Ordering::Relaxed);
+                    SCAN_PHASE_CODE.store(phase_code("error"), Ordering::Relaxed);
+                }
                 if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
                     if guard.as_str() == safe {
                         guard.clear();
@@ -5191,7 +5283,7 @@ fn start_offline_session_history(
             }
         })
         .map_err(|e| {
-            scan_progress_finish("error");
+            scan_progress_finish_if(gen, "error");
             if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
                 guard.clear();
             }

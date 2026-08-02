@@ -369,7 +369,7 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
         {processOpen && (
           <div className="process-sequence process-rail ml-[7px] mt-2 border-l border-line2 pb-1 pl-5 pt-2">
             {process.length > 0 ? (
-              <RenderSequence blocks={process} sessionId={sessionId} processing />
+              <RenderSequence blocks={process} sessionId={sessionId} processing={false} />
             ) : (
               <p className="mb-3 text-[10.5px] leading-relaxed text-dim">{language === "zh-CN" ? "本轮 API 只返回了最终答复；无法据此判断服务商内部是否调用了工具。" : "The API returned only a final answer; provider-internal tool usage cannot be determined from this response."}</p>
             )}
@@ -482,15 +482,25 @@ export function Timeline({ session }: { session: Session }) {
   const hiddenCount = turns.length - visibleTurns.length;
 
   const jumpToTurn = (id: string) => {
-    const index = visibleTurns.findIndex((turn) => turn.id === id);
-    if (index < 0) return;
+    // Expand live window if the target is outside the visible slice.
+    if (!showAll && !visibleTurns.some((turn) => turn.id === id)) {
+      setShowAll(true);
+    }
     followRef.current = false;
-    virtuosoRef.current?.scrollToIndex({
-      index,
-      align: "start",
-      behavior: "smooth",
-      offset: -48,
-    });
+    const run = () => {
+      // Prefer full turns so expand-after-setShowAll lands correctly.
+      const target = turns.findIndex((turn) => turn.id === id);
+      if (target < 0) return;
+      virtuosoRef.current?.scrollToIndex({
+        index: target,
+        align: "start",
+        behavior: "auto",
+        offset: -48,
+      });
+    };
+    run();
+    window.setTimeout(run, 40);
+    window.setTimeout(run, 160);
   };
 
   const scrollToBottom = (force = false) => {
@@ -504,7 +514,7 @@ export function Timeline({ session }: { session: Session }) {
     return true;
   };
 
-  // Stick to bottom when the transcript grows / session opens.
+  // Stick to bottom only on open/switch — never yank on every block_add (user reading up).
   useEffect(() => {
     if (!hasBlocks) return;
     followRef.current = true;
@@ -515,7 +525,14 @@ export function Timeline({ session }: { session: Session }) {
       window.clearTimeout(t1);
       window.clearTimeout(t2);
     };
-  }, [session.id, signature, showAll, hiddenCount, hasBlocks, visibleTurns.length]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: session open only
+  }, [session.id]);
+
+  // Soft follow when already at bottom and transcript grows (does not re-arm follow).
+  useEffect(() => {
+    if (!hasBlocks || !followRef.current) return;
+    scrollToBottom(true);
+  }, [signature, showAll, hiddenCount, visibleTurns.length, hasBlocks]);
 
   if (!hasBlocks) {
     if (loadingFullHistory && historyLoadMode === "disk") {

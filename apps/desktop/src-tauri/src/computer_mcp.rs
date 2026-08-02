@@ -31,7 +31,7 @@ static HTTP_SERVER: OnceLock<SharedHttpServer> = OnceLock::new();
 /// Start (or reuse) the localhost MCP HTTP server and bind it to `lease_id`.
 /// Subsequent calls keep the same port and only rotate token + lease state.
 pub fn serve_http(lease_id: String) -> Result<HttpEndpoint, String> {
-    let token = uuid_token();
+    let token = uuid_token()?;
     if let Some(shared) = HTTP_SERVER.get() {
         rotate_http_auth(shared, &lease_id, &token)?;
         return Ok(HttpEndpoint {
@@ -98,10 +98,11 @@ fn rotate_http_auth(shared: &SharedHttpServer, lease_id: &str, token: &str) -> R
     Ok(())
 }
 
-fn uuid_token() -> String {
+fn uuid_token() -> Result<String, String> {
     let mut bytes = [0_u8; 32];
-    getrandom::fill(&mut bytes).unwrap_or(());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    // Fail closed: never ship an all-zero bearer if the CSPRNG is unavailable.
+    getrandom::fill(&mut bytes).map_err(|e| format!("无法生成 Computer Use 令牌：{e}"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
 fn current_http_auth() -> Option<(String, String)> {
@@ -1573,7 +1574,11 @@ mod platform {
             "CTRL" | "CONTROL" => VK_CONTROL,
             "SHIFT" => VK_SHIFT,
             "ALT" => VK_MENU,
-            "WIN" | "META" => VK_LWIN,
+            // Deny OS-shell / focus-stealing keys — SendInput is global; WIN/META
+            // breaks the selected-window sandbox (Win+R, Start menu, etc.).
+            "WIN" | "META" | "LWIN" | "RWIN" | "SUPER" => {
+                return Err("出于安全原因，Computer Use 禁止 WIN/META 系统键".into());
+            }
             "ENTER" | "RETURN" => VK_RETURN,
             "ESC" | "ESCAPE" => VK_ESCAPE,
             "TAB" => VK_TAB,
