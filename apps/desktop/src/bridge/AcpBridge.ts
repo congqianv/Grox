@@ -2471,7 +2471,8 @@ export class AcpBridge implements GrokBridge {
   async newSession(cwd: string): Promise<void> {
     const metaRequest = await this.sessionMeta(cwd);
     const preferredModel = localStorage.getItem("grok.model")?.trim();
-    const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+    // Soft-fail when CU opt-in is off: empty MCP/plugin lists, session still creates.
+    const computer = await this.invokeComputerSessionExtensions();
     let responseValue: unknown;
     let attachedComputer = computer.mcpServers.length > 0 || computer.pluginDirs.length > 0;
     try {

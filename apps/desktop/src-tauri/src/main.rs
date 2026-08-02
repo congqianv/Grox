@@ -3841,11 +3841,15 @@ fn computer_use_gate_open(operator_enabled: Option<bool>) -> bool {
 fn computer_session_extensions(operator_enabled: Option<bool>) -> Result<ComputerSessionExtensions, String> {
     // Product gate: Computer Use is opt-in (Settings / explicit flag). Env
     // GROX_COMPUTER_USE=1 also enables for advanced operators.
+    // Soft-fail when closed: return empty MCP/plugin lists so session/new and
+    // session/load still succeed. Prompt-time attach (ensureComputerAttached)
+    // surfaces the opt-in message only when the user actually asks for CU.
     if !computer_use_gate_open(operator_enabled) {
-        return Err(
-            "Computer Use 未启用。请在设置中打开「允许 Computer Use」，或设置环境变量 GROX_COMPUTER_USE=1。"
-                .into(),
-        );
+        return Ok(ComputerSessionExtensions {
+            mcp_servers: Vec::new(),
+            plugin_dirs: Vec::new(),
+            lease_id: String::new(),
+        });
     }
     let mut lease_bytes = [0_u8; 16];
     getrandom::fill(&mut lease_bytes)
@@ -6814,6 +6818,20 @@ api_key = "local-key"
         assert!(!computer_use_gate_open(None));
         assert!(!computer_use_gate_open(Some(false)));
         assert!(computer_use_gate_open(Some(true)));
+    }
+
+    #[test]
+    fn computer_session_extensions_soft_ok_when_gate_closed() {
+        // Off-path must not kill session lifecycle — empty MCP only.
+        std::env::remove_var("GROX_COMPUTER_USE");
+        let none = computer_session_extensions(None).expect("gate-closed is Ok");
+        assert!(none.mcp_servers.is_empty());
+        assert!(none.plugin_dirs.is_empty());
+        assert!(none.lease_id.is_empty());
+        let off = computer_session_extensions(Some(false)).expect("explicit off is Ok");
+        assert!(off.mcp_servers.is_empty());
+        assert!(off.plugin_dirs.is_empty());
+        assert!(off.lease_id.is_empty());
     }
 
     #[test]
