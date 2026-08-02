@@ -31,6 +31,8 @@ export function TitleBar() {
   const bridgeKind = useDesktop((s) => s.bridgeKind);
   const toggleInspector = useDesktop((s) => s.toggleInspector);
   const inspectorOpen = useDesktop((s) => s.inspectorOpen);
+  const toggleTerminal = useDesktop((s) => s.toggleTerminal);
+  const terminalOpen = useDesktop((s) => s.terminalOpen);
   const setPaletteOpen = useDesktop((s) => s.setPaletteOpen);
   const setSettingsOpen = useDesktop((s) => s.setSettingsOpen);
   const appUpdate = useDesktop((s) => s.appUpdate);
@@ -148,6 +150,17 @@ export function TitleBar() {
           <Icon name="command" size={12} />
           <span>{isMac() ? "⌘K" : "Ctrl+K"}</span>
         </button>
+
+        {activeId && (
+          <button
+            className={`chip ${terminalOpen ? "!bg-high !text-fg" : ""}`}
+            onClick={toggleTerminal}
+            title={zh ? "终端输出" : "Terminal panel"}
+            aria-pressed={terminalOpen}
+          >
+            <Icon name="terminal" size={12} />
+          </button>
+        )}
 
         <button
           className={`chip ${inspectorOpen ? "!bg-high !text-fg" : ""}`}

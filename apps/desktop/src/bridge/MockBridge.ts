@@ -414,6 +414,7 @@ export class MockBridge implements GrokBridge {
     sessionId: string,
     blockId: string,
     option: PermissionOption,
+    _feedback?: string,
   ): { duplicate: boolean; message?: string } {
     const prior = this.resolvedPermissions.get(blockId);
     if (prior) {

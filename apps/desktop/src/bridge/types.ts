@@ -107,6 +107,8 @@ export interface PermissionRequest {
   description: string;
   payload?: string;
   options: PermissionOption[];
+  /** Distinguishes the plan review surface from ordinary tool approval. */
+  purpose?: "tool" | "plan";
 }
 
 export interface QuestionOption {

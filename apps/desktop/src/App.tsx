@@ -13,6 +13,8 @@ import { CommandPalette } from "./components/palette/CommandPalette";
 import { SettingsModal } from "./components/settings/SettingsModal";
 import { BlackHole } from "./components/fx/BlackHole";
 import { PreviewPane } from "./components/preview/PreviewPane";
+import { PlanPreviewPane } from "./components/preview/PlanPreviewPane";
+import { TerminalPanel } from "./components/terminal/TerminalPanel";
 import { ResizeHandle } from "./components/common/ResizeHandle";
 import { usePreferences } from "./state/preferences";
 import { useI18n } from "./lib/i18n";
@@ -64,6 +66,8 @@ export default function App() {
   const startupError = useDesktop((s) => s.startupError);
   const inspectorOpen = useDesktop((s) => s.inspectorOpen);
   const previewOpen = useDesktop((s) => s.previewOpen);
+  const planPreviewOpen = useDesktop((s) => s.planPreviewOpen);
+  const terminalOpen = useDesktop((s) => s.terminalOpen);
   const goHome = useDesktop((s) => s.goHome);
   const sidebarWidth = usePreferences((s) => s.sidebarWidth);
   const setSidebarWidth = usePreferences((s) => s.setSidebarWidth);
@@ -88,9 +92,13 @@ export default function App() {
       } else if (mod && e.key.toLowerCase() === "j") {
         e.preventDefault();
         s.toggleInspector();
+      } else if (mod && e.key === "`") {
+        e.preventDefault();
+        s.toggleTerminal();
       } else if (e.key === "Escape") {
         if (s.paletteOpen) s.setPaletteOpen(false);
         else if (s.settingsOpen) s.setSettingsOpen(false);
+        else if (s.terminalOpen) s.toggleTerminal();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -125,6 +133,7 @@ export default function App() {
             {inSession && session ? (
               <>
                 <Timeline session={session} />
+                {terminalOpen && <TerminalPanel />}
                 <Composer />
               </>
             ) : inSession && !session ? (
@@ -138,8 +147,9 @@ export default function App() {
             )}
           </SessionErrorBoundary>
         </main>
-        {inspectorOpen && inSession && session && <Inspector />}
+        {inspectorOpen && !planPreviewOpen && inSession && session && <Inspector />}
         {previewOpen && <PreviewPane />}
+        {planPreviewOpen && inSession && session && <PlanPreviewPane />}
       </div>
       <StatusBar />
       <CommandPalette />

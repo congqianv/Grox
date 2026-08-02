@@ -10,6 +10,7 @@ import { ToolCallCard } from "./ToolCallCard";
 import { PlanCard } from "./PlanCard";
 import { PermissionCard } from "./PermissionCard";
 import { QuestionCard } from "./QuestionCard";
+import { TurnChangeCard } from "./TurnChangeCard";
 
 interface Turn {
   id: string;
@@ -377,6 +378,8 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
       </div>
       {unresolved.map((block) => renderBlock(block, sessionId))}
       {answerBlock && <AssistantMsg block={answerBlock} />}
+      {/* Upstream: summarize file diffs for this turn + review/rewind */}
+      <TurnChangeCard blocks={turn.blocks} promptIndex={turn.promptIndex} />
     </section>
   );
 }

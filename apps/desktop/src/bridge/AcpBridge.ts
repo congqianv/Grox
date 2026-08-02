@@ -1990,6 +1990,7 @@ export class AcpBridge implements GrokBridge {
         description: string(tool.kind) ?? "Grok requests permission to continue.",
         payload: jsonText(tool.rawInput),
         options,
+        purpose: "tool",
       },
     });
   }
@@ -2021,6 +2022,7 @@ export class AcpBridge implements GrokBridge {
         description: "Grok has finished planning and is waiting to enter agent mode.",
         payload: string(params.planContent),
         options: ["allow_once", "deny"],
+        purpose: "plan",
       },
     });
   }
@@ -2803,6 +2805,7 @@ export class AcpBridge implements GrokBridge {
     sessionId: string,
     blockId: string,
     option: PermissionOption,
+    feedback?: string,
   ): { duplicate: boolean; message?: string } {
     const priorByBlock = this.resolvedPlanByBlock.get(blockId);
     if (priorByBlock) {
@@ -2844,7 +2847,10 @@ export class AcpBridge implements GrokBridge {
     if (pending.kind === "plan") {
       // Answer the original x.ai/exit_plan_mode request only — never invent a
       // synthetic "[Plan approved]" user prompt that would spawn a second turn.
-      result = { outcome: option === "deny" ? "cancelled" : "approved" };
+      result = {
+        outcome: option === "deny" ? "cancelled" : "approved",
+        ...(option === "deny" && feedback?.trim() ? { feedback: feedback.trim() } : {}),
+      };
     } else {
       const optionId = pending.optionIds[option];
       result = optionId

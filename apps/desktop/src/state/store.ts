@@ -408,6 +408,8 @@ interface DesktopState {
   queueNotice: QueueNotice | null;
 
   inspectorOpen: boolean;
+  /** Bottom terminal panel (aggregates shell tool output). */
+  terminalOpen: boolean;
   inspectorTab: InspectorTab;
   paletteOpen: boolean;
   settingsOpen: boolean;
@@ -475,6 +477,9 @@ interface DesktopState {
   setProjectPreviewUrl(url: string): void;
   openPreview(path: string): Promise<void>;
   closePreview(): void;
+  /** Right-side plan review pane (plan mode / exit_plan_mode approval). */
+  planPreviewOpen: boolean;
+  setPlanPreviewOpen(open: boolean): void;
 
   sendPrompt(text: string, attachments?: PromptAttachment[], sessionId?: string): void;
   /**
@@ -503,7 +508,7 @@ interface DesktopState {
    * When no official checkpoint exists (e.g. mid-turn stop), truncates UI only.
    */
   editUserPrompt(promptIndex: number): Promise<void>;
-  resolvePermission(blockId: string, option: PermissionOption): void;
+  resolvePermission(blockId: string, option: PermissionOption, feedback?: string): void;
   resolveQuestion(blockId: string, response: QuestionResponse): void;
 
   setModel(model: string): void;
@@ -514,6 +519,7 @@ interface DesktopState {
   setComposerAttachments(attachments: PromptAttachment[]): void;
   setInspectorTab(tab: InspectorTab): void;
   toggleInspector(): void;
+  toggleTerminal(): void;
   setPaletteOpen(open: boolean): void;
   setSettingsOpen(open: boolean): void;
   refreshHistory(): Promise<void>;
@@ -1028,6 +1034,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
       case "block_add":
         withSession(e.sessionId, (s) => ({ ...s, blocks: [...s.blocks, e.block] }));
+        if (e.block.type === "plan" && get().activeId === e.sessionId) {
+          set({ planPreviewOpen: true, previewOpen: false });
+        }
         break;
       case "block_patch":
         withSession(e.sessionId, (s) => ({
@@ -1071,6 +1080,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
             { type: "permission", id: e.blockId, req: e.req, ts: Date.now() },
           ],
         }));
+        if (
+          (e.req.purpose === "plan" || e.blockId.startsWith("plan-approval-")) &&
+          get().activeId === e.sessionId
+        ) {
+          set({ planPreviewOpen: true, previewOpen: false });
+        }
         break;
       case "permission_resolved":
         withSession(e.sessionId, (s) => ({
@@ -1226,6 +1241,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     previewFile: null,
     previewLoading: false,
     previewError: null,
+    planPreviewOpen: false,
 
     model: localStorage.getItem("grok.model") ?? "grok-build",
     models: MODELS,
@@ -1243,6 +1259,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     queueNotice: null,
 
     inspectorOpen: true,
+    terminalOpen: false,
     inspectorTab: "files",
     paletteOpen: false,
     settingsOpen: false,
@@ -1399,6 +1416,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       set({
         view: "home",
         activeId: null,
+        planPreviewOpen: false,
         fullHistoryLoadingId:
           get().historyLoadMode === "disk" ? null : get().fullHistoryLoadingId,
         historyLoadMode: get().historyLoadMode === "disk" ? null : get().historyLoadMode,
@@ -1674,6 +1692,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
                   projectPreview: { status: "idle" as const },
                   previewOpen: false,
                   previewFile: null,
+                  planPreviewOpen: false,
                 }
               : meta
                 ? { activeProjectId: projectId(meta.cwd) }
@@ -1923,6 +1942,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         projectPreview: { status: "idle" },
         previewOpen: false,
         previewFile: null,
+        planPreviewOpen: false,
       });
       void get().refreshWorkspaceFiles();
       void get().refreshWorkspaceDiffs();
@@ -2195,7 +2215,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async openPreview(path) {
-      set({ previewOpen: true, previewLoading: true, previewError: null });
+      set({
+        previewOpen: true,
+        planPreviewOpen: false,
+        previewLoading: true,
+        previewError: null,
+      });
       try {
         const previewFile = await invoke<PreviewFile>("read_preview_file", {
           cwd: get().workspace,
@@ -2845,7 +2870,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }, 50);
     },
 
-    resolvePermission(blockId, option) {
+    resolvePermission(blockId, option, feedback) {
       const { activeId, sessions } = get();
       if (!activeId) return;
       const session = sessions[activeId];
@@ -2861,7 +2886,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
         return;
       }
-      const result = bridge.respondPermission(activeId, blockId, option);
+      const result = bridge.respondPermission(activeId, blockId, option, feedback);
       if (result.duplicate) {
         set({
           queueNotice: {
@@ -2873,13 +2898,22 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
         return;
       }
-      if (blockId.startsWith("plan-approval-")) {
+      const isPlan =
+        block?.type === "permission" &&
+        (block.req.purpose === "plan" || blockId.startsWith("plan-approval-"));
+      // Close the plan pane on approve, or on deny without revision notes.
+      if (isPlan && (option !== "deny" || !feedback?.trim())) {
+        set({ planPreviewOpen: false });
+      }
+      if (blockId.startsWith("plan-approval-") || isPlan) {
         set({
           queueNotice: {
             id: uid(),
             message:
               option === "deny"
-                ? "计划已拒绝，原回合将继续规划"
+                ? feedback?.trim()
+                  ? "已发送计划修改要求，原回合将继续规划"
+                  : "计划已拒绝，原回合将继续规划"
                 : "计划已批准，原回合将继续执行（未额外发送消息）",
             state: "queued",
             at: Date.now(),
@@ -2948,6 +2982,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
     setInspectorTab: (inspectorTab) => set({ inspectorTab, inspectorOpen: true }),
     toggleInspector: () => set((s) => ({ inspectorOpen: !s.inspectorOpen })),
+    toggleTerminal: () => set((s) => ({ terminalOpen: !s.terminalOpen })),
+    setPlanPreviewOpen: (planPreviewOpen) =>
+      set({ planPreviewOpen, ...(planPreviewOpen ? { previewOpen: false } : {}) }),
     setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
     setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
     async refreshHistory() {

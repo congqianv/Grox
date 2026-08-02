@@ -160,6 +160,7 @@ export interface GrokBridge {
     sessionId: string,
     blockId: string,
     option: PermissionOption,
+    feedback?: string,
   ): { duplicate: boolean; message?: string };
 
   /** Resolve a structured x.ai/ask_user_question interaction. */
