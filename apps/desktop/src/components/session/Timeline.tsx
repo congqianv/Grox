@@ -618,47 +618,9 @@ export function Timeline({ session }: { session: Session }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: session open only
   }, [session.id]);
 
-  if (!hasBlocks) {
-    if (loadingFullHistory && historyLoadMode === "disk") {
-      const pct = scanProgress?.percent ?? 0;
-      return (
-        <div className="flex flex-1 flex-col items-center justify-center gap-4 px-8 pb-24">
-          <BlackHole size={40} spin />
-          <div className="w-full max-w-sm text-center">
-            <p className="text-[14px] text-mute">
-              {language === "zh-CN"
-                ? `正在从磁盘加载历史… ${pct}%`
-                : `Loading history from disk… ${pct}%`}
-            </p>
-            <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-line/60">
-              <div
-                className="h-full rounded-full bg-acc/80 transition-[width] duration-200 ease-out"
-                style={{ width: `${Math.min(100, Math.max(2, pct))}%` }}
-              />
-            </div>
-            {scanProgress && scanProgress.totalBytes > 0 && (
-              <p className="mt-2 text-[11px] text-faint">
-                {(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)} /{" "}
-                {(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB
-              </p>
-            )}
-          </div>
-        </div>
-      );
-    }
-    return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-4 pb-24">
-        <BlackHole size={40} spin="slow" />
-        <div className="text-center">
-          <p className="text-[15px] text-mute">{language === "zh-CN" ? "准备好了。" : "Ready when you are."}</p>
-          <p className="mt-1.5 text-[13px] text-faint">
-            {language === "zh-CN" ? "在下方输入你的第一个请求" : "Type your first message below"}
-          </p>
-        </div>
-      </div>
-    );
-  }
-
+  // agentBindLabel + virtuosoComponents MUST stay above any early return.
+  // Empty session (new mission) → hasBlocks false → early UI; first prompt adds
+  // blocks and would otherwise call one more useMemo → React #310 hooks mismatch.
   const agentBindLabel =
     language === "zh-CN"
       ? bindElapsedSec > 0
@@ -753,6 +715,47 @@ export function Timeline({ session }: { session: Session }) {
       markUserUnfollow,
     ],
   );
+
+  if (!hasBlocks) {
+    if (loadingFullHistory && historyLoadMode === "disk") {
+      const pct = scanProgress?.percent ?? 0;
+      return (
+        <div className="flex flex-1 flex-col items-center justify-center gap-4 px-8 pb-24">
+          <BlackHole size={40} spin />
+          <div className="w-full max-w-sm text-center">
+            <p className="text-[14px] text-mute">
+              {language === "zh-CN"
+                ? `正在从磁盘加载历史… ${pct}%`
+                : `Loading history from disk… ${pct}%`}
+            </p>
+            <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-line/60">
+              <div
+                className="h-full rounded-full bg-acc/80 transition-[width] duration-200 ease-out"
+                style={{ width: `${Math.min(100, Math.max(2, pct))}%` }}
+              />
+            </div>
+            {scanProgress && scanProgress.totalBytes > 0 && (
+              <p className="mt-2 text-[11px] text-faint">
+                {(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)} /{" "}
+                {(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB
+              </p>
+            )}
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center gap-4 pb-24">
+        <BlackHole size={40} spin="slow" />
+        <div className="text-center">
+          <p className="text-[15px] text-mute">{language === "zh-CN" ? "准备好了。" : "Ready when you are."}</p>
+          <p className="mt-1.5 text-[13px] text-faint">
+            {language === "zh-CN" ? "在下方输入你的第一个请求" : "Type your first message below"}
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="relative flex min-h-0 flex-1">
