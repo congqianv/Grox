@@ -98,6 +98,31 @@ fn rotate_http_auth(shared: &SharedHttpServer, lease_id: &str, token: &str) -> R
     Ok(())
 }
 
+/// Invalidate the process-wide MCP bearer. Listener stays up; prior tokens die.
+/// Call on session delete / emergency stop so local clients cannot keep driving
+/// the desktop after the operator ends Computer Use.
+pub fn revoke_http_auth() -> Result<(), String> {
+    let Some(shared) = HTTP_SERVER.get() else {
+        return Ok(());
+    };
+    let dead = uuid_token()?;
+    {
+        let mut auth = shared
+            .auth
+            .lock()
+            .map_err(|_| "Computer Use 认证状态锁定失败".to_string())?;
+        auth.token = dead;
+        auth.lease_id.clear();
+    }
+    if let Ok(mut state) = shared.state.lock() {
+        state.active_window = None;
+        state.paused = false;
+        state.stopped = true;
+        state.lease_id = None;
+    }
+    Ok(())
+}
+
 fn uuid_token() -> Result<String, String> {
     let mut bytes = [0_u8; 32];
     // Fail closed: never ship an all-zero bearer if the CSPRNG is unavailable.
@@ -125,10 +150,10 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<ComputerState>>) {
         line.to_ascii_lowercase().starts_with("authorization: bearer ")
             && line.trim()["authorization: bearer ".len()..].trim() == token
     });
-    let (status, response) = if !authorized {
-        (401, Some(json!({"error":"Unauthorized"})))
+    let (status, reason, response) = if !authorized {
+        (401, "Unauthorized", Some(json!({"error":"Unauthorized"})))
     } else if !headers.starts_with("POST ") {
-        (405, Some(json!({"error":"Method Not Allowed"})))
+        (405, "Method Not Allowed", Some(json!({"error":"Method Not Allowed"})))
     } else {
         match serde_json::from_str::<Value>(body.trim()) {
             Ok(request) => {
@@ -160,16 +185,20 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<ComputerState>>) {
                     _ => Err(format!("不支持的 MCP 方法：{method}")),
                 };
                 match result {
-                    Ok(result) => (200, Some(json!({"jsonrpc":"2.0","id":id,"result":result}))),
-                    Err(message) => (200, Some(json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":classified_error(&message)}],"isError":true}}))),
+                    Ok(result) => (200, "OK", Some(json!({"jsonrpc":"2.0","id":id,"result":result}))),
+                    Err(message) => (
+                        200,
+                        "OK",
+                        Some(json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":classified_error(&message)}],"isError":true}})),
+                    ),
                 }
             }
-            Err(error) => (400, Some(json!({"error": error.to_string()}))),
+            Err(error) => (400, "Bad Request", Some(json!({"error": error.to_string()}))),
         }
     };
     let payload = response.map(|value| value.to_string()).unwrap_or_default();
     let reply = format!(
-        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nMcp-Session-Id: {session_id}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nMcp-Session-Id: {session_id}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
     );
     let _ = stream.write_all(reply.as_bytes());
@@ -519,13 +548,7 @@ fn call_tool_inner(name: &str, args: &Value, state: &mut ComputerState) -> Resul
         "press_key" => {
             check_state(args, state)?;
             let hwnd = state.active_window.ok_or("尚未选择窗口")?;
-            let keys = args
-                .get("keys")
-                .and_then(Value::as_array)
-                .ok_or("keys 必须是数组")?
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>();
+            let keys = parse_key_chord(args)?;
             platform::key(hwnd, &keys)?;
             observe(state)
         }
@@ -536,12 +559,8 @@ fn call_tool_inner(name: &str, args: &Value, state: &mut ComputerState) -> Resul
                 let (x, y) = platform::target_point(hwnd, Some(element_id), None, None)?;
                 platform::click(hwnd, x, y, "left", 1)?;
             }
-            platform::type_text(
-                hwnd,
-                args.get("text")
-                    .and_then(Value::as_str)
-                    .ok_or("缺少 text")?,
-            )?;
+            let text = clamp_type_text(args)?;
+            platform::type_text(hwnd, text)?;
             observe(state)
         }
         "set_value" => {
@@ -663,25 +682,15 @@ fn call_tool_inner(name: &str, args: &Value, state: &mut ComputerState) -> Resul
         "computer_key" => {
             check_state(args, state)?;
             let hwnd = state.active_window.ok_or("尚未选择窗口")?;
-            let keys = args
-                .get("keys")
-                .and_then(Value::as_array)
-                .ok_or("keys 必须是数组")?
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>();
+            let keys = parse_key_chord(args)?;
             platform::key(hwnd, &keys)?;
             observe(state)
         }
         "computer_type" => {
             check_state(args, state)?;
             let hwnd = state.active_window.ok_or("尚未选择窗口")?;
-            platform::type_text(
-                hwnd,
-                args.get("text")
-                    .and_then(Value::as_str)
-                    .ok_or("缺少 text")?,
-            )?;
+            let text = clamp_type_text(args)?;
+            platform::type_text(hwnd, text)?;
             observe(state)
         }
         "computer_wait" => {
@@ -696,6 +705,73 @@ fn call_tool_inner(name: &str, args: &Value, state: &mut ComputerState) -> Resul
         }
         _ => Err(format!("未知工具：{name}")),
     }
+}
+
+/// Enforce schema maxLength on type_text / computer_type (defense in depth).
+fn clamp_type_text(args: &Value) -> Result<&str, String> {
+    const MAX_TYPE_CHARS: usize = 20_000;
+    let text = args
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or("缺少 text")?;
+    if text.chars().count() > MAX_TYPE_CHARS {
+        return Err(format!("text 超过 {MAX_TYPE_CHARS} 字符上限"));
+    }
+    Ok(text)
+}
+
+/// Parse key chords with hard limits and focus-stealing denylist.
+fn parse_key_chord(args: &Value) -> Result<Vec<&str>, String> {
+    const MAX_KEYS: usize = 8;
+    let keys = args
+        .get("keys")
+        .and_then(Value::as_array)
+        .ok_or("keys 必须是数组")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Err("keys 不能为空".into());
+    }
+    if keys.len() > MAX_KEYS {
+        return Err(format!("keys 最多 {MAX_KEYS} 个"));
+    }
+    deny_focus_stealing_chord(&keys)?;
+    Ok(keys)
+}
+
+/// Block global focus / shell chords (SendInput is process-global).
+fn deny_focus_stealing_chord(keys: &[&str]) -> Result<(), String> {
+    let upper: Vec<String> = keys
+        .iter()
+        .map(|k| k.trim().to_ascii_uppercase())
+        .collect();
+    let has = |name: &str| upper.iter().any(|k| k == name);
+    // WIN/META already rejected in vk(); also catch multi-key OS shortcuts.
+    if has("WIN") || has("META") || has("LWIN") || has("RWIN") || has("SUPER") {
+        return Err("出于安全原因，Computer Use 禁止 WIN/META 系统键".into());
+    }
+    if has("ALT") && has("TAB") {
+        return Err("出于安全原因，禁止 ALT+TAB（会离开目标窗口）".into());
+    }
+    if has("ALT") && has("ESC") {
+        return Err("出于安全原因，禁止 ALT+ESC".into());
+    }
+    if has("CTRL") && has("ESC") {
+        return Err("出于安全原因，禁止 CTRL+ESC（开始菜单）".into());
+    }
+    if has("CONTROL") && has("ESC") {
+        return Err("出于安全原因，禁止 CTRL+ESC（开始菜单）".into());
+    }
+    if has("ALT") && (has("F4") || has("F4")) {
+        return Err("出于安全原因，禁止 ALT+F4（关闭窗口）".into());
+    }
+    // CTRL+ALT+DEL cannot be synthesized by SendInput on modern Windows, but
+    // reject the combination if ever expressed as three keys.
+    if (has("CTRL") || has("CONTROL")) && has("ALT") && (has("DEL") || has("DELETE")) {
+        return Err("出于安全原因，禁止 CTRL+ALT+DEL".into());
+    }
+    Ok(())
 }
 
 fn list_apps() -> Result<Vec<Value>, String> {
@@ -1242,7 +1318,7 @@ mod platform {
     }
 
     pub fn set_value(hwnd: i64, element_id: &str, value: &str) -> Result<(), String> {
-        ensure_target_foreground(hwnd)?;
+        ensure_target_controllable(hwnd)?;
         let element = find_element(element_id)?;
         let pattern = element
             .get_pattern::<UIValuePattern>()
@@ -1355,7 +1431,7 @@ mod platform {
     }
 
     pub fn move_mouse(hwnd: i64, x: i32, y: i32) -> Result<(), String> {
-        ensure_target_foreground(hwnd)?;
+        ensure_target_controllable(hwnd)?;
         let (screen_x, screen_y) = to_screen_point(hwnd, x, y)?;
         unsafe { SetCursorPos(screen_x, screen_y).map_err(|error| error.to_string()) }
     }
@@ -1414,7 +1490,7 @@ mod platform {
                     .get_pattern::<UIScrollItemPattern>()
                     .map_err(|error| error.to_string())
             }) {
-                ensure_target_foreground(hwnd)?;
+                ensure_target_controllable(hwnd)?;
                 return pattern
                     .scroll_into_view()
                     .map_err(|error| error.to_string());
@@ -1446,7 +1522,8 @@ mod platform {
     }
 
     pub fn key(hwnd: i64, keys: &[&str]) -> Result<(), String> {
-        ensure_target_foreground(hwnd)?;
+        ensure_target_controllable(hwnd)?;
+        // Focus-stealing chords are denied in parse_key_chord before this runs.
         let mut virtual_keys = Vec::new();
         for name in keys {
             let (key, modifiers) = vk(name)?;
@@ -1470,11 +1547,13 @@ mod platform {
         for key in virtual_keys.iter().rev() {
             inputs.push(key_input(*key, true));
         }
-        send(&inputs)
+        send(&inputs)?;
+        // Re-verify after SendInput — focus-stealing chords may have slipped through.
+        ensure_target_controllable(hwnd)
     }
 
     pub fn type_text(hwnd: i64, text: &str) -> Result<(), String> {
-        ensure_target_foreground(hwnd)?;
+        ensure_target_controllable(hwnd)?;
         let mut inputs = Vec::new();
         for unit in text.encode_utf16() {
             inputs.push(unicode_input(unit, false));
@@ -1483,7 +1562,7 @@ mod platform {
         for chunk in inputs.chunks(512) {
             send(chunk)?;
         }
-        Ok(())
+        ensure_target_controllable(hwnd)
     }
 
     fn key_input(key: VIRTUAL_KEY, up: bool) -> INPUT {
@@ -1564,6 +1643,32 @@ mod platform {
                 "目标窗口已不在前台；为避免控制错误应用，请重新调用 activate_window 或 get_window_state"
                     .into(),
             );
+        }
+        Ok(())
+    }
+
+    /// Foreground HWND match + live elevation/blocklist (same gates as activate).
+    fn ensure_target_controllable(hwnd: i64) -> Result<(), String> {
+        ensure_target_foreground(hwnd)?;
+        let handle = HWND(hwnd as *mut _);
+        let mut buffer = [0u16; 512];
+        let len = unsafe { GetWindowTextW(handle, &mut buffer) };
+        let info = window_info(
+            handle,
+            String::from_utf16_lossy(&buffer[..len as usize])
+                .trim()
+                .to_string(),
+        );
+        if info.get("controllable").and_then(Value::as_bool) != Some(true) {
+            let code = info
+                .get("blockedCode")
+                .and_then(Value::as_str)
+                .unwrap_or("blocklist");
+            return Err(if code == "elevated" {
+                "elevation-blocked: 目标以管理员权限运行，无法控制".into()
+            } else {
+                "blocklist: 该应用位于 Computer Use 不可控制清单".into()
+            });
         }
         Ok(())
     }
@@ -1772,5 +1877,24 @@ mod tests {
         );
         assert!(first.url.starts_with("http://127.0.0.1:"));
         assert!(first.url.ends_with("/mcp"));
+    }
+
+    #[test]
+    fn revoke_http_auth_invalidates_bearer() {
+        let lease = format!("{:032x}", 0xccccu128);
+        let live = serve_http(lease).expect("start");
+        revoke_http_auth().expect("revoke");
+        let auth = current_http_auth().expect("auth still present after revoke");
+        assert_ne!(auth.0, live.token, "token must rotate to a dead value");
+        assert!(auth.1.is_empty(), "lease cleared on revoke");
+    }
+
+    #[test]
+    fn focus_stealing_chords_are_denied() {
+        assert!(deny_focus_stealing_chord(&["ALT", "TAB"]).is_err());
+        assert!(deny_focus_stealing_chord(&["CTRL", "ESC"]).is_err());
+        assert!(deny_focus_stealing_chord(&["WIN"]).is_err());
+        assert!(deny_focus_stealing_chord(&["CTRL", "C"]).is_ok());
+        assert!(deny_focus_stealing_chord(&["ENTER"]).is_ok());
     }
 }

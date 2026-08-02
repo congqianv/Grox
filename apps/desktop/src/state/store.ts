@@ -2110,7 +2110,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await bridge.configureProvider(config);
         await get().refreshProviderProfiles();
         await Promise.all([get().refreshAccount(), get().refreshModels()]);
-        if (activeId) await bridge.loadSession(activeId);
+        if (activeId) {
+          await bridge.loadSession(activeId, { background: true, silent: true });
+        }
         set({ providerSwitching: false, startupError: null });
       } catch (error) {
         if (!wasComplete) localStorage.removeItem("grox.accountSetupComplete");
@@ -2147,7 +2149,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await bridge.activateProviderProfile(profile.id);
         await get().refreshProviderProfiles();
         await Promise.all([get().refreshAccount(), get().refreshModels()]);
-        if (activeId) await bridge.loadSession(activeId);
+        if (activeId) {
+          await bridge.loadSession(activeId, { background: true, silent: true });
+        }
         set({ providerSwitching: false, startupError: null });
       } catch (error) {
         set({
@@ -2174,7 +2178,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await bridge.activateProviderProfile(id);
         await get().refreshProviderProfiles();
         await Promise.all([get().refreshAccount(), get().refreshModels()]);
-        if (activeId) await bridge.loadSession(activeId);
+        if (activeId) {
+          await bridge.loadSession(activeId, { background: true, silent: true });
+        }
         set({ providerSwitching: false, startupError: null });
       } catch (error) {
         set({ providerSwitching: false });
@@ -2205,7 +2211,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (wasActive) {
         try {
           await Promise.all([get().refreshAccount(), get().refreshModels()]);
-          if (activeId) await bridge.loadSession(activeId);
+          if (activeId) {
+            await bridge.loadSession(activeId, { background: true, silent: true });
+          }
         } catch (error) {
           set({
             startupError:
@@ -2310,7 +2318,40 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     setProjectPreviewUrl(url) {
-      set({ projectPreview: { ...get().projectPreview, status: "ready", url } });
+      // Project preview iframe only loads loopback — blocks arbitrary https phishing.
+      try {
+        const parsed = new URL(url);
+        if (!/^https?:$/.test(parsed.protocol)) {
+          throw new Error("preview protocol");
+        }
+        const host = parsed.hostname.toLowerCase();
+        const loopback =
+          host === "localhost" ||
+          host === "127.0.0.1" ||
+          host === "[::1]" ||
+          host === "::1";
+        if (!loopback) {
+          set({
+            projectPreview: {
+              ...get().projectPreview,
+              status: "error",
+              error: "项目预览仅允许 localhost / 127.0.0.1",
+              url: undefined,
+            },
+          });
+          return;
+        }
+        set({ projectPreview: { ...get().projectPreview, status: "ready", url: parsed.toString() } });
+      } catch {
+        set({
+          projectPreview: {
+            ...get().projectPreview,
+            status: "error",
+            error: "无效的预览地址",
+            url: undefined,
+          },
+        });
+      }
     },
 
     async openPreview(path) {
@@ -2892,7 +2933,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (!result.success) {
         throw new Error(result.error || `回退存在 ${result.conflicts.length} 个文件冲突`);
       }
-      await bridge.loadSession(activeId);
+      await bridge.loadSession(activeId, { background: true, silent: true });
       if (mode !== "files_only") get().setDraft(result.prompt_text ?? point.prompt_preview ?? "");
       return result;
     },

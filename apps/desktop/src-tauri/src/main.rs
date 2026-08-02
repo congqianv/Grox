@@ -851,12 +851,47 @@ fn apply_grox_provider_environment(command: &mut Command) {
     }
 }
 
+/// Denylist of host-sensitive env keys that must never be taken from ~/.grok/.env
+/// into CLI children (PATH hijack / proxy / TLS keylog class).
+fn is_denied_cli_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "PATH"
+            | "PATHEXT"
+            | "COMSPEC"
+            | "COMPSPEC"
+            | "SYSTEMROOT"
+            | "WINDIR"
+            | "TEMP"
+            | "TMP"
+            | "SSLKEYLOGFILE"
+            | "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "ALL_PROXY"
+            | "NO_PROXY"
+            | "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+            | "DYLD_INSERT_LIBRARIES"
+            | "DYLD_LIBRARY_PATH"
+            | "NODE_OPTIONS"
+            | "PYTHONPATH"
+            | "PYTHONHOME"
+    ) || upper.starts_with("LD_")
+        || upper.starts_with("DYLD_")
+        || upper.starts_with("PYTHON")
+        || upper.starts_with("NODE_")
+}
+
 /// Same provider resolution used by `acp_spawn`: full ~/.grok/.env, then the
 /// active provider profile (authoritative), then privacy env. Media generation
 /// must match the agent so Settings profiles work for image/video studio.
 fn apply_cli_provider_environment(command: &mut Command) {
     if let Ok(home) = grok_home() {
         for (key, value) in parse_env_file(&home.join(".env")) {
+            if is_denied_cli_env_key(&key) {
+                continue;
+            }
             command.env(key, value);
         }
     }
@@ -3723,12 +3758,20 @@ fn computer_session_extensions() -> Result<ComputerSessionExtensions, String> {
 
 #[tauri::command]
 fn computer_emergency_stop(lease_id: String) -> Result<(), String> {
-    computer_mcp::mark_emergency_stop(&lease_id)
+    // Sticky stop + kill the process-wide bearer so local MCP clients cannot continue.
+    computer_mcp::mark_emergency_stop(&lease_id)?;
+    computer_mcp::revoke_http_auth()
 }
 
 #[tauri::command]
 fn computer_clear_emergency_stop(lease_id: String) -> Result<(), String> {
     computer_mcp::clear_emergency_stop(&lease_id)
+}
+
+/// Invalidate Computer Use MCP bearer (session delete / unmount).
+#[tauri::command]
+fn computer_revoke_http_auth() -> Result<(), String> {
+    computer_mcp::revoke_http_auth()
 }
 
 #[cfg(windows)]
@@ -3815,6 +3858,9 @@ async fn generate_media(
     let prompt = checked_media_prompt(&request, &cwd)?;
     let runtime = configured_grok_command(&app);
     let mut command = Command::new(&runtime.path);
+    // Headless media child: only the four media tools are enabled. `--always-approve`
+    // is scoped by that tool allowlist (not full agent yolo). Permission mode is
+    // intentionally media-only; chat permissionMode does not apply to this child.
     command
         .arg("--single")
         .arg(&prompt)
@@ -6320,6 +6366,7 @@ fn main() {
             computer_session_extensions,
             computer_emergency_stop,
             computer_clear_emergency_stop,
+            computer_revoke_http_auth,
             save_media_reference,
             generate_media,
             reveal_in_explorer,

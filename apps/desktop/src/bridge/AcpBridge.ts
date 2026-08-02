@@ -3042,8 +3042,10 @@ export class AcpBridge implements GrokBridge {
     const meta = this.catalogue.get(id);
     this.cancel(id);
     const computerLease = this.computerLeases.get(id);
+    // Revoke MCP bearer so leftover localhost clients cannot keep controlling.
+    // Do NOT clear emergency-stop marker alone (that re-armed tools under a live token).
     if (computerLease) {
-      await invoke("computer_clear_emergency_stop", { leaseId: computerLease }).catch(() => {});
+      await invoke("computer_revoke_http_auth").catch(() => {});
     }
     await this.request(ACP_METHODS.sessionDelete, {
       sessionId: id,
