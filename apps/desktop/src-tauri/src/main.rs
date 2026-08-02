@@ -4111,6 +4111,36 @@ fn trunc_str(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// FNV-1a 64-bit — content-stable offline block ids across re-scans (not crypto).
+fn offline_fnv1a64(data: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h = FNV_OFFSET;
+    for b in data {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// Content-stable offline block id (`off-{kind}-{fnv}`).
+/// Hash mixes kind + body so user/asst/plan never collide on the same text.
+/// `seen` tracks per-hash occurrence within one scan (suffix `-2` for duplicates).
+fn offline_id_for(kind: &str, body: &str, seen: &mut std::collections::HashMap<u64, u32>) -> String {
+    let mut data = Vec::with_capacity(kind.len() + 1 + body.len());
+    data.extend_from_slice(kind.as_bytes());
+    data.push(0);
+    data.extend_from_slice(body.as_bytes());
+    let h = offline_fnv1a64(&data);
+    let n = seen.entry(h).or_insert(0);
+    *n = n.saturating_add(1);
+    if *n <= 1 {
+        format!("off-{kind}-{h:016x}")
+    } else {
+        format!("off-{kind}-{h:016x}-{n}")
+    }
+}
+
 fn extract_user_visible_text(raw: &str) -> String {
     if let Some(start) = raw.find("<user_query>") {
         if let Some(end) = raw.find("</user_query>") {
@@ -4688,9 +4718,11 @@ fn start_offline_session_history(
             let mut reader = StdBufReader::with_capacity(1024 * 256, file);
             let mut line_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
             let mut blocks: Vec<serde_json::Value> = Vec::new();
-            let mut user_open: Option<(String, String)> = None; // id, text
-            let mut asst_open: Option<(String, String)> = None;
-            let mut block_i = 0usize;
+            // Open chunks hold text only; ids are content-hashed at flush (stable re-scan).
+            let mut user_open: Option<String> = None;
+            let mut asst_open: Option<String> = None;
+            let mut offline_id_seen: std::collections::HashMap<u64, u32> =
+                std::collections::HashMap::new();
             let mut line_i = 0usize;
             let mut last_progress_lines = 0usize;
             let mut last_progress_bytes = 0u64;
@@ -4704,11 +4736,13 @@ fn start_offline_session_history(
             scan_progress_reset(total_bytes);
 
             let flush_user = |blocks: &mut Vec<serde_json::Value>,
-                             user_open: &mut Option<(String, String)>,
+                             user_open: &mut Option<String>,
+                             seen: &mut std::collections::HashMap<u64, u32>,
                              updated_at: u64| {
-                if let Some((id, text)) = user_open.take() {
+                if let Some(text) = user_open.take() {
                     let text = extract_user_visible_text(&text);
                     if !text.is_empty() {
+                        let id = offline_id_for("user", &text, seen);
                         blocks.push(serde_json::json!({
                             "type": "user",
                             "id": id,
@@ -4719,10 +4753,12 @@ fn start_offline_session_history(
                 }
             };
             let flush_asst = |blocks: &mut Vec<serde_json::Value>,
-                              asst_open: &mut Option<(String, String)>,
+                              asst_open: &mut Option<String>,
+                              seen: &mut std::collections::HashMap<u64, u32>,
                               updated_at: u64| {
-                if let Some((id, text)) = asst_open.take() {
+                if let Some(text) = asst_open.take() {
                     if !text.trim().is_empty() {
+                        let id = offline_id_for("asst", &text, seen);
                         blocks.push(serde_json::json!({
                             "type": "assistant",
                             "id": id,
@@ -4834,25 +4870,34 @@ fn start_offline_session_history(
                 match kind {
                     "agent_thought_chunk" => {}
                     "user_message_chunk" => {
-                        flush_asst(&mut blocks, &mut asst_open, updated_at);
+                        flush_asst(
+                            &mut blocks,
+                            &mut asst_open,
+                            &mut offline_id_seen,
+                            updated_at,
+                        );
                         let delta = json_text_content(
                             update.get("content").unwrap_or(&serde_json::Value::Null),
                         );
-                        if let Some((_, ref mut text)) = user_open {
+                        if let Some(ref mut text) = user_open {
                             text.push_str(&delta);
                         } else {
-                            block_i += 1;
-                            user_open = Some((format!("off-user-{block_i}"), delta));
+                            user_open = Some(delta);
                         }
                     }
                     "agent_message_chunk" => {
-                        flush_user(&mut blocks, &mut user_open, updated_at);
+                        flush_user(
+                            &mut blocks,
+                            &mut user_open,
+                            &mut offline_id_seen,
+                            updated_at,
+                        );
                         let delta = json_text_content(
                             update.get("content").unwrap_or(&serde_json::Value::Null),
                         );
                         // Cap offline assistant body — unbounded append freezes pack/emit.
                         const ASST_CAP: usize = 48 * 1024;
-                        if let Some((_, ref mut text)) = asst_open {
+                        if let Some(ref mut text) = asst_open {
                             if text.len() < ASST_CAP {
                                 let room = ASST_CAP - text.len();
                                 if delta.len() <= room {
@@ -4862,14 +4907,22 @@ fn start_offline_session_history(
                                 }
                             }
                         } else {
-                            block_i += 1;
-                            asst_open =
-                                Some((format!("off-asst-{block_i}"), trunc_str(&delta, ASST_CAP)));
+                            asst_open = Some(trunc_str(&delta, ASST_CAP));
                         }
                     }
                     "tool_call" => {
-                        flush_user(&mut blocks, &mut user_open, updated_at);
-                        flush_asst(&mut blocks, &mut asst_open, updated_at);
+                        flush_user(
+                            &mut blocks,
+                            &mut user_open,
+                            &mut offline_id_seen,
+                            updated_at,
+                        );
+                        flush_asst(
+                            &mut blocks,
+                            &mut asst_open,
+                            &mut offline_id_seen,
+                            updated_at,
+                        );
                         let tool_id = update
                             .get("toolCallId")
                             .and_then(|v| v.as_str())
@@ -4892,12 +4945,6 @@ fn start_offline_session_history(
                             | "read" | "search" | "fetch" | "list" | "other" => kind_s,
                             _ => "other",
                         };
-                        let block_id = if tool_id.is_empty() {
-                            block_i += 1;
-                            format!("off-tool-{block_i}")
-                        } else {
-                            format!("off-tool-{tool_id}")
-                        };
                         let input = update
                             .get("rawInput")
                             .or_else(|| update.pointer("/_meta/x.ai/tool/rawInput"))
@@ -4909,6 +4956,16 @@ fn start_offline_session_history(
                                 };
                                 trunc_str(&s, 4000)
                             });
+                        // Prefer ACP toolCallId; fall back to content hash of title+input.
+                        let block_id = if !tool_id.is_empty() && tool_id != "tool" {
+                            format!("off-tool-{tool_id}")
+                        } else {
+                            let body = format!(
+                                "{title}\n{}",
+                                input.as_deref().unwrap_or("")
+                            );
+                            offline_id_for("tool", &body, &mut offline_id_seen)
+                        };
                         let mut call = serde_json::json!({
                             "id": tool_id,
                             "kind": kind_norm,
@@ -4965,8 +5022,18 @@ fn start_offline_session_history(
                         }
                     }
                     "plan" => {
-                        flush_user(&mut blocks, &mut user_open, updated_at);
-                        flush_asst(&mut blocks, &mut asst_open, updated_at);
+                        flush_user(
+                            &mut blocks,
+                            &mut user_open,
+                            &mut offline_id_seen,
+                            updated_at,
+                        );
+                        flush_asst(
+                            &mut blocks,
+                            &mut asst_open,
+                            &mut offline_id_seen,
+                            updated_at,
+                        );
                         let entries = update
                             .get("entries")
                             .or_else(|| update.get("steps"))
@@ -5012,10 +5079,17 @@ fn start_offline_session_history(
                                     obj.insert("steps".into(), serde_json::Value::Array(steps));
                                 }
                             } else {
-                                block_i += 1;
+                                // Content-stable plan id from step bodies (not scan order).
+                                let plan_body: String = steps
+                                    .iter()
+                                    .filter_map(|s| s.get("content").and_then(|c| c.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let plan_id =
+                                    offline_id_for("plan", &plan_body, &mut offline_id_seen);
                                 blocks.push(serde_json::json!({
                                     "type": "plan",
-                                    "id": format!("off-plan-{block_i}"),
+                                    "id": plan_id,
                                     "ts": updated_at,
                                     "steps": steps,
                                 }));
@@ -5023,8 +5097,18 @@ fn start_offline_session_history(
                         }
                     }
                     "turn_completed" => {
-                        flush_user(&mut blocks, &mut user_open, updated_at);
-                        flush_asst(&mut blocks, &mut asst_open, updated_at);
+                        flush_user(
+                            &mut blocks,
+                            &mut user_open,
+                            &mut offline_id_seen,
+                            updated_at,
+                        );
+                        flush_asst(
+                            &mut blocks,
+                            &mut asst_open,
+                            &mut offline_id_seen,
+                            updated_at,
+                        );
                     }
                     _ => {}
                 }
@@ -5037,8 +5121,18 @@ fn start_offline_session_history(
                 clear_active();
                 return;
             }
-            flush_user(&mut blocks, &mut user_open, updated_at);
-            flush_asst(&mut blocks, &mut asst_open, updated_at);
+            flush_user(
+                &mut blocks,
+                &mut user_open,
+                &mut offline_id_seen,
+                updated_at,
+            );
+            flush_asst(
+                &mut blocks,
+                &mut asst_open,
+                &mut offline_id_seen,
+                updated_at,
+            );
             for block in blocks.iter_mut() {
                 if block.get("type").and_then(|t| t.as_str()) != Some("tool") {
                     continue;
@@ -6282,6 +6376,28 @@ api_key = "local-key"
         assert_eq!(values.get("GROK_TELEMETRY_TRACE_UPLOAD"), Some(&"0"));
         assert_eq!(values.get("GROK_EXTERNAL_OTEL"), Some(&"0"));
         assert_eq!(values.get("OTEL_LOGS_EXPORTER"), Some(&"none"));
+    }
+
+    #[test]
+    fn offline_block_ids_are_content_stable_and_kind_scoped() {
+        let mut seen = std::collections::HashMap::new();
+        let a = offline_id_for("user", "hello world", &mut seen);
+        let b = offline_id_for("user", "hello world", &mut seen);
+        let c = offline_id_for("asst", "hello world", &mut seen);
+        let d = offline_id_for("plan", "step one\nstep two", &mut seen);
+        assert!(a.starts_with("off-user-"), "{a}");
+        assert_eq!(a, "off-user-".to_string() + &a["off-user-".len()..]);
+        // Same body again → occurrence suffix.
+        assert_ne!(a, b);
+        assert!(b.ends_with("-2"), "{b}");
+        // Same body, different kind → distinct id (not treated as occurrence 3).
+        assert!(c.starts_with("off-asst-"), "{c}");
+        assert!(!c.ends_with("-2") && !c.ends_with("-3"), "{c}");
+        assert!(d.starts_with("off-plan-"), "{d}");
+        // Fresh map → same content yields same first id (re-scan stability).
+        let mut seen2 = std::collections::HashMap::new();
+        assert_eq!(offline_id_for("user", "hello world", &mut seen2), a);
+        assert_eq!(offline_id_for("plan", "step one\nstep two", &mut seen2), d);
     }
 
     #[test]

@@ -374,6 +374,11 @@ interface DesktopState {
   fullHistoryLoadingId: string | null;
   /** Why fullHistoryLoadingId is set: offline disk scan vs agent session/load. */
   historyLoadMode: HistoryLoadMode;
+  /**
+   * Wall-clock ms when silent agent bind started (historyLoadMode === "agent").
+   * Used by Timeline for elapsed "binding…" copy. Null when not agent-binding.
+   */
+  agentBindStartedAt: number | null;
   /** Real-time offline disk scan progress (null when idle). */
   diskHistoryProgress: DiskHistoryScanProgress | null;
   account: AccountInfo | null;
@@ -1014,7 +1019,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
             permissionMode: composer.permissionMode,
             sessionComposers,
             ...(clearAgentBanner
-              ? { fullHistoryLoadingId: null, historyLoadMode: null }
+              ? {
+                  fullHistoryLoadingId: null,
+                  historyLoadMode: null,
+                  agentBindStartedAt: null,
+                }
               : {}),
           });
         } else {
@@ -1023,7 +1032,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
             sessionIndex: nextIndex,
             sessionComposers,
             ...(clearAgentBanner
-              ? { fullHistoryLoadingId: null, historyLoadMode: null }
+              ? {
+                  fullHistoryLoadingId: null,
+                  historyLoadMode: null,
+                  agentBindStartedAt: null,
+                }
               : {}),
           });
         }
@@ -1221,6 +1234,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     activeId: null,
     fullHistoryLoadingId: null,
     historyLoadMode: null,
+    agentBindStartedAt: null,
     diskHistoryProgress: null,
     account: null,
     billing: null,
@@ -2451,6 +2465,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             set({
               fullHistoryLoadingId: session.id,
               historyLoadMode: "agent",
+              agentBindStartedAt: Date.now(),
               queueNotice: {
                 id: uid(),
                 message:
@@ -2465,6 +2480,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             set({
               fullHistoryLoadingId: null,
               historyLoadMode: null,
+              agentBindStartedAt: null,
               queueNotice: null,
             });
           }
@@ -2480,6 +2496,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           set({
             fullHistoryLoadingId: null,
             historyLoadMode: null,
+            agentBindStartedAt: null,
             queueNotice: {
               id: uid(),
               message: error instanceof Error ? error.message : String(error),
