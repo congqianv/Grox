@@ -8,8 +8,8 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
-    io::Write as _,
+    fs::{self, File},
+    io::{BufRead, BufReader as StdBufReader, Write as _},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -2169,6 +2169,752 @@ fn write_hidden_projects(ids: Vec<String>) -> Result<(), String> {
     atomic_write(&path, &body)
 }
 
+/// Local UI transcript cache — avoids waiting on full ACP `session/load` when
+/// switching missions. Stored under the app config dir (not the agent session tree).
+const SESSION_CACHE_MAX_BYTES: u64 = 12 * 1024 * 1024;
+
+fn session_cache_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("session-cache"))
+        .map_err(|error| format!("无法定位会话缓存目录：{error}"))
+}
+
+fn session_cache_path(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, String> {
+    let safe: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(80)
+        .collect();
+    if safe.is_empty() {
+        return Err("无效的会话 ID".into());
+    }
+    Ok(session_cache_dir(app)?.join(format!("{safe}.json")))
+}
+
+#[tauri::command]
+fn read_session_cache(app: tauri::AppHandle, id: String) -> Result<Option<String>, String> {
+    let path = session_cache_path(&app, &id)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    match read_bounded_text(&path, SESSION_CACHE_MAX_BYTES) {
+        Ok(content) if !content.trim().is_empty() => Ok(Some(content)),
+        Ok(_) => Ok(None),
+        Err(_) => Ok(None),
+    }
+}
+
+#[tauri::command]
+fn write_session_cache(app: tauri::AppHandle, id: String, content: String) -> Result<(), String> {
+    if content.len() as u64 > SESSION_CACHE_MAX_BYTES {
+        return Err(format!(
+            "会话缓存过大（{} bytes），已跳过写入",
+            content.len()
+        ));
+    }
+    let path = session_cache_path(&app, &id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建会话缓存目录：{error}"))?;
+    }
+    atomic_write(&path, &content)
+}
+
+/// Locate `~/.grok/sessions/**/<id>/` without relying on cwd encoding details.
+fn find_grok_session_dir(id: &str) -> Option<PathBuf> {
+    let root = grok_home().ok()?.join("sessions");
+    if !root.is_dir() {
+        return None;
+    }
+    let Ok(level1) = fs::read_dir(&root) else {
+        return None;
+    };
+    for entry in level1.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if entry.file_name() == id {
+            return Some(path);
+        }
+        if let Ok(level2) = fs::read_dir(&path) {
+            for child in level2.flatten() {
+                if child.file_name() == id && child.path().is_dir() {
+                    return Some(child.path());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn json_text_content(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => {
+            let mut out = String::new();
+            for item in items {
+                if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(t);
+                } else if let Some(t) = item.as_str() {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(t);
+                }
+            }
+            out
+        }
+        serde_json::Value::Object(map) => map
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+fn extract_user_visible_text(raw: &str) -> String {
+    if let Some(start) = raw.find("<user_query>") {
+        if let Some(end) = raw.find("</user_query>") {
+            if end > start {
+                return raw[start + "<user_query>".len()..end].trim().to_string();
+            }
+        }
+    }
+    if raw.contains("<system-reminder>") && !raw.contains("<user_query>") {
+        return String::new();
+    }
+    if raw.len() > 4000 {
+        let mut end = 4000;
+        while !raw.is_char_boundary(end) {
+            end -= 1;
+        }
+        return format!("{}…", &raw[..end]);
+    }
+    raw.trim().to_string()
+}
+
+/// Fast UI transcript from the small `chat_history.jsonl` (typically <1MB),
+/// avoiding full ACP `session/load` of multi-hundred-MB `updates.jsonl`.
+#[tauri::command]
+fn preview_session_from_disk(
+    id: String,
+    title: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+) -> Result<Option<String>, String> {
+    let safe: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(80)
+        .collect();
+    if safe.is_empty() {
+        return Ok(None);
+    }
+    let Some(dir) = find_grok_session_dir(&safe) else {
+        return Ok(None);
+    };
+    let chat_path = dir.join("chat_history.jsonl");
+    if !chat_path.is_file() {
+        return Ok(None);
+    }
+    let raw = match read_bounded_text(&chat_path, 6 * 1024 * 1024) {
+        Ok(text) if !text.trim().is_empty() => text,
+        _ => return Ok(None),
+    };
+
+    let mut title = title.unwrap_or_else(|| "Untitled mission".into());
+    let mut cwd = cwd.unwrap_or_default();
+    let mut model = model.unwrap_or_else(|| "grok-4.5".into());
+    let mut created_at = 0u64;
+    let mut updated_at = 0u64;
+    if let Ok(summary_raw) = read_bounded_text(&dir.join("summary.json"), 256 * 1024) {
+        if let Ok(summary) = serde_json::from_str::<serde_json::Value>(&summary_raw) {
+            if let Some(t) = summary
+                .pointer("/generated_title")
+                .or_else(|| summary.pointer("/session_summary"))
+                .and_then(|v| v.as_str())
+            {
+                if !t.trim().is_empty() {
+                    title = t.trim().to_string();
+                }
+            }
+            if let Some(c) = summary
+                .pointer("/info/cwd")
+                .or_else(|| summary.pointer("/cwd"))
+                .and_then(|v| v.as_str())
+            {
+                cwd = c.to_string();
+            }
+            if let Some(m) = summary
+                .pointer("/current_model_id")
+                .and_then(|v| v.as_str())
+            {
+                model = m.to_string();
+            }
+            created_at = summary
+                .pointer("/created_at")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            updated_at = summary
+                .pointer("/updated_at")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+        }
+    }
+
+    let mut blocks: Vec<serde_json::Value> = Vec::new();
+    let mut block_i = 0usize;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let kind = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match kind {
+            "system" => {}
+            "user" => {
+                let text = extract_user_visible_text(&json_text_content(
+                    entry.get("content").unwrap_or(&serde_json::Value::Null),
+                ));
+                if text.is_empty() {
+                    continue;
+                }
+                block_i += 1;
+                blocks.push(serde_json::json!({
+                    "type": "user",
+                    "id": format!("disk-user-{block_i}"),
+                    "text": text,
+                    "ts": updated_at,
+                }));
+            }
+            "assistant" => {
+                let text =
+                    json_text_content(entry.get("content").unwrap_or(&serde_json::Value::Null));
+                let text = text.trim();
+                if !text.is_empty() {
+                    block_i += 1;
+                    blocks.push(serde_json::json!({
+                        "type": "assistant",
+                        "id": format!("disk-assistant-{block_i}"),
+                        "text": text,
+                        "streaming": false,
+                        "ts": updated_at,
+                    }));
+                }
+                if let Some(calls) = entry.get("tool_calls").and_then(|v| v.as_array()) {
+                    for (ti, call) in calls.iter().enumerate() {
+                        let name = call
+                            .pointer("/function/name")
+                            .or_else(|| call.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("tool");
+                        block_i += 1;
+                        blocks.push(serde_json::json!({
+                            "type": "tool",
+                            "id": format!("disk-tool-{block_i}-{ti}"),
+                            "ts": updated_at,
+                            "call": {
+                                "id": format!("disk-tool-{block_i}-{ti}"),
+                                "kind": "other",
+                                "rawKind": name,
+                                "title": name,
+                                "status": "done",
+                            }
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if blocks.is_empty() {
+        return Ok(None);
+    }
+
+    // chat_history is already small (typically <2MB); keep all turns for the
+    // instant paint. Offline updates scan upgrades tools/fidelity later.
+    const MAX_BLOCKS: usize = 800;
+    if blocks.len() > MAX_BLOCKS {
+        blocks = blocks.split_off(blocks.len() - MAX_BLOCKS);
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if created_at == 0 {
+        created_at = now;
+    }
+    if updated_at == 0 {
+        updated_at = now;
+    }
+
+    let session = serde_json::json!({
+        "id": safe,
+        "title": title,
+        "cwd": cwd,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+        "model": model,
+        "blocks": blocks,
+        "usage": {
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "cacheReadTokens": 0,
+            "costUSD": 0,
+            "contextUsed": 0,
+            "contextMax": 0,
+            "turns": 0
+        },
+        "status": "idle",
+        "demo": false
+    });
+    Ok(Some(session.to_string()))
+}
+
+/// Generation token: switching missions abandons the previous offline scan.
+static OFFLINE_HISTORY_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Bump generation so any in-flight offline history worker exits without emitting.
+#[tauri::command]
+fn cancel_offline_session_history() {
+    OFFLINE_HISTORY_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+fn offline_history_meta(dir: &Path) -> (String, String, String, u64, u64) {
+    let mut title = "Untitled mission".to_string();
+    let mut cwd = String::new();
+    let mut model = "grok-4.5".to_string();
+    let mut created_at = 0u64;
+    let mut updated_at = 0u64;
+    if let Ok(summary_raw) = read_bounded_text(&dir.join("summary.json"), 256 * 1024) {
+        if let Ok(summary) = serde_json::from_str::<serde_json::Value>(&summary_raw) {
+            if let Some(t) = summary
+                .pointer("/generated_title")
+                .or_else(|| summary.pointer("/session_summary"))
+                .and_then(|v| v.as_str())
+            {
+                if !t.trim().is_empty() {
+                    title = t.trim().to_string();
+                }
+            }
+            if let Some(c) = summary
+                .pointer("/info/cwd")
+                .or_else(|| summary.pointer("/cwd"))
+                .and_then(|v| v.as_str())
+            {
+                cwd = c.to_string();
+            }
+            if let Some(m) = summary
+                .pointer("/current_model_id")
+                .and_then(|v| v.as_str())
+            {
+                model = m.to_string();
+            }
+            created_at = summary
+                .pointer("/created_at")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            updated_at = summary
+                .pointer("/updated_at")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+        }
+    }
+    (title, cwd, model, created_at, updated_at)
+}
+
+fn pack_offline_session(
+    id: &str,
+    title: &str,
+    cwd: &str,
+    model: &str,
+    created_at: u64,
+    updated_at: u64,
+    blocks: &[serde_json::Value],
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "title": title,
+        "cwd": cwd,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+        "model": model,
+        "blocks": blocks,
+        "usage": {
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "cacheReadTokens": 0,
+            "costUSD": 0,
+            "contextUsed": 0,
+            "contextMax": 0,
+            "turns": 0
+        },
+        "status": "idle",
+        "demo": false
+    })
+}
+
+/// Stream-parse `updates.jsonl` on a worker thread (no Agent, no UI freeze).
+/// Switching sessions bumps the generation and abandons the previous scan.
+#[tauri::command]
+fn start_offline_session_history(
+    app: tauri::AppHandle,
+    id: String,
+    title: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+) -> Result<(), String> {
+    let safe: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(80)
+        .collect();
+    if safe.is_empty() {
+        return Err("无效的会话 ID".into());
+    }
+    let gen = OFFLINE_HISTORY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::Builder::new()
+        .name(format!("offline-hist-{safe}"))
+        .spawn(move || {
+            let abandoned = || OFFLINE_HISTORY_GEN.load(Ordering::SeqCst) != gen;
+            let emit = |session: serde_json::Value, done: bool, phase: &str| {
+                if abandoned() {
+                    return;
+                }
+                let _ = app.emit(
+                    "disk-history-progress",
+                    serde_json::json!({
+                        "id": safe,
+                        "gen": gen,
+                        "done": done,
+                        "phase": phase,
+                        "session": session,
+                    }),
+                );
+            };
+
+            let Some(dir) = find_grok_session_dir(&safe) else {
+                let _ = app.emit(
+                    "disk-history-progress",
+                    serde_json::json!({
+                        "id": safe,
+                        "gen": gen,
+                        "done": true,
+                        "phase": "missing",
+                        "session": null,
+                    }),
+                );
+                return;
+            };
+
+            let (mut title_s, mut cwd_s, mut model_s, mut created_at, mut updated_at) =
+                offline_history_meta(&dir);
+            if let Some(t) = title.filter(|s| !s.trim().is_empty()) {
+                title_s = t;
+            }
+            if let Some(c) = cwd.filter(|s| !s.trim().is_empty()) {
+                cwd_s = c;
+            }
+            if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
+                model_s = m;
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if created_at == 0 {
+                created_at = now;
+            }
+            if updated_at == 0 {
+                updated_at = now;
+            }
+
+            // Phase 1: chat_history already shown by frontend; optional skip.
+
+            // Phase 2: stream updates.jsonl for full tool + message fidelity.
+            let updates_path = dir.join("updates.jsonl");
+            if !updates_path.is_file() {
+                emit(
+                    pack_offline_session(
+                        &safe, &title_s, &cwd_s, &model_s, created_at, updated_at, &[],
+                    ),
+                    true,
+                    "no-updates",
+                );
+                return;
+            }
+
+            let file = match File::open(&updates_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = app.emit(
+                        "disk-history-progress",
+                        serde_json::json!({
+                            "id": safe,
+                            "gen": gen,
+                            "done": true,
+                            "phase": "error",
+                            "error": format!("open updates: {e}"),
+                            "session": null,
+                        }),
+                    );
+                    return;
+                }
+            };
+
+            // Blocking worker: use std BufReader (tokio::io::BufReader is async).
+            let reader = StdBufReader::with_capacity(1024 * 256, file);
+            let mut blocks: Vec<serde_json::Value> = Vec::new();
+            let mut user_open: Option<(String, String)> = None; // id, text
+            let mut asst_open: Option<(String, String)> = None;
+            let mut block_i = 0usize;
+            let mut line_i = 0usize;
+            let mut last_emit_lines = 0usize;
+
+            let flush_user = |blocks: &mut Vec<serde_json::Value>,
+                             user_open: &mut Option<(String, String)>,
+                             updated_at: u64| {
+                if let Some((id, text)) = user_open.take() {
+                    let text = extract_user_visible_text(&text);
+                    if !text.is_empty() {
+                        blocks.push(serde_json::json!({
+                            "type": "user",
+                            "id": id,
+                            "text": text,
+                            "ts": updated_at,
+                        }));
+                    }
+                }
+            };
+            let flush_asst = |blocks: &mut Vec<serde_json::Value>,
+                              asst_open: &mut Option<(String, String)>,
+                              updated_at: u64| {
+                if let Some((id, text)) = asst_open.take() {
+                    if !text.trim().is_empty() {
+                        blocks.push(serde_json::json!({
+                            "type": "assistant",
+                            "id": id,
+                            "text": text,
+                            "streaming": false,
+                            "ts": updated_at,
+                        }));
+                    }
+                }
+            };
+
+            for line in reader.lines() {
+                if abandoned() {
+                    return;
+                }
+                line_i += 1;
+                // Cheap cancel check every ~4k lines without waiting for emit cadence.
+                if line_i & 0xFFF == 0 && abandoned() {
+                    return;
+                }
+                let Ok(line) = line else { continue };
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                // Fast-path: thoughts dominate huge updates.jsonl files (100MB+).
+                // Skip before full JSON parse — keeps UI free while scanning.
+                if line.contains("\"agent_thought_chunk\"") {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let update = entry
+                    .pointer("/params/update")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let kind = update
+                    .get("sessionUpdate")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                match kind {
+                    "agent_thought_chunk" => {}
+                    "user_message_chunk" => {
+                        flush_asst(&mut blocks, &mut asst_open, updated_at);
+                        let delta = json_text_content(
+                            update.get("content").unwrap_or(&serde_json::Value::Null),
+                        );
+                        if let Some((_, ref mut text)) = user_open {
+                            text.push_str(&delta);
+                        } else {
+                            block_i += 1;
+                            user_open = Some((format!("off-user-{block_i}"), delta));
+                        }
+                    }
+                    "agent_message_chunk" => {
+                        flush_user(&mut blocks, &mut user_open, updated_at);
+                        let delta = json_text_content(
+                            update.get("content").unwrap_or(&serde_json::Value::Null),
+                        );
+                        if let Some((_, ref mut text)) = asst_open {
+                            text.push_str(&delta);
+                        } else {
+                            block_i += 1;
+                            asst_open = Some((format!("off-asst-{block_i}"), delta));
+                        }
+                    }
+                    "tool_call" => {
+                        flush_user(&mut blocks, &mut user_open, updated_at);
+                        flush_asst(&mut blocks, &mut asst_open, updated_at);
+                        let tool_id = update
+                            .get("toolCallId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("tool");
+                        let title = update
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| {
+                                update
+                                    .pointer("/_meta/x.ai/tool/name")
+                                    .and_then(|v| v.as_str())
+                            })
+                            .unwrap_or("tool");
+                        let kind_s = update
+                            .pointer("/_meta/x.ai/tool/kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("other");
+                        let kind_norm = match kind_s {
+                            "execute" | "terminal" | "edit" | "write" | "delete" | "move"
+                            | "read" | "search" | "fetch" | "other" => kind_s,
+                            _ => "other",
+                        };
+                        block_i += 1;
+                        blocks.push(serde_json::json!({
+                            "type": "tool",
+                            "id": format!("off-tool-{block_i}"),
+                            "ts": updated_at,
+                            "call": {
+                                "id": tool_id,
+                                "kind": kind_norm,
+                                "rawKind": title,
+                                "title": title,
+                                "status": "done",
+                            }
+                        }));
+                    }
+                    "tool_call_update" => {
+                        // Mark matching tool done if present; keep title updates light.
+                        let tool_id = update
+                            .get("toolCallId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let status = update
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("done");
+                        let title = update.get("title").and_then(|v| v.as_str());
+                        if let Some(block) = blocks.iter_mut().rev().find(|b| {
+                            b.get("type").and_then(|t| t.as_str()) == Some("tool")
+                                && b.pointer("/call/id").and_then(|t| t.as_str()) == Some(tool_id)
+                        }) {
+                            if let Some(call) = block.get_mut("call") {
+                                if let Some(obj) = call.as_object_mut() {
+                                    obj.insert(
+                                        "status".into(),
+                                        serde_json::Value::String(
+                                            if status == "in_progress" || status == "running" {
+                                                "running".into()
+                                            } else {
+                                                "done".into()
+                                            },
+                                        ),
+                                    );
+                                    if let Some(t) = title {
+                                        obj.insert(
+                                            "title".into(),
+                                            serde_json::Value::String(t.to_string()),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "turn_completed" => {
+                        flush_user(&mut blocks, &mut user_open, updated_at);
+                        flush_asst(&mut blocks, &mut asst_open, updated_at);
+                    }
+                    _ => {}
+                }
+
+                // Emit progress every ~8000 lines — rare enough not to thrash React.
+                if line_i - last_emit_lines >= 8000 {
+                    last_emit_lines = line_i;
+                    flush_user(&mut blocks, &mut user_open, updated_at);
+                    flush_asst(&mut blocks, &mut asst_open, updated_at);
+                    let view_blocks: Vec<serde_json::Value> = if blocks.len() > 600 {
+                        blocks[blocks.len() - 600..].to_vec()
+                    } else {
+                        blocks.clone()
+                    };
+                    emit(
+                        pack_offline_session(
+                            &safe,
+                            &title_s,
+                            &cwd_s,
+                            &model_s,
+                            created_at,
+                            updated_at,
+                            &view_blocks,
+                        ),
+                        false,
+                        "scanning",
+                    );
+                }
+            }
+
+            if abandoned() {
+                return;
+            }
+            flush_user(&mut blocks, &mut user_open, updated_at);
+            flush_asst(&mut blocks, &mut asst_open, updated_at);
+            for block in blocks.iter_mut() {
+                if block.get("type").and_then(|t| t.as_str()) != Some("tool") {
+                    continue;
+                }
+                if let Some(call) = block.get_mut("call").and_then(|c| c.as_object_mut()) {
+                    let running = call
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s == "running" || s == "pending" || s == "in_progress")
+                        .unwrap_or(false);
+                    if running {
+                        call.insert("status".into(), serde_json::Value::String("done".into()));
+                    }
+                }
+            }
+            // Timeline windows initial paint; 1500 blocks covers long missions.
+            const MAX_FINAL_BLOCKS: usize = 1500;
+            if blocks.len() > MAX_FINAL_BLOCKS {
+                blocks = blocks.split_off(blocks.len() - MAX_FINAL_BLOCKS);
+            }
+            emit(
+                pack_offline_session(
+                    &safe, &title_s, &cwd_s, &model_s, created_at, updated_at, &blocks,
+                ),
+                true,
+                "complete",
+            );
+        })
+        .map_err(|e| format!("无法启动离线历史线程：{e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 fn read_config_documents(cwd: String) -> Result<Vec<ConfigDocument>, String> {
     let cwd = checked_workspace(&cwd)?;
@@ -2979,6 +3725,11 @@ fn main() {
             write_config_document,
             read_hidden_projects,
             write_hidden_projects,
+            read_session_cache,
+            write_session_cache,
+            preview_session_from_disk,
+            start_offline_session_history,
+            cancel_offline_session_history,
             read_provider_status,
             configure_provider,
             list_provider_profiles,

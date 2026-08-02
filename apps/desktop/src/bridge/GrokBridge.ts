@@ -80,8 +80,32 @@ export interface GrokBridge {
   /** ACP: session/new — emits session_ready. */
   newSession(cwd: string): Promise<void>;
 
-  /** ACP: session/load — emits session_ready with the restored transcript. */
-  loadSession(id: string): Promise<void>;
+  /**
+   * ACP: session/load — emits session_ready with the restored transcript.
+   * `background: true` keeps the current UI (e.g. disk cache) visible and only
+   * replaces it when load finishes — no empty-shell flash.
+   */
+  loadSession(id: string, options?: { background?: boolean }): Promise<void>;
+
+  /**
+   * Seed the ACP session catalogue so the next loadSession can skip a full
+   * session-list round-trip. Optional on mock bridges.
+   */
+  rememberSessionMeta?(meta: SessionMeta): void;
+
+  /** True once ACP session/load (or new) has bound this id in the agent process. */
+  isSessionBound?(id: string): boolean;
+
+  /**
+   * Visit memory + priority queue:
+   * - Active mission first; then other visited unbound missions (oldest first).
+   * - Switch to C abandons not-yet-started secondary loads (e.g. A).
+   * - In-flight ACP load cannot be cancelled mid-flight.
+   */
+  enqueueBackgroundLoad?(id: string): void;
+
+  /** So the load queue can prefer the live active mission. */
+  setActiveSessionGetter?(getter: () => string | null): void;
 
   /** ACP: session/prompt — streams events until the turn settles. */
   prompt(sessionId: string, text: string, opts: PromptOptions): Promise<void>;

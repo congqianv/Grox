@@ -761,6 +761,32 @@ export class AcpBridge implements GrokBridge {
   private cursors = new Map<string, ContentCursor>();
   private catalogue = new Map<string, SessionMeta>();
   private replaying = new Map<string, Session>();
+  /**
+   * Sessions currently being restored via `session/load`. While set, emit() keeps
+   * a private replay buffer AND periodically flushes it to the UI so the shell
+   * is not stuck on the full-screen "Restoring session…" spinner for long
+   * transcripts (especially under agent --leader).
+   */
+  private progressiveLoad = new Set<string>();
+  private progressiveFlushTimers = new Map<string, number>();
+  /** In-flight session/load promises — dedupe open + first-send races. */
+  private loadPromises = new Map<string, Promise<void>>();
+  /**
+   * Scheme C + visit memory:
+   * 1) Always prefer full-load of the active mission if unbound.
+   * 2) After active is complete, full-load other *visited* unbound missions
+   *    (oldest visit first — e.g. opened A then B → while on B load A).
+   * 3) Switching to C: active C wins; abandon not-yet-started secondary (A).
+   * 4) In-flight ACP load cannot be cancelled mid-flight.
+   */
+  private visitedOrder: string[] = [];
+  private backgroundLoadRunning = false;
+  private backgroundLoadInFlight: string | null = null;
+  private activeSessionGetter: (() => string | null) | null = null;
+  /** Avoid tight retry loops after a failed full-load until user re-opens. */
+  private backgroundLoadFailed = new Set<string>();
+  /** Short TTL cache for sessionMeta (system-prompt + permission flags) per cwd. */
+  private sessionMetaCache = new Map<string, { expires: number; value: Record<string, unknown> }>();
   private usage = new Map<string, Usage>();
   private sessionOptions = new Map<string, PromptOptions>();
   private knownSessions = new Set<string>();
@@ -808,11 +834,184 @@ export class AcpBridge implements GrokBridge {
     if ("sessionId" in event) {
       const replay = this.replaying.get(event.sessionId);
       if (replay) {
+        // During session/load the agent can stream hundreds of thousands of
+        // updates. Applying every thinking/assistant delta freezes the UI
+        // (scroll works, clicks/switch/send do not). Keep only structured
+        // events for the final snapshot; skip pure stream deltas.
+        if (
+          event.type === "assistant_append" ||
+          event.type === "thinking_append"
+        ) {
+          return;
+        }
         this.replaying.set(event.sessionId, applyToSession(replay, event));
+        // Progressive restore only for intentional foreground loads.
+        if (this.progressiveLoad.has(event.sessionId)) {
+          this.scheduleProgressiveFlush(event.sessionId);
+        }
         return;
       }
     }
     for (const callback of this.listeners) callback(event);
+  }
+
+  /** Push the current replay snapshot to the UI (throttled). */
+  private scheduleProgressiveFlush(sessionId: string) {
+    if (this.progressiveFlushTimers.has(sessionId)) return;
+    const timer = window.setTimeout(() => {
+      this.progressiveFlushTimers.delete(sessionId);
+      if (!this.progressiveLoad.has(sessionId)) return;
+      const snap = this.replaying.get(sessionId);
+      if (!snap) return;
+      const session: Session = {
+        ...snap,
+        status: "idle",
+        blocks: snap.blocks.map((block) =>
+          block.type === "assistant"
+            ? { ...block, streaming: false }
+            : block.type === "thinking"
+              ? { ...block, live: false }
+              : block,
+        ),
+      };
+      for (const callback of this.listeners) {
+        callback({ type: "session_ready", session });
+      }
+    }, 100);
+    this.progressiveFlushTimers.set(sessionId, timer);
+  }
+
+  private clearProgressiveLoad(sessionId: string) {
+    this.progressiveLoad.delete(sessionId);
+    const timer = this.progressiveFlushTimers.get(sessionId);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      this.progressiveFlushTimers.delete(sessionId);
+    }
+  }
+
+  /** Seed catalogue so loadSession skips a full x.ai/session/list round-trip. */
+  rememberSessionMeta(meta: SessionMeta): void {
+    this.catalogue.set(meta.id, meta);
+  }
+
+  isSessionBound(id: string): boolean {
+    return this.knownSessions.has(id);
+  }
+
+  setActiveSessionGetter(getter: () => string | null): void {
+    this.activeSessionGetter = getter;
+  }
+
+  private activeSessionId(): string | null {
+    return this.activeSessionGetter?.() ?? null;
+  }
+
+  private touchVisited(id: string): void {
+    this.visitedOrder = this.visitedOrder.filter((x) => x !== id);
+    this.visitedOrder.push(id);
+    // Cap memory of visits
+    if (this.visitedOrder.length > 40) {
+      this.visitedOrder = this.visitedOrder.slice(-40);
+    }
+  }
+
+  /**
+   * Pick next full-load target:
+   * - Active unbound mission always first (C when user is on C).
+   * - Else oldest visited unbound (A after B is complete).
+   */
+  private nextBackgroundLoadId(): string | null {
+    const active = this.activeSessionId();
+    if (
+      active &&
+      !this.knownSessions.has(active) &&
+      !this.backgroundLoadFailed.has(active)
+    ) {
+      return active;
+    }
+    for (const id of this.visitedOrder) {
+      if (active && id === active) continue;
+      if (this.knownSessions.has(id)) continue;
+      if (this.backgroundLoadFailed.has(id)) continue;
+      return id;
+    }
+    return null;
+  }
+
+  /**
+   * Record a visit and pump the load queue.
+   * Opening a mission marks it visited and prioritizes the active window.
+   */
+  enqueueBackgroundLoad(id: string): void {
+    if (!id) return;
+    this.touchVisited(id);
+    // User re-opened — allow retry after a previous failure.
+    this.backgroundLoadFailed.delete(id);
+    void this.pumpBackgroundLoads();
+  }
+
+  private async pumpBackgroundLoads(): Promise<void> {
+    if (this.backgroundLoadRunning) return;
+    this.backgroundLoadRunning = true;
+    try {
+      for (;;) {
+        const id = this.nextBackgroundLoadId();
+        if (!id) break;
+
+        // If something else is already mid-flight, wait for it via loadPromises
+        // only when it's the same id; otherwise we must finish in-flight first
+        // (ACP single channel) then re-evaluate nextBackgroundLoadId.
+        if (
+          this.backgroundLoadInFlight &&
+          this.backgroundLoadInFlight !== id
+        ) {
+          // Wait for current in-flight to finish by awaiting its promise if any.
+          const inflightId = this.backgroundLoadInFlight;
+          const pending = this.loadPromises.get(inflightId);
+          if (pending) {
+            try {
+              await pending;
+            } catch {
+              /* ignore */
+            }
+          }
+          continue;
+        }
+
+        if (this.knownSessions.has(id)) continue;
+
+        // Re-check priority right before start (user may have switched to C).
+        const preferred = this.nextBackgroundLoadId();
+        if (preferred !== id) {
+          // Abandoned not-yet-started secondary (e.g. was about to load A, now C).
+          continue;
+        }
+
+        // Active window always wins over secondary: if we're about to load a
+        // non-active id but active is unbound, skip to re-pick active.
+        const active = this.activeSessionId();
+        if (active && active !== id && !this.knownSessions.has(active)) {
+          continue;
+        }
+
+        this.backgroundLoadInFlight = id;
+        try {
+          await this.loadSession(id, { background: true });
+          this.backgroundLoadFailed.delete(id);
+        } catch (error) {
+          console.warn("background full-load failed", id, error);
+          this.backgroundLoadFailed.add(id);
+        } finally {
+          this.backgroundLoadInFlight = null;
+        }
+      }
+    } finally {
+      this.backgroundLoadRunning = false;
+      if (this.nextBackgroundLoadId()) {
+        void this.pumpBackgroundLoads();
+      }
+    }
   }
 
   private queueStreamAppend(event: Extract<BridgeEvent, { type: "assistant_append" | "thinking_append" }>) {
@@ -1004,12 +1203,36 @@ export class AcpBridge implements GrokBridge {
     return cursor;
   }
 
+  /** Inbound ACP lines — drained in rAF slices so a huge session/load cannot freeze clicks. */
+  private inboundQueue: string[] = [];
+  private inboundDraining = false;
+
+  private enqueueInbound(line: string) {
+    this.inboundQueue.push(line);
+    if (this.inboundDraining) return;
+    this.inboundDraining = true;
+    const pump = () => {
+      const start = performance.now();
+      // ~one frame of work; leave headroom for clicks / React.
+      while (this.inboundQueue.length > 0 && performance.now() - start < 6) {
+        const next = this.inboundQueue.shift();
+        if (next !== undefined) this.onLine(next);
+      }
+      if (this.inboundQueue.length > 0) {
+        window.requestAnimationFrame(pump);
+      } else {
+        this.inboundDraining = false;
+      }
+    };
+    window.requestAnimationFrame(pump);
+  }
+
   private async connect(): Promise<void> {
     const environment = await invoke<DesktopEnvironment>("desktop_environment");
     this.workspace = localStorage.getItem("grok.workspace") ?? environment.defaultWorkspace;
 
     this.unlisten.push(
-      await listen<string>("acp-event", ({ payload }) => this.onLine(payload)),
+      await listen<string>("acp-event", ({ payload }) => this.enqueueInbound(payload)),
       await listen<string>("acp-stderr", ({ payload }) => {
         this.diagnostics.push(payload);
         this.diagnostics = this.diagnostics.slice(-20);
@@ -1281,6 +1504,11 @@ export class AcpBridge implements GrokBridge {
     const update = record(updateValue);
     if (!update) return;
     const type = string(update.sessionUpdate);
+    // While replaying session/load, thought tokens are pure noise for the final
+    // UI snapshot and dominate CPU on long sessions — drop them.
+    if (this.replaying.has(sessionId) && type === "agent_thought_chunk") {
+      return;
+    }
     const cursor = this.cursor(sessionId);
 
     switch (type) {
@@ -1901,6 +2129,11 @@ export class AcpBridge implements GrokBridge {
   }
 
   private async sessionMeta(cwd: string) {
+    const cached = this.sessionMetaCache.get(cwd);
+    if (cached && cached.expires > Date.now()) {
+      // Permission flags may change from the composer; always merge live flags.
+      return { ...cached.value, ...this.sessionPermissionMeta() };
+    }
     let systemPromptOverride: string | undefined;
     try {
       const documents = await invoke<ConfigDocument[]>("read_config_documents", { cwd });
@@ -1910,9 +2143,13 @@ export class AcpBridge implements GrokBridge {
     } catch {
       // A missing optional prompt document must never block session creation.
     }
-    return {
-      ...this.sessionPermissionMeta(),
+    const base = {
       ...(systemPromptOverride ? { systemPromptOverride } : {}),
+    };
+    this.sessionMetaCache.set(cwd, { expires: Date.now() + 60_000, value: base });
+    return {
+      ...base,
+      ...this.sessionPermissionMeta(),
     };
   }
 
@@ -2131,16 +2368,38 @@ export class AcpBridge implements GrokBridge {
     this.emit({ type: "session_ready", session: emptySession(meta) });
   }
 
-  async loadSession(id: string): Promise<void> {
+  async loadSession(id: string, options?: { background?: boolean }): Promise<void> {
+    const inflight = this.loadPromises.get(id);
+    if (inflight) return inflight;
+
+    const run = this.loadSessionInner(id, options).finally(() => {
+      this.loadPromises.delete(id);
+    });
+    this.loadPromises.set(id, run);
+    return run;
+  }
+
+  private async loadSessionInner(id: string, options?: { background?: boolean }): Promise<void> {
+    const background = options?.background === true;
     let meta = this.catalogue.get(id);
     if (!meta) {
+      // Expensive: paginated x.ai/session/list. Prefer rememberSessionMeta() first.
       await this.listSessions();
       meta = this.catalogue.get(id);
     }
     if (!meta) throw new Error(`找不到会话：${id}`);
 
+    // Foreground: paint empty shell immediately. Background: keep whatever the
+    // UI already shows (chat_history preview / cache) until full load finishes.
+    if (!background) {
+      this.emit({ type: "session_ready", session: emptySession(meta) });
+    }
+
     this.cursors.set(id, { toolBlocks: new Map() });
     this.replaying.set(id, emptySession(meta));
+    if (!background) {
+      this.progressiveLoad.add(id);
+    }
     try {
       const metaRequest = await this.sessionMeta(meta.cwd);
       const response = await this.request(ACP_METHODS.sessionLoad, {
@@ -2152,7 +2411,10 @@ export class AcpBridge implements GrokBridge {
       this.flushStreamAppends(id);
       this.flushToolPatches(id);
       this.captureModelState(response);
-      await this.refreshSessionInfo(id);
+      // Session info is nice-to-have; do not block the final paint on it.
+      void this.refreshSessionInfo(id).catch(() => {
+        /* non-fatal */
+      });
       const replayed = this.replaying.get(id) ?? emptySession(meta);
       const finalized: Session = {
         ...replayed,
@@ -2166,10 +2428,12 @@ export class AcpBridge implements GrokBridge {
               : block,
         ),
       };
+      this.clearProgressiveLoad(id);
       this.replaying.delete(id);
       this.knownSessions.add(id);
       this.emit({ type: "session_ready", session: finalized });
     } catch (error) {
+      this.clearProgressiveLoad(id);
       this.replaying.delete(id);
       throw error;
     }

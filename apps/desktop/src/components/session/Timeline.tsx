@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { Session, SessionBlock } from "../../bridge/types";
+import { useDesktop } from "../../state/store";
 import { useI18n } from "../../lib/i18n";
 import { Icon } from "../fx/Icon";
 import { BlackHole } from "../fx/BlackHole";
@@ -262,6 +263,9 @@ const STICK_BOTTOM_PX = 120;
 
 export function Timeline({ session }: { session: Session }) {
   const { language } = useI18n();
+  const fullHistoryLoadingId = useDesktop((s) => s.fullHistoryLoadingId);
+  const historyLoadMode = useDesktop((s) => s.historyLoadMode);
+  const loadingFullHistory = fullHistoryLoadingId === session.id;
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
@@ -361,6 +365,20 @@ export function Timeline({ session }: { session: Session }) {
       className="flex-1 overflow-y-auto"
     >
       <div ref={contentRef} className="mx-auto max-w-[860px] px-8 py-8">
+        {loadingFullHistory && (
+          <div className="mb-4 flex items-center justify-center gap-2 rounded-md border border-line/80 bg-raise/50 px-3 py-2 text-[11.5px] text-mute">
+            <BlackHole size={14} spin />
+            <span>
+              {historyLoadMode === "disk"
+                ? language === "zh-CN"
+                  ? "正在从磁盘补全完整历史（工具调用等）… 可切换其他对话，不会卡住"
+                  : "Loading full history from disk (tools…)… switching chats is fine"
+                : language === "zh-CN"
+                  ? "正在连接 Agent 完整上下文（首次发送）… 可切换查看其他对话"
+                  : "Binding full agent context for first send… you can switch chats"}
+            </span>
+          </div>
+        )}
         {hiddenCount > 0 && (
           <button
             type="button"
