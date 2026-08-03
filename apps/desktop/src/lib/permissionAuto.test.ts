@@ -6,15 +6,15 @@ import {
 } from "./permissionAuto";
 
 describe("shouldAutoApproveToolPermission", () => {
-  it("never auto when a manual gate is open", () => {
+  it("bypass still auto-approves when a manual gate is already open", () => {
     expect(
       shouldAutoApproveToolPermission({
         permissionMode: "bypass",
-        toolLabel: "read_file",
+        toolLabel: "execute bash",
         computerUseAuto: false,
         hasOpenManualGate: true,
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("default mode never auto (except CU handled separately via computerUseAuto)", () => {
@@ -62,6 +62,25 @@ describe("shouldAutoApproveToolPermission", () => {
         toolLabel: "write_file",
         computerUseAuto: false,
         hasOpenManualGate: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("auto mode still silent-allows safe tools while an execute card is open", () => {
+    expect(
+      shouldAutoApproveToolPermission({
+        permissionMode: "auto",
+        toolLabel: "read_file",
+        computerUseAuto: false,
+        hasOpenManualGate: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldAutoApproveToolPermission({
+        permissionMode: "auto",
+        toolLabel: "execute bash",
+        computerUseAuto: false,
+        hasOpenManualGate: true,
       }),
     ).toBe(false);
   });

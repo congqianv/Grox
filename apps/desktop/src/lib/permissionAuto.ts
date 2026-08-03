@@ -16,10 +16,7 @@ const AUTO_SAFE_KIND_RE =
 const AUTO_UNSAFE_KIND_RE =
   /(^|[^a-z0-9_])(exec(ute)?|terminal|bash|shell|cmd|powershell|write(_file)?|edit|delete|remove|move|rename|apply_patch|computer|spawn|subagent|kill|task|image_gen|video_gen|image_to_video|reference_to_video|media|deploy|run_terminal|run_command|bash_tool)([^a-z0-9_]|$)/i;
 
-/**
- * Costly / high-impact tools that even Bypass should surface when a manual
- * gate is already open (handled via hasOpenManualGate). Listed for docs/tests.
- */
+/** Costly / high-impact tools (execute/write/spawn/media). Auto never silent-allows these. */
 export function isElevatedToolLabel(toolLabel: string): boolean {
   return AUTO_UNSAFE_KIND_RE.test(toolLabel || "");
 }
@@ -27,6 +24,11 @@ export function isElevatedToolLabel(toolLabel: string): boolean {
 /**
  * Decide whether FE may auto-select allow for a tool permission request.
  * Pure — unit-tested.
+ *
+ * YOLO/bypass must never be blocked by an already-open card: stacking
+ * `hasOpenManualGate` used to leave execute cards open and then force every
+ * later tool (even under YOLO) through manual UI — matches the operator report
+ * "切到 YOLO 仍然一直要授权".
  */
 export function shouldAutoApproveToolPermission(input: {
   permissionMode: PermissionMode;
@@ -37,23 +39,29 @@ export function shouldAutoApproveToolPermission(input: {
   /** Another permission/plan/question card is already open for this session. */
   hasOpenManualGate: boolean;
 }): boolean {
-  if (input.hasOpenManualGate) return false;
+  // Bypass = YOLO for trusted envs: always silent-allow tools (plan/question
+  // are separate request kinds and still require a card).
+  if (input.permissionMode === "bypass") return true;
 
-  // CU tools: only auto when CU opt-in is on (regardless of mode, matches prior CU path).
-  if (input.computerUseAuto) return true;
+  // CU tools with opt-in: auto regardless of DEFAULT/AUTO (not blocked by YOLO path above).
+  // Still respect an open manual gate so CU does not race past a visible card.
+  if (input.computerUseAuto) {
+    return !input.hasOpenManualGate;
+  }
 
   if (input.permissionMode === "default") return false;
 
-  // Bypass = YOLO for trusted envs (still blocked by hasOpenManualGate above).
-  if (input.permissionMode === "bypass") return true;
-
-  // auto: only safe read-ish tools
+  // auto: only safe read-ish tools. An open *unsafe* gate must not cascade into
+  // cards for later safe tools (that felt like "自动策略也一直要授权").
   if (input.permissionMode === "auto") {
     const label = input.toolLabel || "";
     if (AUTO_UNSAFE_KIND_RE.test(label)) return false;
-    if (AUTO_SAFE_KIND_RE.test(label)) return true;
-    // Unknown tools: do not auto under Auto (safer than YOLO).
-    return false;
+    if (!AUTO_SAFE_KIND_RE.test(label)) {
+      // Unknown tools: do not auto under Auto (safer than YOLO).
+      return false;
+    }
+    // Safe tool: allow even when another card is open (independent RPC).
+    return true;
   }
 
   return false;

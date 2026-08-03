@@ -2911,7 +2911,7 @@ export class AcpBridge implements GrokBridge {
     }
     localStorage.setItem("grok.permissionMode", mode);
     void this.notify("x.ai/yolo_mode_changed", {
-      clientIdentifier: "grok-desktop",
+      clientIdentifier: "grox-desktop",
       permission_mode:
         mode === "bypass" ? "always-approve" : mode === "auto" ? "auto" : "default",
       yolo_mode: mode === "bypass",
@@ -2922,6 +2922,47 @@ export class AcpBridge implements GrokBridge {
         this.emit({ type: "error", sessionId: id, message: errorText(error) });
       }
     });
+    // Switching into YOLO must clear already-painted tool cards; otherwise the
+    // operator still has to click 仅本次允许 for the open request (and every
+    // later tool used to stack behind hasOpenManualGate).
+    if (mode === "bypass") {
+      this.flushPendingToolPermissionsForMode(sessionId);
+    }
+  }
+
+  /**
+   * Silent-allow open tool permission RPCs after the operator picks YOLO.
+   * Plan / question gates stay (product: YOLO is tool-only).
+   */
+  private flushPendingToolPermissionsForMode(sessionId?: string): void {
+    const pending = [...this.interactions.entries()].filter(
+      ([, item]) =>
+        item.kind === "permission" &&
+        (sessionId === undefined || item.sessionId === sessionId),
+    );
+    for (const [blockId, item] of pending) {
+      const optionId = pickSilentAllowOptionId(item.optionIds);
+      if (!optionId) continue;
+      this.interactions.delete(blockId);
+      this.emit({
+        type: "permission_resolved",
+        sessionId: item.sessionId,
+        blockId,
+        option: "allow_once",
+      });
+      void this.sendRaw({
+        jsonrpc: "2.0",
+        id: item.rpcId,
+        result: { outcome: { outcome: "selected", optionId } },
+      }).catch((error) => {
+        this.interactions.set(blockId, item);
+        this.emit({ type: "permission_restored", sessionId: item.sessionId, blockId });
+        this.emitSoftError(
+          item.sessionId,
+          `YOLO 自动批准失败，请手动点允许：${errorText(error)}`,
+        );
+      });
+    }
   }
 
   /** Mode used for tool auto-approve for this session (no cross-session bleed). */
