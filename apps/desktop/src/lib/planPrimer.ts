@@ -1,5 +1,9 @@
 /* Ported from vscode-supergrok (MIT) plan/primer.ts — rebranded for Grox.
  * Copyright (c) 2026 Jacob The Jacobs.
+ *
+ * Grox uses host RPC for exit_plan_mode (approved/cancelled) rather than
+ * synthetic [Plan approved] user turns. Primer still teaches plan discipline
+ * and that host may block mutating tools while planning.
  */
 
 export const PRIMER_VERSION = 1;
@@ -14,23 +18,36 @@ export function isPrimerText(text: string): boolean {
   return PRIMER_PATTERN.test(text ?? "");
 }
 
+/** Bracket markers that may appear after plan UI decisions (legacy SuperGrok). */
+export const PLAN_VERDICT_PATTERN =
+  /^\s*\[Plan (approved|rejected|cancelled)\]/i;
+
+export function isPlanVerdictText(text: string): boolean {
+  return PLAN_VERDICT_PATTERN.test(text ?? "");
+}
+
+export function formatPlanVerdictMessage(
+  verdict: "approved" | "rejected" | "cancelled",
+  comment?: string,
+): string {
+  const head = `[Plan ${verdict}]`;
+  const note = comment?.trim();
+  return note ? `${head}\n${note}` : head;
+}
+
 export const GROX_PLAN_PRIMER = `${PRIMER_MARKER}
 
 ## HIDDEN PRIMER
 
 This is a system message, not a user request. The user cannot see it in the UI. Skip it when discussing previous user messages or summarizing the conversation. It is informational only: **do not use any tools, do not read any files, do not search the workspace, and do not take any action in response to it.**
 
-## Plan Mode
+## Plan Mode (Grox desktop)
 
-The \`exit_plan_mode\` tool's response is currently unreliable in this CLI version — it always reports "approved" to any client reply, regardless of what the user actually chose in the plan-review UI. **Do not trust the tool result.**
+You are in **plan mode**. While planning:
 
-After \`exit_plan_mode\` resolves, end your turn and wait for the NEXT user message. The user's actual verdict will arrive there as a bracketed marker, optionally followed by a comment:
-
-- \`[Plan approved]\` → implement the plan
-- \`[Plan rejected]\` → stay in plan mode; if a comment follows, treat it as refinement guidance
-- \`[Plan cancelled]\` → exit plan mode; if a comment follows, respond to it normally
-- Anything else → treat as a normal user message
-
-The verdict is **always** in the follow-up message, **never** in the tool result.
+1. Prefer read-only exploration. The host may **block mutating tools** (writes, executes) until the operator approves the plan.
+2. When you finish a plan, call \`exit_plan_mode\` / the plan approval path. Wait for the **host RPC** outcome (\`approved\` or \`cancelled\`), not assumptions.
+3. Do **not** start implementing until the host reports approval. If the operator rejects with feedback, revise the plan and stay in plan mode.
+4. After approval, implement carefully in agent mode.
 
 Reply with exactly: ok`;

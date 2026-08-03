@@ -1,4 +1,5 @@
 import type { Session, SessionBlock, SessionStatus } from "../bridge/types";
+import { isPrimerText } from "./planPrimer";
 
 /** True when the live session must not be forced idle by a disk merge. */
 export function isLiveBusyStatus(status: SessionStatus | undefined): boolean {
@@ -11,6 +12,11 @@ export function isLiveBusyStatus(status: SessionStatus | undefined): boolean {
  * mergeOfflineWithLive appends the entire live transcript after disk history
  * (full duplicate conversation after scan completes).
  */
+/** Drop hidden plan primers from offline/live transcripts before merge/display. */
+export function stripPrimerBlocks(blocks: SessionBlock[]): SessionBlock[] {
+  return blocks.filter((block) => !(block.type === "user" && isPrimerText(block.text)));
+}
+
 export function blockContentKey(block: SessionBlock): string {
   switch (block.type) {
     case "user":
@@ -45,64 +51,88 @@ export function blockContentKey(block: SessionBlock): string {
 export function mergeOfflineWithLive(pending: Session, cur: Session | undefined): Session {
   const busyStatus = cur && isLiveBusyStatus(cur.status) ? cur.status : null;
   const status = busyStatus ?? ("idle" as const);
+  const pendingClean: Session = {
+    ...pending,
+    blocks: stripPrimerBlocks(pending.blocks),
+  };
+  const curClean = cur
+    ? { ...cur, blocks: stripPrimerBlocks(cur.blocks) }
+    : undefined;
 
-  if (!cur || cur.blocks.length === 0) {
-    return { ...pending, status };
+  if (!curClean || curClean.blocks.length === 0) {
+    return { ...pendingClean, status };
   }
 
-  const pendingKeys = new Set(pending.blocks.map(blockContentKey));
-  const liveOnly = cur.blocks.filter((b) => !pendingKeys.has(blockContentKey(b)));
+  const pendingKeys = new Set(pendingClean.blocks.map(blockContentKey));
+  const liveOnly = curClean.blocks.filter((b) => !pendingKeys.has(blockContentKey(b)));
 
   // Idle + offline covers live content → offline is authoritative (no ghost twin turns).
   if (!busyStatus && liveOnly.length === 0) {
     return {
-      ...pending,
+      ...pendingClean,
       status: "idle",
-      usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
+      usage: curClean.usage?.outputTokens ? curClean.usage : pendingClean.usage,
     };
   }
 
   // Idle + offline is longer (or equal) by block count and covers most of live:
   // still prefer offline + residual liveOnly (e.g. brand-new unsent paint).
-  if (!busyStatus && pending.blocks.length >= cur.blocks.length && liveOnly.length === 0) {
+  if (
+    !busyStatus &&
+    pendingClean.blocks.length >= curClean.blocks.length &&
+    liveOnly.length === 0
+  ) {
     return {
-      ...pending,
+      ...pendingClean,
       status: "idle",
-      usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
+      usage: curClean.usage?.outputTokens ? curClean.usage : pendingClean.usage,
     };
   }
 
   // Live strictly longer by raw length AND no content overlap path for residuals:
   // keep live when offline is a short cache prefix of the same session (legacy).
   // Prefer content-based append when offline is longer or equal.
-  if (cur.blocks.length > pending.blocks.length && liveOnly.length === cur.blocks.length) {
+  if (
+    curClean.blocks.length > pendingClean.blocks.length &&
+    liveOnly.length === curClean.blocks.length
+  ) {
     // Zero content overlap (total ID/content mismatch): offline + live would
     // double the transcript. Prefer the longer stream while busy; while idle
     // prefer offline when it has more blocks (richer disk history).
-    if (!busyStatus && pending.blocks.length >= Math.floor(cur.blocks.length * 0.5)) {
+    if (
+      !busyStatus &&
+      pendingClean.blocks.length >= Math.floor(curClean.blocks.length * 0.5)
+    ) {
       // Heuristic: disk recovered a large history; live is likely cache+optimistic.
       // Keep offline and only append live blocks that look like a trailing turn
       // (last few user/assistant after offline end).
-      const trailing = pickTrailingLiveOnly(cur.blocks, pendingKeys);
+      const trailing = pickTrailingLiveOnly(curClean.blocks, pendingKeys);
       return {
-        ...pending,
+        ...pendingClean,
         status: "idle",
-        blocks: trailing.length > 0 ? [...pending.blocks, ...trailing] : pending.blocks,
-        usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
+        blocks:
+          trailing.length > 0
+            ? [...pendingClean.blocks, ...trailing]
+            : pendingClean.blocks,
+        usage: curClean.usage?.outputTokens ? curClean.usage : pendingClean.usage,
       };
     }
-    return { ...cur, status };
+    return { ...curClean, status };
   }
 
   if (liveOnly.length === 0) {
-    return { ...pending, status, usage: cur.usage?.outputTokens ? cur.usage : pending.usage };
+    return {
+      ...pendingClean,
+      status,
+      usage: curClean.usage?.outputTokens ? curClean.usage : pendingClean.usage,
+    };
   }
 
   return {
-    ...pending,
+    ...pendingClean,
     status,
-    blocks: [...pending.blocks, ...liveOnly],
-    usage: cur.usage?.outputTokens ? cur.usage : pending.usage,
+    blocks: [...pendingClean.blocks, ...liveOnly],
+    usage: curClean.usage?.outputTokens ? curClean.usage : pendingClean.usage,
   };
 }
 

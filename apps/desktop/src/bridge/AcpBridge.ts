@@ -62,6 +62,15 @@ import {
   shouldRejectPermission,
 } from "../lib/planGate";
 import {
+  GROX_PLAN_PRIMER,
+  isPrimerText,
+} from "../lib/planPrimer";
+import {
+  recordPlanVerdict,
+  restoreDecisionForSession,
+  verdictFromPermissionOption,
+} from "../lib/planHistory";
+import {
   collectToolImages,
   extractGeneratedMediaPaths,
   isMediaGenToolCall,
@@ -170,6 +179,8 @@ interface PendingInteraction {
   kind: "permission" | "plan" | "question";
   optionIds: Partial<Record<PermissionOption, string>>;
   questions?: QuestionItem[];
+  /** Plan markdown from x.ai/exit_plan_mode (for local verdict history). */
+  planText?: string;
 }
 
 class AcpRpcError extends Error {
@@ -937,6 +948,8 @@ export class AcpBridge implements GrokBridge {
    */
   private productGateFallbackInFlight = false;
   private productGateFallbackDone = false;
+  /** Sessions that already received GROX_PLAN_PRIMER this process lifetime. */
+  private planPrimerSent = new Set<string>();
   /** Child died again while crash-reconnect was still finishing success path. */
   private reconnectChildDied = false;
   /** When true, restartAgentInner must not steal `ready` from runCrashReconnect. */
@@ -2186,8 +2199,16 @@ export class AcpBridge implements GrokBridge {
 
     switch (type) {
       case "user_message_chunk": {
-        if (!this.replaying.has(sessionId)) return;
         const delta = contentText(update.content);
+        // Hide plan primers (and legacy SuperGrok primers) from the transcript.
+        if (isPrimerText(delta) || isPrimerText(`${cursor.userText ?? ""}${delta}`)) {
+          cursor.userOpen = false;
+          cursor.userId = undefined;
+          cursor.userText = undefined;
+          return;
+        }
+        // Live user text is painted optimistically by promptInner; only replay paints here.
+        if (!this.replaying.has(sessionId)) return;
         const promptIndex = number(record(update._meta)?.promptIndex);
         const userId = cursor.userId;
         const beginsNewPrompt =
@@ -2300,7 +2321,21 @@ export class AcpBridge implements GrokBridge {
       case "current_mode_update": {
         const modeId = string(update.currentModeId);
         const mode: AgentMode = modeId === "plan" ? "plan" : modeId === "ask" ? "ask" : "agent";
+        const prev = this.sessionOptions.get(sessionId);
+        if (prev) this.sessionOptions.set(sessionId, { ...prev, mode });
+        else {
+          this.sessionOptions.set(sessionId, {
+            model: this.modelState.currentId,
+            effort: "high",
+            mode,
+          });
+        }
         this.emit({ type: "mode_state", sessionId, mode });
+        if (mode === "plan") {
+          void this.ensurePlanPrimer(sessionId).catch((error) => {
+            console.warn("plan primer inject failed", error);
+          });
+        }
         return;
       }
       case "tool_call":
@@ -2912,12 +2947,18 @@ export class AcpBridge implements GrokBridge {
     }
     const toolCallId = string(params.toolCallId) ?? uid();
     const blockId = `plan-approval-${toolCallId}-${String(rpcId)}`;
+    const planText =
+      string(params.planContent) ??
+      string(params.plan) ??
+      string(params.content) ??
+      "";
     this.interactions.set(blockId, {
       rpcId,
       sessionId,
       blockId,
       kind: "plan",
       optionIds: {},
+      planText,
     });
     this.emit({
       type: "permission_request",
@@ -2928,7 +2969,7 @@ export class AcpBridge implements GrokBridge {
         toolCallId,
         title: "Approve execution plan",
         description: "Grok has finished planning and is waiting to enter agent mode.",
-        payload: string(params.planContent),
+        payload: planText || undefined,
         options: ["allow_once", "deny"],
         purpose: "plan",
       },
@@ -3313,6 +3354,54 @@ export class AcpBridge implements GrokBridge {
     });
     const current = this.sessionOptions.get(sessionId);
     if (current) this.sessionOptions.set(sessionId, { ...current, mode });
+    else {
+      this.sessionOptions.set(sessionId, {
+        model: this.modelState.currentId,
+        effort: "high",
+        mode,
+      });
+    }
+    if (mode === "plan") {
+      void this.ensurePlanPrimer(sessionId).catch((error) => {
+        console.warn("plan primer inject failed", error);
+      });
+    }
+  }
+
+  /**
+   * Inject a hidden plan-mode primer once per session (not shown in UI).
+   * Uses session/prompt; user_message_chunk is filtered via isPrimerText.
+   */
+  private async ensurePlanPrimer(sessionId: string): Promise<void> {
+    if (this.planPrimerSent.has(sessionId)) return;
+    this.planPrimerSent.add(sessionId);
+    try {
+      await this.requestRaw(
+        ACP_METHODS.sessionPrompt,
+        {
+          sessionId,
+          prompt: [{ type: "text", text: GROX_PLAN_PRIMER }],
+        },
+        90_000,
+      );
+    } catch (error) {
+      // Allow retry on next plan enter if inject failed.
+      this.planPrimerSent.delete(sessionId);
+      throw error;
+    }
+  }
+
+  /** After session/load, re-enter plan mode if last stored verdict was rejected. */
+  private async applyPlanRestore(sessionId: string): Promise<void> {
+    const decision = restoreDecisionForSession(sessionId);
+    if (!decision.planActive) return;
+    const current = this.sessionOptions.get(sessionId)?.mode;
+    if (current === "plan") {
+      void this.ensurePlanPrimer(sessionId).catch(() => {});
+      return;
+    }
+    await this.setSessionMode(sessionId, "plan");
+    this.emit({ type: "mode_state", sessionId, mode: "plan" });
   }
 
   async deleteProviderProfile(id: string): Promise<void> {
@@ -3612,15 +3701,21 @@ export class AcpBridge implements GrokBridge {
         ...replayed,
         usage: this.usage.get(id) ?? replayed.usage,
         status: "idle",
-        blocks: replayed.blocks.map((block) =>
-          block.type === "assistant"
-            ? { ...block, streaming: false }
-            : block.type === "thinking"
-              ? { ...block, live: false }
-              : block,
-        ),
+        blocks: replayed.blocks
+          .filter((block) => !(block.type === "user" && isPrimerText(block.text)))
+          .map((block) =>
+            block.type === "assistant"
+              ? { ...block, streaming: false }
+              : block.type === "thinking"
+                ? { ...block, live: false }
+                : block,
+          ),
       };
       this.emit({ type: "session_ready", session: finalized });
+      // Restore plan mode when last stored verdict was "rejected".
+      void this.applyPlanRestore(id).catch((error) => {
+        console.warn("plan restore failed", error);
+      });
     } catch (error) {
       this.clearProgressiveLoad(id);
       this.replaying.delete(id);
@@ -4193,6 +4288,11 @@ export class AcpBridge implements GrokBridge {
         outcome: option === "deny" ? "cancelled" : "approved",
         ...(option === "deny" && feedback?.trim() ? { feedback: feedback.trim() } : {}),
       };
+      // Persist verdict for offline/session restore (last rejected → stay in plan).
+      recordPlanVerdict(sessionId, {
+        text: pending.planText?.trim() || "(plan)",
+        verdict: verdictFromPermissionOption(option, feedback),
+      });
     } else {
       const optionId = pending.optionIds[option];
       result = optionId

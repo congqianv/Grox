@@ -13,6 +13,7 @@ import {
 import type { Session, SessionBlock } from "../../bridge/types";
 import { useDesktop } from "../../state/store";
 import { useI18n } from "../../lib/i18n";
+import { isPrimerText } from "../../lib/planPrimer";
 import { Icon } from "../fx/Icon";
 import { BlackHole } from "../fx/BlackHole";
 import { AssistantMsg, SystemEvent, UserMsg } from "./blocks";
@@ -187,6 +188,8 @@ export function groupTurns(blocks: SessionBlock[]): Turn[] {
   const turns: Turn[] = [];
   let promptIndex = -1;
   for (const block of blocks) {
+    // Hide plan primers (host inject / legacy SuperGrok history).
+    if (block.type === "user" && isPrimerText(block.text)) continue;
     if (block.type === "user") {
       // Same-turn 插话: append, do not open a new turn / promptIndex.
       if (block.interjected && turns.length > 0) {
