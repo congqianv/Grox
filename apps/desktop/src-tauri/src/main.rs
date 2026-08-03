@@ -2535,6 +2535,8 @@ async fn terminate_process(mut process: AgentProcess) {
                 .status()
                 .await;
         }
+        // Fallback if taskkill is unavailable / failed — still reap the direct child.
+        let _ = process.child.kill().await;
     }
     #[cfg(not(windows))]
     {

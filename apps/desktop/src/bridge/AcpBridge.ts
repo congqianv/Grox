@@ -950,6 +950,8 @@ export class AcpBridge implements GrokBridge {
   private productGateFallbackDone = false;
   /** Sessions that already received GROX_PLAN_PRIMER this process lifetime. */
   private planPrimerSent = new Set<string>();
+  /** Operator entered plan while a turn was live — inject primer after idle. */
+  private planPrimerNeeded = new Set<string>();
   /** Child died again while crash-reconnect was still finishing success path. */
   private reconnectChildDied = false;
   /** When true, restartAgentInner must not steal `ready` from runCrashReconnect. */
@@ -2331,11 +2333,9 @@ export class AcpBridge implements GrokBridge {
           });
         }
         this.emit({ type: "mode_state", sessionId, mode });
-        if (mode === "plan") {
-          void this.ensurePlanPrimer(sessionId).catch((error) => {
-            console.warn("plan primer inject failed", error);
-          });
-        }
+        // Do NOT inject primer here: agent-driven mode flips often mid-turn, and
+        // session/prompt would race the live turn. Primer is host-initiated only
+        // (setSessionMode / applyPlanRestore / deferred after finishTurn).
         return;
       }
       case "tool_call":
@@ -2603,6 +2603,12 @@ export class AcpBridge implements GrokBridge {
     this.resetTurnRetryState(this.cursor(sessionId));
     if (usageValue) this.emitUsage(sessionId, usageValue);
     this.emit({ type: "status", sessionId, status: "idle" });
+    // Deferred plan primer (operator switched to plan mid-turn).
+    if (this.planPrimerNeeded.has(sessionId)) {
+      void this.ensurePlanPrimer(sessionId).catch((error) => {
+        console.warn("deferred plan primer inject failed", error);
+      });
+    }
   }
 
   /** Start a JSON-RPC request; resolve only after the line is written (not the result). */
@@ -3370,12 +3376,27 @@ export class AcpBridge implements GrokBridge {
 
   /**
    * Inject a hidden plan-mode primer once per session (not shown in UI).
-   * Uses session/prompt; user_message_chunk is filtered via isPrimerText.
+   * Uses session/prompt under silent stream so "ok" does not paint a bubble.
+   * Skips (and defers) when a live turn or permission gate is open.
    */
   private async ensurePlanPrimer(sessionId: string): Promise<void> {
-    if (this.planPrimerSent.has(sessionId)) return;
+    if (this.planPrimerSent.has(sessionId)) {
+      this.planPrimerNeeded.delete(sessionId);
+      return;
+    }
+    if (
+      this.primaryPromptSessions.has(sessionId) ||
+      (this.concurrentPromptCount.get(sessionId) ?? 0) > 0 ||
+      this.hasOpenInteraction(sessionId)
+    ) {
+      this.planPrimerNeeded.add(sessionId);
+      return;
+    }
+    this.planPrimerNeeded.delete(sessionId);
     this.planPrimerSent.add(sessionId);
     try {
+      // Silent filter drops stream paint for this session during inject.
+      await this.setSilentStream(true, sessionId);
       await this.requestRaw(
         ACP_METHODS.sessionPrompt,
         {
@@ -3387,7 +3408,10 @@ export class AcpBridge implements GrokBridge {
     } catch (error) {
       // Allow retry on next plan enter if inject failed.
       this.planPrimerSent.delete(sessionId);
+      this.planPrimerNeeded.add(sessionId);
       throw error;
+    } finally {
+      await this.setSilentStream(false, sessionId).catch(() => {});
     }
   }
 
