@@ -28,6 +28,7 @@ import {
   validateAttachmentSet,
 } from "../../lib/attachments";
 import { attachExplicitPromptImages } from "../../lib/pathAttachments";
+import { topPendingPermissionId } from "../../lib/sessionGate";
 import {
   elementContainsPoint,
   isNativeDragDropActive,
@@ -107,6 +108,7 @@ export function Composer() {
   const setAttachments = useDesktop((s) => s.setComposerAttachments);
   const stop = useDesktop((s) => s.stop);
   const compact = useDesktop((s) => s.compact);
+  const resolvePermission = useDesktop((s) => s.resolvePermission);
   const status = useDesktop((s) => (s.activeId ? s.sessions[s.activeId]?.status : null));
   const model = useDesktop((s) => s.model);
   const models = useDesktop((s) => s.models);
@@ -480,6 +482,24 @@ export function Composer() {
       if (e.key === "Escape") {
         setText("");
         return;
+      }
+    }
+
+    // Scheme A (Claude-like): while a tool/plan permission is open, Enter/Esc
+    // resolve the gate even when focus is still in the composer — do not send.
+    if (status === "awaiting_permission" && session && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      const pendingId = topPendingPermissionId(session);
+      if (pendingId) {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          resolvePermission(pendingId, "allow_once");
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          resolvePermission(pendingId, "deny");
+          return;
+        }
       }
     }
 
