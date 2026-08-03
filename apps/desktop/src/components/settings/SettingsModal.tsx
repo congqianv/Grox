@@ -3,6 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { bridge } from "../../bridge";
 import type { ConfigDocument, ProviderApiBackend, ProviderKind } from "../../bridge/types";
 import { EFFORTS } from "../../bridge/types";
+import {
+  isComputerUseOperatorEnabled,
+  setComputerUseHostEnvEnabled,
+  setComputerUseOperatorEnabled,
+} from "../../lib/computerUse";
 import { useDesktop } from "../../state/store";
 import { usePreferences } from "../../state/preferences";
 import { useI18n } from "../../lib/i18n";
@@ -181,12 +186,114 @@ function General() {
         {appUpdate.body.trim().slice(0, 1200)}
       </div>
     )}
-    <Row label={zh ? "Grok Build 运行时" : "Grok Build runtime"} hint={runtime?.path}><div className="flex items-center gap-2"><span className="chip">{runtimeSource}</span><ActionButton disabled={runtimeBusy} onClick={() => void refreshRuntime()}>{zh ? "重新检测" : "Detect"}</ActionButton>{runtime && runtime.source !== "override" && <ActionButton tone="accent" disabled={runtimeBusy} onClick={() => { setRuntimeError(""); void installOfficialRuntime().catch((cause) => setRuntimeError(cause instanceof Error ? cause.message : String(cause))); }}>{runtimeBusy ? (zh ? "安装中" : "Installing") : runtime.systemPath ? (zh ? "更新官方 CLI" : "Update official CLI") : (zh ? "安装官方 CLI" : "Install official CLI")}</ActionButton>}</div></Row>
+    <Row label={zh ? "Grok Build 运行时" : "Grok Build runtime"} hint={runtime?.path}><div className="flex items-center gap-2"><span className="chip">{runtimeSource}</span><ActionButton disabled={runtimeBusy} onClick={() => void refreshRuntime()}>{zh ? "重新检测" : "Detect"}</ActionButton>{runtime && runtime.source !== "override" && <ActionButton tone="accent" disabled={runtimeBusy} onClick={() => { setRuntimeError(""); void installOfficialRuntime().catch((cause) => setRuntimeError(cause instanceof Error ? cause.message : String(cause))); }}>{runtimeBusy ? (zh ? "打开安装说明" : "Open install docs") : runtime.systemPath ? (zh ? "打开官方安装说明" : "Open official install docs") : (zh ? "打开官方安装说明" : "Open official install docs")}</ActionButton>}</div></Row>
     {runtime && <Row label={zh ? "版本来源" : "Version provenance"} hint={zh ? "Lite 壳使用本机 Grok CLI；此处显示 CLI 版本与桌面壳提交。" : "Lite shell uses the system Grok CLI; shows CLI version and desktop shell commit."}><div className="max-w-[440px] space-y-1 text-right font-mono text-[9px] text-dim"><p className="truncate" title={runtime.version}>{runtime.version ?? (zh ? "无法读取 CLI 版本" : "CLI version unavailable")}</p><p className="truncate" title={runtime.groxCommit}>CLI · {runtime.source}　{zh ? "壳" : "SHELL"} · {runtime.groxCommit}</p></div></Row>}
     {runtimeError && <p className="mb-4 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{runtimeError}</p>}
     <Row label={zh ? "推理强度" : "Reasoning effort"}><div className="flex gap-1">{EFFORTS.map((item) => <button key={item} onClick={() => setEffort(item)} className={`h-7 rounded-[3px] border px-2 font-mono text-[9.5px] ${effort === item ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim"}`}>{item.toUpperCase()}</button>)}</div></Row>
-    <Row label={zh ? "权限模式" : "Permission mode"} hint={zh ? "Default 保留审批；Auto 交给 Agent 策略；Bypass 仅用于可信环境。" : "Default keeps approvals; Auto follows the Agent policy; use Bypass only in trusted environments."}><select value={permission} onChange={(event) => setPermission(event.target.value as typeof permission)} className="h-8 rounded-[4px] border border-line2 bg-void px-2 font-mono text-[9.5px] text-fg2"><option value="default">DEFAULT</option><option value="auto">AUTO</option><option value="bypass">BYPASS / YOLO</option></select></Row>
+    <Row label={zh ? "权限模式" : "Permission mode"} hint={zh ? "默认 Auto：按 Agent 策略少弹批。Default 每次工具都确认；Bypass 仅用于可信环境。" : "Default is Auto (fewer prompts). Default mode confirms every tool; Bypass is for trusted environments only."}><select value={permission} onChange={(event) => setPermission(event.target.value as typeof permission)} className="h-8 rounded-[4px] border border-line2 bg-void px-2 font-mono text-[9.5px] text-fg2"><option value="auto">AUTO（默认）</option><option value="default">DEFAULT</option><option value="bypass">BYPASS / YOLO</option></select></Row>
+    <SupportDiagnostics zh={zh} bridgeKind={bridgeKind} />
+    <ComputerUseOptIn zh={zh} />
   </div>;
+}
+
+/** Copy redacted support dump (no raw API keys / .env) to the clipboard. */
+function SupportDiagnostics({ zh, bridgeKind }: { zh: boolean; bridgeKind: string }) {
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const copy = () => {
+    if (bridgeKind !== "acp") {
+      setError(zh ? "仅 ACP 桌面壳支持导出诊断" : "Diagnostics export requires the ACP desktop shell");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setNotice("");
+    void invoke<string>("export_support_diagnostics")
+      .then(async (dump) => {
+        try {
+          await navigator.clipboard.writeText(dump);
+          setNotice(zh ? "已复制脱敏诊断（不含 API 密钥）" : "Redacted diagnostics copied (no API keys)");
+        } catch {
+          // Clipboard may be blocked; still surface the dump length so operator knows it ran.
+          setNotice(
+            zh
+              ? `已生成诊断（${dump.length} 字符），剪贴板不可用时请从控制台粘贴`
+              : `Diagnostics ready (${dump.length} chars); clipboard unavailable`,
+          );
+          console.info("[grox] support diagnostics\n", dump);
+        }
+      })
+      .catch((cause) => {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      })
+      .finally(() => setBusy(false));
+  };
+  return (
+    <>
+      <Row
+        label={zh ? "支持诊断" : "Support diagnostics"}
+        hint={zh
+          ? "导出版本、供应商摘要（密钥已脱敏）与 last-exit 尾部。不含 ~/.grok/.env 明文。"
+          : "Export version, redacted provider summary, and last-exit tail. Never includes ~/.grok/.env secrets."}
+      >
+        <ActionButton disabled={busy || bridgeKind !== "acp"} onClick={copy}>
+          {busy ? (zh ? "导出中…" : "Exporting…") : (zh ? "复制诊断" : "Copy diagnostics")}
+        </ActionButton>
+      </Row>
+      {notice && <p className="mb-3 rounded-[4px] border border-line2 bg-raise px-3 py-2 text-[10px] text-dim">{notice}</p>}
+      {error && <p className="mb-3 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{error}</p>}
+    </>
+  );
+}
+
+function ComputerUseOptIn({ zh }: { zh: boolean }) {
+  const [enabled, setEnabled] = useState(() => isComputerUseOperatorEnabled());
+  const [envForced, setEnvForced] = useState(false);
+  useEffect(() => {
+    // Align checkbox with host GROX_COMPUTER_USE when Settings opens (R4A-CU-03).
+    void invoke<boolean>("computer_use_env_enabled_cmd")
+      .then((on) => {
+        setComputerUseHostEnvEnabled(on === true);
+        setEnvForced(on === true);
+        setEnabled(isComputerUseOperatorEnabled());
+      })
+      .catch(() => {
+        /* non-tauri / older shell */
+      });
+  }, []);
+  return (
+    <Row
+      label={zh ? "允许 Computer Use" : "Allow Computer Use"}
+      hint={
+        envForced
+          ? zh
+            ? "已由环境变量 GROX_COMPUTER_USE=1 启用（高级）。关闭设置开关仍会吊销本机 MCP，但 env 在下次启动仍会打开门控。"
+            : "Enabled by host env GROX_COMPUTER_USE=1 (advanced). Turning the switch off revokes MCP now; env re-opens the gate on next ensure."
+          : zh
+            ? "默认关闭。开启后挂载桌面控制 MCP，并对 Computer 工具自动批准（不必再点「仅本次允许」）。其它工具仍受上方「权限模式」约束。关闭会立即吊销本机 MCP。"
+            : "Off by default. When on, attaches the desktop MCP and auto-approves Computer tools (no extra Allow). Other tools still follow Permission mode above. Off revokes local MCP."
+      }
+    >
+      <label className="flex items-center gap-2 font-mono text-[10px] text-fg2">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(event) => {
+            const next = event.target.checked;
+            setEnabled(next);
+            setComputerUseOperatorEnabled(next);
+            // R4A-CU-01: disable-after-attach must not leave control live.
+            if (!next) void bridge.revokeComputerUseCapability?.().catch(() => {});
+          }}
+        />
+        {enabled ? (zh ? "已启用" : "Enabled") : zh ? "已关闭" : "Disabled"}
+        {envForced ? (
+          <span className="text-dim">{zh ? "· ENV" : "· ENV"}</span>
+        ) : null}
+      </label>
+    </Row>
+  );
 }
 
 function Account() {

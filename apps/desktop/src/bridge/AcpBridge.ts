@@ -3,43 +3,56 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { GrokBridge } from "./GrokBridge";
-import { MODELS } from "./types";
-import type {
-  AccountInfo,
-  AgentMode,
-  AuthState,
-  BillingInfo,
-  BridgeEvent,
-  DiffHunk,
-  PermissionOption,
-  PermissionMode,
-  PlanStep,
-  PromptOptions,
-  QuestionItem,
-  QuestionResponse,
-  ModelState,
-  Session,
-  SessionBlock,
-  SessionMeta,
-  TerminalIO,
-  ToolCall,
-  ToolKind,
-  ToolStatus,
-  Usage,
-  ConfigDocument,
-  ProviderConfig,
-  ProviderProfileSummary,
-  ProviderProfilesState,
-  ProviderStatus,
-  PromptAttachment,
-  SaveProviderProfile,
-  RewindMode,
-  RewindPoint,
-  RewindResult,
-  InterjectResult,
-  QueueOperationReceipt,
-  PromptQueueEntry,
+import {
+  MODELS,
+  readStoredPermissionMode,
+  type AccountInfo,
+  type AgentMode,
+  type AuthState,
+  type BillingInfo,
+  type BridgeEvent,
+  type DiffHunk,
+  type PermissionOption,
+  type PermissionMode,
+  type PlanStep,
+  type PromptOptions,
+  type QuestionItem,
+  type QuestionResponse,
+  type ModelState,
+  type Session,
+  type SessionBlock,
+  type SessionMeta,
+  type TerminalIO,
+  type ToolCall,
+  type ToolKind,
+  type ToolStatus,
+  type Usage,
+  type ConfigDocument,
+  type ProviderConfig,
+  type ProviderProfileSummary,
+  type ProviderProfilesState,
+  type ProviderStatus,
+  type PromptAttachment,
+  type SaveProviderProfile,
+  type RewindMode,
+  type RewindPoint,
+  type RewindResult,
+  type InterjectResult,
+  type QueueOperationReceipt,
+  type PromptQueueEntry,
 } from "./types";
+import { isAllowedOAuthUrl } from "../lib/oauthUrl";
+import {
+  COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
+  computerLeaseIfAttached,
+  computerToolNameFromPermissionTool,
+  decideComputerAttachForPrompt,
+  hasActiveComputerLease,
+  isComputerUseMcpTool,
+  isComputerUseOperatorEnabled,
+  setComputerUseHostEnvEnabled,
+} from "../lib/computerUse";
+import { shouldDropSilentInbound } from "../lib/silentAcp";
 
 export const ACP_METHODS = {
   initialize: "initialize",
@@ -795,6 +808,33 @@ export class AcpBridge implements GrokBridge {
    * live stream, and avoids stacking multi-minute rehydrates on one stdio child.
    */
   private channelTail: Promise<unknown> = Promise.resolve();
+  /** Serialize restartAgent so double activate cannot spawn two children. */
+  private restartTail: Promise<void> = Promise.resolve();
+  /** True while we intentionally replace the agent (suppress stale exit noise). */
+  private suppressExitHandling = false;
+  private reconnectTimer: number | undefined;
+  /** Resolve the in-flight reconnect delay when cancelled (provider switch etc.). */
+  private reconnectDelayResolve: (() => void) | null = null;
+  /** True while crash auto-reconnect owns `ready` (prompt/drain must wait). */
+  private crashReconnectInFlight = false;
+  /**
+   * Bumped on intentional restart so an in-flight runCrashReconnect aborts
+   * instead of racing ready or sticking crashReconnectInFlight.
+   */
+  private reconnectEpoch = 0;
+  /** Child died again while crash-reconnect was still finishing success path. */
+  private reconnectChildDied = false;
+  /** When true, restartAgentInner must not steal `ready` from runCrashReconnect. */
+  private restartFromCrashReconnect = false;
+  /**
+   * R15: wall-clock of successful crash-reconnect publishes (sliding window).
+   * Too many flaps → cool down auto-reconnect so we don't spin forever.
+   */
+  private reconnectSuccessTimes: number[] = [];
+  private reconnectCoolingUntil = 0;
+  private static readonly RECONNECT_FLAP_WINDOW_MS = 60_000;
+  private static readonly RECONNECT_FLAP_MAX = 4;
+  private static readonly RECONNECT_COOLDOWN_MS = 120_000;
   /**
    * Scheme C + visit memory:
    * 1) Always prefer full-load of the active mission if unbound.
@@ -824,12 +864,7 @@ export class AcpBridge implements GrokBridge {
   private authMethodId: string | undefined;
   private authState: AuthState = { required: false, inProgress: false };
   private modelState: ModelState = { models: MODELS, currentId: MODELS[0].id };
-  private permissionMode: PermissionMode =
-    localStorage.getItem("grok.permissionMode") === "auto"
-      ? "auto"
-      : localStorage.getItem("grok.permissionMode") === "bypass"
-        ? "bypass"
-        : "default";
+  private permissionMode: PermissionMode = readStoredPermissionMode();
   private workspace = "";
   private computerLeases = new Map<string, string>();
   private activeComputerSessions = new Set<string>();
@@ -1241,16 +1276,14 @@ export class AcpBridge implements GrokBridge {
   private inboundDraining = false;
 
   private enqueueInbound(line: string) {
-    // Belt-and-braces if Rust silent filter is off or a line slipped through.
-    if (this.silentReplaying.size > 0) {
-      if (
-        line.includes("sessionUpdate") ||
-        line.includes("agent_thought_chunk") ||
-        line.includes('"session/update"') ||
-        line.includes("x.ai/session/update")
-      ) {
-        return;
-      }
+    // Belt-and-braces: only drop history floods for sessions currently silent-binding.
+    if (shouldDropSilentInbound(line, this.silentReplaying)) {
+      return;
+    }
+    // Bound memory if a non-silent flood arrives (broken filter / huge replay).
+    const MAX_INBOUND_LINES = 20_000;
+    if (this.inboundQueue.length >= MAX_INBOUND_LINES) {
+      this.inboundQueue.splice(0, Math.floor(MAX_INBOUND_LINES / 4));
     }
     this.inboundQueue.push(line);
     if (this.inboundDraining) return;
@@ -1271,9 +1304,16 @@ export class AcpBridge implements GrokBridge {
     window.requestAnimationFrame(pump);
   }
 
-  private async setSilentStream(silent: boolean): Promise<void> {
+  /**
+   * Per-session silent history filter. Pass `sessionId` when enabling/disabling
+   * bind for one mission; omit sessionId with silent=false to clear all.
+   */
+  private async setSilentStream(silent: boolean, sessionId?: string): Promise<void> {
     try {
-      await invoke("acp_set_silent_stream", { silent });
+      await invoke("acp_set_silent_stream", {
+        silent,
+        sessionId: sessionId ?? null,
+      });
     } catch {
       /* older shells without the command — JS drop still applies */
     }
@@ -1305,12 +1345,21 @@ export class AcpBridge implements GrokBridge {
     this.backgroundLoadInFlight = null;
     this.backgroundLoadRunning = false;
     this.backgroundLoadFailed.clear();
+    // Cut the exclusive channel so a hung load cannot block the next agent life.
+    this.channelTail = Promise.resolve();
+    // Stale Computer leases cannot drive desktop after the stdio child is gone.
+    this.computerLeases.clear();
+    this.activeComputerSessions.clear();
+    this.activeComputerToolCalls.clear();
+    void invoke("computer_revoke_http_auth").catch(() => {});
     void this.setSilentStream(false);
   }
 
   private async connect(): Promise<void> {
     const environment = await invoke<DesktopEnvironment>("desktop_environment");
     this.workspace = localStorage.getItem("grok.workspace") ?? environment.defaultWorkspace;
+    // Align FE opt-in with host GROX_COMPUTER_USE (R4A-CU-03).
+    await this.refreshComputerUseHostEnv();
 
     this.unlisten.push(
       await listen<string>("acp-event", ({ payload }) => this.enqueueInbound(payload)),
@@ -1332,7 +1381,7 @@ export class AcpBridge implements GrokBridge {
           return;
         }
         for (const sessionId of leaseSessions) {
-          void this.emergencyStopComputer(sessionId);
+          void this.emergencyStopComputer(sessionId).catch(() => {});
         }
       }),
     );
@@ -1344,41 +1393,120 @@ export class AcpBridge implements GrokBridge {
     // Diagnostics belong to one concrete child process. Keeping stderr from a
     // process replaced during a Tauri hot reload produces misleading errors.
     this.diagnostics = [];
-    await invoke("acp_spawn", { cwd: this.workspace });
-    const response = await this.requestRaw(ACP_METHODS.initialize, {
-      protocolVersion: 1,
-      clientCapabilities: {
-        fs: { readTextFile: false, writeTextFile: false },
-        terminal: false,
-      },
-      clientInfo: { name: "grox-desktop", title: "Grox Desktop", version: "0.1.0" },
-      _meta: {
-        clientIdentifier: "grok-desktop",
-        clientType: "desktop",
-      },
-    }, 15_000);
+    try {
+      await Promise.race([
+        invoke("acp_spawn", { cwd: this.workspace }),
+        new Promise<never>((_, reject) => {
+          window.setTimeout(
+            () => reject(new Error("启动 Grok Agent 超时（30 秒）")),
+            30_000,
+          );
+        }),
+      ]);
+    } catch (error) {
+      const detail = errorText(error);
+      throw new Error(
+        `无法启动 Grok Agent：${detail}。请确认 Grok Build CLI 已安装，或通过 GROK_DESKTOP_CLI 指定可执行文件。`,
+      );
+    }
+    let response: unknown;
+    try {
+      response = await this.requestRaw(
+        ACP_METHODS.initialize,
+        {
+          protocolVersion: 1,
+          clientCapabilities: {
+            fs: { readTextFile: false, writeTextFile: false },
+            terminal: false,
+          },
+          clientInfo: { name: "grox-desktop", title: "Grox Desktop", version: "0.1.0" },
+          _meta: {
+            clientIdentifier: "grok-desktop",
+            clientType: "desktop",
+          },
+        },
+        20_000,
+      );
+    } catch (error) {
+      throw new Error(
+        `Grok Agent 初始化失败：${errorText(error)}。CLI 已启动但未在 20 秒内完成握手。`,
+      );
+    }
     this.captureModelState(response);
     await this.configureAuthentication(response);
   }
 
   private async restartAgent(): Promise<void> {
-    this.flushStreamAppends();
-    this.flushToolPatches();
-    const error = new Error("模型服务已切换，请重新发送尚未完成的请求");
-    for (const request of this.pending.values()) {
-      if (request.timeoutId !== undefined) window.clearTimeout(request.timeoutId);
-      request.reject(error);
+    // Queue restarts: concurrent activate/logout must not interleave spawn.
+    const run = this.restartTail.then(
+      () => this.restartAgentInner(),
+      () => this.restartAgentInner(),
+    );
+    this.restartTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** Wake any crash-reconnect backoff waiter and drop the timer. */
+  private cancelReconnectDelay(): void {
+    if (this.reconnectTimer !== undefined) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
     }
-    this.pending.clear();
-    this.interactions.clear();
-    this.cursors.clear();
-    this.sessionOptions.clear();
-    this.knownSessions.clear();
-    this.authMethodId = undefined;
-    this.modelState = { models: MODELS, currentId: MODELS[0].id };
-    const next = this.initializeAgent();
-    this.ready = next;
-    await next;
+    if (this.reconnectDelayResolve) {
+      const resolve = this.reconnectDelayResolve;
+      this.reconnectDelayResolve = null;
+      resolve();
+    }
+  }
+
+  private async restartAgentInner(): Promise<void> {
+    const fromCrash = this.restartFromCrashReconnect;
+    this.suppressExitHandling = true;
+    // Intentional restart (provider switch / logout) aborts crash-reconnect ownership.
+    if (!fromCrash) {
+      this.reconnectEpoch += 1;
+      this.crashReconnectInFlight = false;
+      this.reconnectChildDied = false;
+    }
+    this.cancelReconnectDelay();
+    try {
+      this.flushStreamAppends();
+      this.flushToolPatches();
+      const error = new Error("模型服务已切换，请重新发送尚未完成的请求");
+      for (const request of this.pending.values()) {
+        if (request.timeoutId !== undefined) window.clearTimeout(request.timeoutId);
+        request.reject(error);
+      }
+      this.pending.clear();
+      this.interactions.clear();
+      this.cursors.clear();
+      this.sessionOptions.clear();
+      // Match agent-exit cleanup so silent bind / computer leases cannot leak.
+      this.resetBindStateAfterAgentExit();
+      this.computerLeases.clear();
+      this.activeComputerSessions.clear();
+      this.activeComputerToolCalls.clear();
+      this.channelTail = Promise.resolve();
+      this.authMethodId = undefined;
+      this.modelState = { models: MODELS, currentId: MODELS[0].id };
+      const next = this.initializeAgent();
+      // Crash-reconnect owns `ready` for the full attempt budget — do not overwrite
+      // with a rejected init mid-retry (R14.1 B1).
+      if (!fromCrash) {
+        this.ready = next;
+      }
+      await next;
+      // R14.2: never clear childDied on crash spawns — flag is owned by
+      // runCrashReconnect (infinite-loop fix when child flaps after handshake).
+      if (!fromCrash) {
+        this.reconnectChildDied = false;
+      }
+    } finally {
+      this.suppressExitHandling = false;
+    }
   }
 
   private async configureAuthentication(responseValue: unknown) {
@@ -1433,9 +1561,35 @@ export class AcpBridge implements GrokBridge {
   }
 
   private onExit(payload: ExitPayload) {
-    if (payload.reason === "killed") return;
+    // Exit from a process we are intentionally replacing (restart/spawn).
+    if (this.suppressExitHandling) {
+      // Child died under suppress — if crash-reconnect just spawned, force another try.
+      if (this.crashReconnectInFlight && payload.reason !== "killed") {
+        this.reconnectChildDied = true;
+      }
+      return;
+    }
     this.flushStreamAppends();
     this.flushToolPatches();
+    // Drop permission/question RPCs immediately so UI cannot sendRaw to a corpse.
+    this.interactions.clear();
+    // Intentional stop (acp_kill) still must clear bind/lease state.
+    if (payload.reason === "killed") {
+      for (const request of this.pending.values()) {
+        if (request.timeoutId !== undefined) window.clearTimeout(request.timeoutId);
+        request.reject(new Error("Grok Agent 已停止"));
+      }
+      this.pending.clear();
+      this.resetBindStateAfterAgentExit();
+      this.reconnectEpoch += 1;
+      this.crashReconnectInFlight = false;
+      this.cancelReconnectDelay();
+      // Park ready on a rejected promise so send/drain cannot talk to a dead child.
+      const stopped = new Error("Grok Agent 已停止");
+      this.ready = Promise.reject(stopped);
+      void this.ready.catch(() => undefined);
+      return;
+    }
     const diagnostic = this.diagnostics
       .filter((line) => {
         const value = line.trim();
@@ -1461,6 +1615,166 @@ export class AcpBridge implements GrokBridge {
     for (const sessionId of bound) {
       this.emit({ type: "error", sessionId, message });
     }
+    // Second death while reconnect is already running: force another attempt.
+    if (this.crashReconnectInFlight) {
+      this.reconnectChildDied = true;
+      return;
+    }
+    this.beginCrashReconnect(message);
+  }
+
+  /** Start (or re-enter) crash auto-reconnect ownership of `ready`. */
+  private beginCrashReconnect(message: string): void {
+    const now = Date.now();
+    if (now < this.reconnectCoolingUntil) {
+      const secs = Math.ceil((this.reconnectCoolingUntil - now) / 1000);
+      const coolMsg = `${message}（Agent 短时内多次崩溃，已暂停自动重连 ${secs}s，请检查 Grok CLI 或重启 Grox）`;
+      this.setAuthState({
+        required: this.authState.required,
+        inProgress: false,
+        error: coolMsg,
+      });
+      const fail = new Error(coolMsg);
+      this.ready = Promise.reject(fail);
+      void this.ready.catch(() => undefined);
+      return;
+    }
+    // Park `ready` on the reconnect promise so queue drain / prompt cannot race
+    // a dead stdio child while the 800ms backoff runs (R12 / R14.1 / R15).
+    this.crashReconnectInFlight = true;
+    this.reconnectChildDied = false;
+    const epoch = this.reconnectEpoch;
+    this.ready = this.runCrashReconnect(message, epoch).finally(() => {
+      if (this.reconnectEpoch !== epoch) return;
+      this.crashReconnectInFlight = false;
+      // Death after success publish but before finally: re-enter recovery (R15).
+      if (this.reconnectChildDied) {
+        this.reconnectChildDied = false;
+        queueMicrotask(() => {
+          if (this.crashReconnectInFlight || this.suppressExitHandling) return;
+          this.beginCrashReconnect("Agent 在重连成功后再次退出");
+        });
+      }
+    });
+    void this.ready.catch(() => undefined);
+  }
+
+  /**
+   * Auto-reconnect after unexpected agent exit. Owns `this.ready` for the full
+   * attempt budget so concurrent prompt/drain await the live child.
+   */
+  private async runCrashReconnect(lastMessage: string, epoch: number): Promise<void> {
+    let lastError = lastMessage;
+    // Local budget — independent of restartAgentInner (must not be zeroed mid-loop).
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      if (this.reconnectEpoch !== epoch) {
+        // Intentional restart took over ready — exit quietly.
+        return;
+      }
+      const delayMs = 800 * attempt;
+      this.setAuthState({
+        ...this.authState,
+        inProgress: true,
+        error: `Agent 异常退出，正在自动重连（${attempt}/2）…`,
+      });
+      await new Promise<void>((resolve) => {
+        this.reconnectDelayResolve = () => {
+          this.reconnectDelayResolve = null;
+          resolve();
+        };
+        this.reconnectTimer = window.setTimeout(() => {
+          this.reconnectTimer = undefined;
+          const done = this.reconnectDelayResolve;
+          this.reconnectDelayResolve = null;
+          done?.();
+        }, delayMs);
+      });
+      if (this.reconnectEpoch !== epoch) {
+        return;
+      }
+      try {
+        this.reconnectChildDied = false;
+        this.restartFromCrashReconnect = true;
+        try {
+          await this.restartAgent();
+        } finally {
+          this.restartFromCrashReconnect = false;
+        }
+        // R14.2: re-check epoch + liveness immediately before publishing ready
+        // (intentional restart / second death can land during await).
+        if (this.reconnectEpoch !== epoch) {
+          return;
+        }
+        if (this.reconnectChildDied) {
+          lastError = "Agent 在重连后再次退出";
+          this.reconnectChildDied = false;
+          continue;
+        }
+        // Final TOCTOU belt: still the same epoch and no late death flag.
+        if (this.reconnectEpoch !== epoch) {
+          return;
+        }
+        if (this.reconnectChildDied) {
+          lastError = "Agent 在重连后再次退出";
+          this.reconnectChildDied = false;
+          continue;
+        }
+        this.setAuthState({
+          ...this.authState,
+          error: undefined,
+          inProgress: false,
+        });
+        // Only claim ready if we still own the reconnect epoch.
+        if (this.reconnectEpoch !== epoch) {
+          return;
+        }
+        this.ready = Promise.resolve();
+        // R15 flap guard: too many successful reconnects in one minute → cooldown.
+        const now = Date.now();
+        this.reconnectSuccessTimes = this.reconnectSuccessTimes.filter(
+          (t) => now - t < AcpBridge.RECONNECT_FLAP_WINDOW_MS,
+        );
+        this.reconnectSuccessTimes.push(now);
+        if (this.reconnectSuccessTimes.length >= AcpBridge.RECONNECT_FLAP_MAX) {
+          this.reconnectCoolingUntil = now + AcpBridge.RECONNECT_COOLDOWN_MS;
+          this.reconnectSuccessTimes = [];
+        }
+        // Rebind active mission in the background so the next send is cheap.
+        const active = this.activeSessionId();
+        if (active) {
+          this.enqueueBackgroundLoad(active);
+          this.emit({
+            type: "block_add",
+            sessionId: active,
+            block: {
+              type: "system",
+              id: uid(),
+              text: "Agent 已自动重连；可继续对话（首次发送会静默绑定上下文）",
+              ts: Date.now(),
+              kind: "info",
+            },
+          });
+        }
+        // Let the store re-drain local queues that parked while ready was offline.
+        this.emit({ type: "agent_reconnected" });
+        return;
+      } catch (error) {
+        lastError = errorText(error);
+      }
+    }
+    if (this.reconnectEpoch !== epoch) {
+      return;
+    }
+    const finalMessage = `${lastError}（已自动重连 2 次仍失败，请重启 Grox 或检查 Grok CLI）`;
+    this.setAuthState({
+      required: this.authState.required,
+      inProgress: false,
+      error: finalMessage,
+    });
+    const fail = new Error(finalMessage);
+    this.ready = Promise.reject(fail);
+    void this.ready.catch(() => undefined);
+    throw fail;
   }
 
   private onLine(line: string) {
@@ -2004,23 +2318,75 @@ export class AcpBridge implements GrokBridge {
       const option = record(rawOption) ?? {};
       const optionId = string(option.optionId);
       if (!optionId) continue;
-      switch ((string(option.kind) ?? string(option.name) ?? "").toLowerCase()) {
-        case "allow_once":
-          optionIds.allow_once = optionId;
-          break;
-        case "allow_always":
-          optionIds.allow_always = optionId;
-          break;
-        case "reject_once":
-        case "reject_always":
-        case "deny":
-          optionIds.deny ??= optionId;
-          break;
+      const kindRaw = (
+        string(option.kind) ??
+        string(option.name) ??
+        string(option.label) ??
+        optionId
+      ).toLowerCase();
+      if (
+        kindRaw === "allow_once" ||
+        kindRaw === "allow-once" ||
+        kindRaw === "allowonce" ||
+        (kindRaw.includes("allow") && kindRaw.includes("once") && !kindRaw.includes("always"))
+      ) {
+        optionIds.allow_once = optionId;
+      } else if (
+        kindRaw === "allow_always" ||
+        kindRaw === "allow-always" ||
+        kindRaw === "allowalways" ||
+        kindRaw === "allow_all" ||
+        (kindRaw.includes("allow") && kindRaw.includes("always"))
+      ) {
+        optionIds.allow_always = optionId;
+      } else if (
+        kindRaw === "reject_once" ||
+        kindRaw === "reject_always" ||
+        kindRaw === "deny" ||
+        kindRaw.includes("reject") ||
+        kindRaw.includes("deny")
+      ) {
+        optionIds.deny ??= optionId;
+      } else if (kindRaw.includes("allow") && !optionIds.allow_once) {
+        // CLI variants that only expose a generic "allow" — treat as once.
+        optionIds.allow_once = optionId;
       }
     }
     const options = (["allow_once", "allow_always", "deny"] as PermissionOption[]).filter(
       (option) => optionIds[option] !== undefined || option === "deny",
     );
+
+    // Settings 「允许 Computer Use」 already authorizes the desktop harness.
+    // Under DEFAULT permission mode the CLI still raises session/request_permission
+    // for every MCP tool — auto-select allow so the operator is not double-gated.
+    const toolName = computerToolNameFromPermissionTool({
+      title: tool.title,
+      kind: tool.kind,
+      name: tool.name,
+      toolName: tool.toolName ?? tool.tool_name,
+      rawInput: tool.rawInput ?? tool.raw_input ?? params.rawInput,
+    });
+    // Auto-select when product mode is Auto/Bypass (CLI may still raise
+    // request_permission — FE must not stall the turn), or when CU opt-in
+    // already authorized the desktop harness for grok_desktop_computer tools.
+    const modeAuto =
+      this.permissionMode === "auto" || this.permissionMode === "bypass";
+    const cuAuto =
+      isComputerUseOperatorEnabled() && isComputerUseMcpTool(toolName);
+    if (modeAuto || cuAuto) {
+      const autoOptionId = optionIds.allow_always ?? optionIds.allow_once;
+      if (autoOptionId) {
+        void this.sendRaw({
+          jsonrpc: "2.0",
+          id: rpcId,
+          result: { outcome: { outcome: "selected", optionId: autoOptionId } },
+        }).catch((error) => {
+          this.emit({ type: "error", sessionId, message: errorText(error) });
+        });
+        return;
+      }
+    }
+
     this.interactions.set(blockId, {
       rpcId,
       sessionId,
@@ -2297,6 +2663,9 @@ export class AcpBridge implements GrokBridge {
         authUrl = string(urlResponse?.auth_url) ?? string(urlResponse?.authUrl);
       }
       if (!authUrl) throw new Error("Grok Agent 未返回登录链接，请重试");
+      if (!isAllowedOAuthUrl(authUrl)) {
+        throw new Error("登录链接域名不受信任，已拒绝打开浏览器");
+      }
       await invoke("open_external", { url: authUrl });
       const authResult = await auth;
       if (authResult.error) throw authResult.error;
@@ -2461,10 +2830,11 @@ export class AcpBridge implements GrokBridge {
     return sessions;
   }
 
-  async newSession(cwd: string): Promise<void> {
+  async newSession(cwd: string): Promise<string> {
     const metaRequest = await this.sessionMeta(cwd);
     const preferredModel = localStorage.getItem("grok.model")?.trim();
-    const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+    // Soft-fail when CU opt-in is off: empty MCP/plugin lists, session still creates.
+    const computer = await this.invokeComputerSessionExtensions();
     let responseValue: unknown;
     let attachedComputer = computer.mcpServers.length > 0 || computer.pluginDirs.length > 0;
     try {
@@ -2499,7 +2869,9 @@ export class AcpBridge implements GrokBridge {
     const response = record(responseValue);
     const sessionId = string(response?.sessionId);
     if (!sessionId) throw new Error("session/new 未返回 sessionId");
-    if (attachedComputer) this.computerLeases.set(sessionId, computer.leaseId);
+    // Soft-fail CU returns empty MCP — only store a real lease when attached.
+    const newLease = attachedComputer ? computerLeaseIfAttached(computer) : null;
+    if (newLease) this.computerLeases.set(sessionId, newLease);
     this.captureModelState(response);
     const detail = record(record(response?._meta)?.["x.ai/sessionDetail"]);
     const now = Date.now();
@@ -2516,6 +2888,7 @@ export class AcpBridge implements GrokBridge {
     this.cursors.set(sessionId, { toolBlocks: new Map() });
     this.usage.set(sessionId, { ...EMPTY_USAGE });
     this.emit({ type: "session_ready", session: emptySession(meta) });
+    return sessionId;
   }
 
   async loadSession(
@@ -2557,7 +2930,7 @@ export class AcpBridge implements GrokBridge {
     this.replaying.set(id, emptySession(meta));
     if (silentBind) {
       this.silentReplaying.add(id);
-      await this.setSilentStream(true);
+      await this.setSilentStream(true, id);
     } else if (!background) {
       this.progressiveLoad.add(id);
     }
@@ -2570,7 +2943,7 @@ export class AcpBridge implements GrokBridge {
       const attachComputer = !silentBind && !background;
       let computer: ComputerSessionExtensions | null = null;
       if (attachComputer) {
-        computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+        computer = await this.invokeComputerSessionExtensions();
       }
       // Large sessions can take several minutes for the agent to rehydrate.
       let response: unknown;
@@ -2617,17 +2990,22 @@ export class AcpBridge implements GrokBridge {
             mcpServers: [],
             _meta: metaRequest,
           },
-          silentBind ? 10 * 60_000 : 2 * 60_000,
+          // Silent first-send bind: 5 min cap (was 10) so hung loads surface sooner;
+          // large transcripts still fit; store restores draft on timeout.
+          silentBind ? 5 * 60_000 : 2 * 60_000,
         );
       }
-      if (computer) {
+      // Soft-fail CU (opt-in off) returns non-null computer with empty lists —
+      // must NOT write computerLeases or ensureComputerAttachedForPrompt short-circuits.
+      const loadLease = computerLeaseIfAttached(computer);
+      if (loadLease) {
         const previousLease = this.computerLeases.get(id);
-        if (previousLease && previousLease !== computer.leaseId) {
+        if (previousLease && previousLease !== loadLease) {
           await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(
             () => {},
           );
         }
-        this.computerLeases.set(id, computer.leaseId);
+        this.computerLeases.set(id, loadLease);
       }
       this.flushStreamAppends(id);
       this.flushToolPatches(id);
@@ -2641,7 +3019,7 @@ export class AcpBridge implements GrokBridge {
       this.replaying.delete(id);
       this.silentReplaying.delete(id);
       this.knownSessions.add(id);
-      await this.setSilentStream(this.silentReplaying.size > 0);
+      await this.setSilentStream(false, id);
 
       if (silentBind) {
         // Bound for prompt; do not overwrite offline disk history with empty replay.
@@ -2665,7 +3043,7 @@ export class AcpBridge implements GrokBridge {
       this.clearProgressiveLoad(id);
       this.replaying.delete(id);
       this.silentReplaying.delete(id);
-      await this.setSilentStream(this.silentReplaying.size > 0);
+      await this.setSilentStream(false, id);
       throw error;
     }
   }
@@ -2674,7 +3052,23 @@ export class AcpBridge implements GrokBridge {
     await this.ready;
     // Do not optimistically mark bound — only session/new or successful session/load.
     const trimmed = text.trim();
-    await this.ensureComputerAttachedForPrompt(sessionId, trimmed);
+    // Computer attach must be channel-serialized (silent filter is session-scoped).
+    // The interject RPC itself must NOT wait behind an in-flight session/prompt
+    // (that would block mid-turn 插话 until the turn ends — R3 regression).
+    // Always enter ensure on Computer intent — even with an existing lease —
+    // so opt-in OFF can revoke stale MCP (R4A-CU-01). Refuse aborts the turn (CU-02).
+    if (this.promptRequestsComputer(trimmed)) {
+      const cu = await this.runOnChannel(() =>
+        this.ensureComputerAttachedForPrompt(sessionId, trimmed),
+      );
+      if (cu === "refused") {
+        return {
+          state: "refused",
+          message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
+          fallback: false,
+        };
+      }
+    }
     const interjectionId = crypto.randomUUID();
     const content = promptContent(trimmed, options.attachments ?? []);
     try {
@@ -2738,26 +3132,32 @@ export class AcpBridge implements GrokBridge {
     const sendNow = queueOptions.sendNow === true;
     const content = promptContent(trimmed, options.attachments ?? []);
 
-    // Concurrent session/prompt with queue meta — CLI owns execution when supported.
-    void this.requestRaw(
-      ACP_METHODS.sessionPrompt,
-      {
-        sessionId,
-        prompt: content,
-        _meta: {
-          promptId,
-          sendNow,
-          clientIdentifier: "grox-desktop",
-        },
-      },
-      1_800_000,
-    ).catch((error) => {
+    // Must not race silent bind: serialize behind the same channel as load/prompt.
+    // Await the wire write so callers keep `source: local` on failure (R7).
+    try {
+      await this.runOnChannel(async () => {
+        await this.requestRaw(
+          ACP_METHODS.sessionPrompt,
+          {
+            sessionId,
+            prompt: content,
+            _meta: {
+              promptId,
+              sendNow,
+              clientIdentifier: "grox-desktop",
+            },
+          },
+          1_800_000,
+        );
+      });
+    } catch (error) {
       this.emit({
         type: "error",
         sessionId,
         message: `队列消息失败：${errorText(error)}`,
       });
-    });
+      throw error instanceof Error ? error : new Error(errorText(error));
+    }
 
     return {
       operationId: uid(),
@@ -2848,7 +3248,12 @@ export class AcpBridge implements GrokBridge {
     try {
       // Silent-bound sessions skip Computer MCP at load time; attach once when
       // the operator's prompt explicitly needs desktop control.
-      await this.ensureComputerAttachedForPrompt(sessionId, text);
+      // Refuse (opt-in off) aborts the turn — do not session/prompt (R4A-CU-02).
+      const cu = await this.ensureComputerAttachedForPrompt(sessionId, text);
+      if (cu === "refused") {
+        // Throw so store can restore draft + pop optimistic bubble (busy-queue parity).
+        throw new Error(COMPUTER_USE_OPT_IN_REFUSE_MESSAGE);
+      }
       const previous = this.sessionOptions.get(sessionId);
       if (!previous || previous.model !== options.model || previous.effort !== options.effort) {
         await this.requestRaw(ACP_METHODS.sessionSetModel, {
@@ -2879,7 +3284,16 @@ export class AcpBridge implements GrokBridge {
       if (promptUsage) this.emitUsage(sessionId, promptUsage);
       await this.refreshSessionInfo(sessionId);
     } catch (error) {
-      this.emit({ type: "error", sessionId, message: errorText(error) });
+      const detail = errorText(error);
+      this.emit({ type: "error", sessionId, message: detail });
+      // Propagate CU refuse so the store restores composer draft + pops the
+      // optimistic user bubble (mirrors busy-queue CU refuse path).
+      if (
+        detail === COMPUTER_USE_OPT_IN_REFUSE_MESSAGE
+        || /computer\s*use|GROX_COMPUTER_USE|未启用/i.test(detail)
+      ) {
+        throw error instanceof Error ? error : new Error(detail);
+      }
     } finally {
       this.finishTurn(sessionId);
     }
@@ -3076,14 +3490,67 @@ export class AcpBridge implements GrokBridge {
     this.knownSessions.delete(id);
     this.cursors.delete(id);
     this.usage.delete(id);
+    // Drop inflight load so a late loadSessionInner cannot re-bind a deleted id.
+    this.loadPromises.delete(id);
+    this.silentReplaying.delete(id);
+    this.replaying.delete(id);
+    this.sessionOptions.delete(id);
+    this.cliQueues.delete(id);
+    void this.setSilentStream(false, id);
   }
 
   async emergencyStopComputer(sessionId: string): Promise<void> {
     const leaseId = this.computerLeases.get(sessionId);
-    if (leaseId) {
-      await invoke("computer_emergency_stop", { leaseId });
+    try {
+      if (leaseId) {
+        await invoke("computer_emergency_stop", { leaseId });
+      }
+    } finally {
+      // Always cancel the turn even if invoke fails (hotkey fail-closed).
+      this.cancel(sessionId);
     }
-    this.cancel(sessionId);
+  }
+
+  /**
+   * Settings opt-out: revoke every lease + process-wide MCP bearer so
+   * disable-after-attach cannot leave desktop control live (R4A-CU-01).
+   */
+  async revokeComputerUseCapability(): Promise<void> {
+    const sessionIds = [...this.computerLeases.keys()];
+    for (const sessionId of sessionIds) {
+      await this.revokeComputerLease(sessionId);
+    }
+    this.computerLeases.clear();
+    this.activeComputerSessions.clear();
+    this.activeComputerToolCalls.clear();
+    await invoke("computer_revoke_http_auth").catch(() => {});
+  }
+
+  /** Public wrapper for busy-queue CU gating (store enqueue path). */
+  async prepareComputerForPrompt(
+    sessionId: string,
+    text: string,
+  ): Promise<"ok" | "refused"> {
+    // R15: same channel as silent bind / prompt so concurrent queue CU attach
+    // cannot stack multi-minute session/load over a live turn.
+    return this.runOnChannel(() => this.ensureComputerAttachedForPrompt(sessionId, text));
+  }
+
+  /** Drop one session lease and sticky-stop / revoke its MCP surface. */
+  private async revokeComputerLease(sessionId: string): Promise<void> {
+    const leaseId = this.computerLeases.get(sessionId);
+    this.computerLeases.delete(sessionId);
+    this.activeComputerSessions.delete(sessionId);
+    for (const key of [...this.activeComputerToolCalls]) {
+      if (key.startsWith(`${sessionId}:`)) this.activeComputerToolCalls.delete(key);
+    }
+    if (leaseId) {
+      try {
+        await invoke("computer_emergency_stop", { leaseId });
+      } catch {
+        await invoke("computer_revoke_http_auth").catch(() => {});
+      }
+    }
   }
 
   /**
@@ -3101,19 +3568,87 @@ export class AcpBridge implements GrokBridge {
     return false;
   }
 
+  /** Pull GROX_COMPUTER_USE from the host process into the FE opt-in helper. */
+  private async refreshComputerUseHostEnv(): Promise<void> {
+    try {
+      const on = await invoke<boolean>("computer_use_env_enabled_cmd");
+      setComputerUseHostEnvEnabled(on === true);
+    } catch {
+      /* older shells — leave cache unchanged / process.env only */
+    }
+  }
+
   /**
    * Secondary attach for sessions that were silent/background-bound without
    * Computer MCP. Re-issues session/load with MCP extensions under the silent
    * stream filter so offline history is not flooded.
+   *
+   * Re-checks opt-in even when a lease is already mapped (R4A-CU-01).
+   * Returns `refused` when opt-in blocks Computer intent so callers abort the
+   * turn (R4A-CU-02) instead of still calling session/prompt.
    */
   private async ensureComputerAttachedForPrompt(
     sessionId: string,
     text: string,
-  ): Promise<void> {
-    if (this.computerLeases.has(sessionId)) return;
-    if (!this.promptRequestsComputer(text)) return;
-    if (!this.knownSessions.has(sessionId)) return;
-    await this.attachComputerMcp(sessionId);
+  ): Promise<"ok" | "refused"> {
+    // Env may have been set after cold start; refresh once per ensure is cheap.
+    if (!isComputerUseOperatorEnabled()) {
+      await this.refreshComputerUseHostEnv();
+    }
+    const decision = decideComputerAttachForPrompt({
+      requestsComputer: this.promptRequestsComputer(text),
+      knownSession: this.knownSessions.has(sessionId),
+      optIn: isComputerUseOperatorEnabled(),
+      hasActiveLease: hasActiveComputerLease(this.computerLeases, sessionId),
+    });
+    switch (decision) {
+      case "skip":
+      case "already_attached":
+        return "ok";
+      case "refuse_opt_in":
+        this.emit({
+          type: "error",
+          sessionId,
+          message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
+        });
+        return "refused";
+      case "revoke_stale_and_refuse":
+        await this.revokeComputerLease(sessionId);
+        // Process-wide bearer may still be live for other sessions; if this
+        // was the last lease, revoke. Always best-effort revoke after opt-out
+        // path so a single-session app cannot leave MCP open.
+        if (this.computerLeases.size === 0) {
+          await invoke("computer_revoke_http_auth").catch(() => {});
+        }
+        this.emit({
+          type: "error",
+          sessionId,
+          message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
+        });
+        return "refused";
+      case "attach":
+        await this.attachComputerMcp(sessionId);
+        return "ok";
+    }
+  }
+
+  private async invokeComputerSessionExtensions(): Promise<ComputerSessionExtensions> {
+    if (!isComputerUseOperatorEnabled()) {
+      await this.refreshComputerUseHostEnv();
+    }
+    try {
+      return await invoke<ComputerSessionExtensions>("computer_session_extensions", {
+        operatorEnabled: isComputerUseOperatorEnabled(),
+      });
+    } catch (error) {
+      // Belt-and-braces: older shells hard-Err when CU opt-in is off. Never let
+      // that kill session/new for ordinary chat (Home "111" → 连接失败).
+      const message = errorText(error);
+      if (/computer\s*use|GROX_COMPUTER_USE|未启用/i.test(message)) {
+        return { mcpServers: [], pluginDirs: [], leaseId: "" };
+      }
+      throw error instanceof Error ? error : new Error(message);
+    }
   }
 
   private async attachComputerMcp(sessionId: string): Promise<void> {
@@ -3121,14 +3656,15 @@ export class AcpBridge implements GrokBridge {
     if (!meta) {
       throw new Error(`找不到会话，无法附加 Computer Use：${sessionId}`);
     }
-    const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
-    if (computer.mcpServers.length === 0 && computer.pluginDirs.length === 0) {
-      // Non-Windows or harness unavailable — leave the turn to run without MCP.
+    const computer = await this.invokeComputerSessionExtensions();
+    const attachLease = computerLeaseIfAttached(computer);
+    if (!attachLease) {
+      // Soft-fail / non-Windows / harness unavailable — leave turn without MCP.
       return;
     }
     const metaRequest = await this.sessionMeta(meta.cwd);
     this.silentReplaying.add(sessionId);
-    await this.setSilentStream(true);
+    await this.setSilentStream(true, sessionId);
     try {
       try {
         await this.request(
@@ -3154,12 +3690,16 @@ export class AcpBridge implements GrokBridge {
         return;
       }
       const previousLease = this.computerLeases.get(sessionId);
-      if (previousLease && previousLease !== computer.leaseId) {
+      if (previousLease && previousLease !== attachLease) {
         await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(
           () => {},
         );
       }
-      this.computerLeases.set(sessionId, computer.leaseId);
+      // Process-wide MCP bearer rotates on each serve_http — sibling leases are stale.
+      for (const sid of [...this.computerLeases.keys()]) {
+        if (sid !== sessionId) this.computerLeases.delete(sid);
+      }
+      this.computerLeases.set(sessionId, attachLease);
       this.emit({
         type: "status",
         sessionId,
@@ -3167,7 +3707,7 @@ export class AcpBridge implements GrokBridge {
       });
     } finally {
       this.silentReplaying.delete(sessionId);
-      await this.setSilentStream(this.silentReplaying.size > 0);
+      await this.setSilentStream(false, sessionId);
     }
   }
 

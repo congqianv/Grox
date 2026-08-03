@@ -77,8 +77,8 @@ export interface GrokBridge {
   /** Change the real Grok Build harness mode for an existing session. */
   setSessionMode(sessionId: string, mode: AgentMode): Promise<void>;
 
-  /** ACP: session/new — emits session_ready. */
-  newSession(cwd: string): Promise<void>;
+  /** ACP: session/new — emits session_ready; resolves to the new session id. */
+  newSession(cwd: string): Promise<string>;
 
   /**
    * ACP: session/load — binds the session in the agent process.
@@ -171,4 +171,19 @@ export interface GrokBridge {
 
   /** Ctrl+Alt+Esc emergency stop for Windows Computer Use harness. */
   emergencyStopComputer?(sessionId: string): Promise<void>;
+
+  /**
+   * Settings opt-out: drop all Computer Use leases and revoke the localhost
+   * MCP bearer so disable-after-attach cannot leave control live (R4A-CU-01).
+   */
+  revokeComputerUseCapability?(): Promise<void>;
+
+  /**
+   * Prompt-time Computer Use attach/refuse (same policy as session/prompt).
+   * Used before concurrent CLI queue sends so busy-session CU intent is gated.
+   */
+  prepareComputerForPrompt?(
+    sessionId: string,
+    text: string,
+  ): Promise<"ok" | "refused">;
 }

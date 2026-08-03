@@ -90,12 +90,14 @@ export function AccountSetup() {
         });
         localStorage.setItem("grox.accountSetupComplete", "1");
         await activateProviderProfile(profile.id);
+        setOpen(false);
       } else {
         await configure({ kind, apiKey, baseUrl });
       }
     } catch (cause) {
       if (!wasComplete) localStorage.removeItem("grox.accountSetupComplete");
       setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
       setBusy(false);
     }
   };

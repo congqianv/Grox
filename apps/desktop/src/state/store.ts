@@ -7,7 +7,9 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { bridge } from "../bridge";
-import { MODELS } from "../bridge/types";
+import { DEFAULT_PERMISSION_MODE, MODELS, readStoredPermissionMode } from "../bridge/types";
+import { COMPUTER_USE_OPT_IN_REFUSE_MESSAGE } from "../lib/computerUse";
+import { isSafeMarkdownOpenUrl } from "../lib/openUrlSafety";
 import type {
   AgentMode,
   AccountInfo,
@@ -39,12 +41,23 @@ import type {
   RewindResult,
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
-import { loadSessionCache, scheduleSaveSessionCache } from "../lib/sessionCache";
+import { mergeOfflineWithLive } from "../lib/offlineMerge";
+import { mergeCliQueueWithLocal, nextLocalDrainIndex } from "../lib/promptQueue";
+import {
+  cancelSaveSessionCache,
+  loadSessionCache,
+  scheduleSaveSessionCache,
+} from "../lib/sessionCache";
 
 /** Missions whose offline disk history scan finished this process lifetime. */
 const offlineHistoryComplete = new Set<string>();
 /** Missions with an in-flight offline scan (avoid re-invoke restart storms). */
 const offlineHistoryScanning = new Set<string>();
+/**
+ * Sessions deleted this process lifetime — late disk-history events must not
+ * resurrect them into `sessions` (R3 tombstone).
+ */
+const offlineHistoryDeleted = new Set<string>();
 /**
  * Sessions with an in-flight sendPrompt IIFE (silent bind + prompt).
  * Prevents openSession from coercing running→idle mid-bind (double-prompt race).
@@ -52,6 +65,23 @@ const offlineHistoryScanning = new Set<string>();
 const promptInFlightSessions = new Set<string>();
 /** Monotonic token so superseded openSession awaits do not steal focus. */
 let openSessionGeneration = 0;
+/** Target of the latest openSession — applyChrome only if still this id. */
+let openSessionTargetId: string | null = null;
+/** Offline scan finished while turn was live — merge on idle. */
+const pendingOfflineMerge = new Map<string, Session>();
+/** Overlapping list_workspace_files walks thrash large repos — one in-flight. */
+let workspaceFilesInFlight = false;
+/** git/diffs is heavy — one in-flight + min interval. */
+let workspaceDiffsInFlight = false;
+let lastWorkspaceDiffAt = 0;
+/** openPreview race: late read must not clobber a newer path. */
+let previewOpenGeneration = 0;
+
+/** Invalidate in-flight openSession applyChrome (Home / new mission / workspace). */
+function bumpOpenSessionGeneration(clearTarget = true): void {
+  openSessionGeneration += 1;
+  if (clearTarget) openSessionTargetId = null;
+}
 /** Poll timer for offline scan progress (atomics in Rust — no event flood). */
 let offlineScanPollTimer: number | null = null;
 
@@ -286,13 +316,9 @@ function normalizeOfflineSession(raw: unknown, fallback?: Session | null): Sessi
         contextMax: 0,
         turns: 0,
       },
-    // Never force-running from a disk snapshot.
-    status:
-      fallback?.status === "running" ||
-      fallback?.status === "awaiting_permission" ||
-      fallback?.status === "awaiting_input"
-        ? fallback.status
-        : "idle",
+    // Disk / deferred offline snapshots must never re-apply busy turn status
+    // (would stick send after flush when a scan finished mid-turn).
+    status: "idle",
     demo: s.demo ?? fallback?.demo,
     pinned: s.pinned ?? fallback?.pinned,
     archived: s.archived ?? fallback?.archived,
@@ -463,7 +489,8 @@ interface DesktopState {
   installAppUpdate(): Promise<void>;
   goHome(): void;
   openSession(id: string): Promise<void>;
-  newSession(): Promise<void>;
+  /** Create a mission; focuses it and returns its id (null on failure). */
+  newSession(): Promise<string | null>;
   newProject(): Promise<void>;
   /**
    * Import one or more folders as projects (e.g. drag onto the sidebar list).
@@ -501,7 +528,11 @@ interface DesktopState {
   setAccountSetupOpen(open: boolean): void;
   refreshWorkspaceFiles(): Promise<void>;
   refreshWorkspaceDiffs(): Promise<void>;
-  refreshProjectPreview(start?: boolean): Promise<void>;
+  /**
+   * Detect or start project preview. `start` alone only probes; starting a
+   * workspace dev script requires `opts.confirmStart === true` after in-app confirm.
+   */
+  refreshProjectPreview(start?: boolean, opts?: { confirmStart?: boolean }): Promise<void>;
   setProjectPreviewUrl(url: string): void;
   openPreview(path: string): Promise<void>;
   closePreview(): void;
@@ -514,7 +545,12 @@ interface DesktopState {
    * Same-turn interjection (Ctrl+Enter while busy).
    * Tries `x.ai/interject`; on older CLIs pins the message at the queue head.
    */
-  interjectPrompt(text: string, attachments?: PromptAttachment[], sessionId?: string): Promise<void>;
+  /** Returns false when Computer Use refuse kept the draft (do not clear composer). */
+  interjectPrompt(
+    text: string,
+    attachments?: PromptAttachment[],
+    sessionId?: string,
+  ): Promise<boolean>;
   removeQueuedPrompt(sessionId: string, queueId: string): void;
   /** Reorder a pending follow-up before it drains (fromIndex → toIndex). */
   reorderQueuedPrompt(sessionId: string, fromIndex: number, toIndex: number): void;
@@ -605,13 +641,7 @@ function loadSessionComposers(): Record<string, SessionComposerState> {
     model: localStorage.getItem("grok.model") ?? "grok-build",
     effort: (localStorage.getItem("grok.effort") as Effort) ?? "high",
     mode: "agent" as AgentMode,
-    permissionMode: (
-      localStorage.getItem("grok.permissionMode") === "auto"
-        ? "auto"
-        : localStorage.getItem("grok.permissionMode") === "bypass"
-          ? "bypass"
-          : "default"
-    ) as PermissionMode,
+    permissionMode: readStoredPermissionMode(),
   };
   return Object.fromEntries(
     Object.entries(stored).map(([id, state]) => [
@@ -992,6 +1022,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
         break;
       }
       case "session_ready": {
+        // Deleted missions must not reappear via late session/new|load.
+        if (offlineHistoryDeleted.has(e.session.id)) break;
         const { blocks: _b, usage: _u, status: _st, ...meta } = e.session;
         const nextIndex = [
           decorateSessions([meta])[0],
@@ -1015,7 +1047,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           model: fallbackModel,
           effort: state.effort || "high",
           mode: state.mode || "agent",
-          permissionMode: state.permissionMode || "default",
+          permissionMode: state.permissionMode || DEFAULT_PERMISSION_MODE,
         });
         const sessionComposers = { ...state.sessionComposers, [e.session.id]: composer };
         persistSessionComposers(sessionComposers);
@@ -1126,7 +1158,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
       case "permission_resolved":
         withSession(e.sessionId, (s) => ({
           ...s,
-          status: "running",
+          // Do not resurrect running after idle/error.
+          status: s.status === "awaiting_permission" ? "running" : s.status,
           blocks: s.blocks.map((b) =>
             b.id === e.blockId && b.type === "permission"
               ? { ...b, resolved: e.option }
@@ -1147,7 +1180,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       case "question_resolved":
         withSession(e.sessionId, (s) => ({
           ...s,
-          status: "running",
+          status: s.status === "awaiting_input" ? "running" : s.status,
           blocks: s.blocks.map((b) =>
             b.id === e.blockId && b.type === "question"
               ? { ...b, response: e.response }
@@ -1159,7 +1192,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         withSession(e.sessionId, (s) => ({ ...s, status: e.status }));
         if (e.status === "idle") {
           // Drain CLI-style follow-up queue once the active turn settles.
-          window.setTimeout(() => drainPromptQueue(e.sessionId), 0);
+          window.setTimeout(() => {
+            flushPendingOfflineMerge(e.sessionId);
+            drainPromptQueue(e.sessionId);
+          }, 0);
         }
         break;
       case "usage":
@@ -1174,12 +1210,65 @@ export const useDesktop = create<DesktopState>((set, get) => {
             { type: "system", id: uid(), text: e.message, ts: Date.now(), kind: "error" },
           ],
         }));
-        window.setTimeout(() => drainPromptQueue(e.sessionId), 0);
+        window.setTimeout(() => {
+          flushPendingOfflineMerge(e.sessionId);
+          drainPromptQueue(e.sessionId);
+        }, 0);
         break;
+      case "agent_reconnected": {
+        // Crash recovery finished. Re-home CLI queue rows (new agent has empty
+        // server queue) and only force-idle sessions that are not mid sendPrompt
+        // IIFE — clearing in-flight while an await-ready turn is live causes dual-send.
+        const queues = get().promptQueues;
+        const nextQueues: typeof queues = {};
+        for (const [id, entries] of Object.entries(queues)) {
+          nextQueues[id] = entries.map((entry) => ({
+            ...entry,
+            source: "local" as const,
+            state: entry.state === "sending" ? ("queued" as const) : entry.state,
+          }));
+        }
+        const live = get().sessions;
+        const next: typeof live = {};
+        for (const [id, session] of Object.entries(live)) {
+          if (promptInFlightSessions.has(id)) {
+            // Live IIFE owns this session — leave status; its finally will clear.
+            next[id] = session;
+            continue;
+          }
+          next[id] =
+            session.status === "running" ||
+            session.status === "awaiting_permission" ||
+            session.status === "awaiting_input"
+              ? {
+                  ...session,
+                  status: "idle",
+                  // Stale permission/question cards are no longer actionable.
+                  blocks: session.blocks.map((block) =>
+                    block.type === "permission" && !block.resolved
+                      ? { ...block, resolved: "deny" as const }
+                      : block.type === "question" && !block.response
+                        ? { ...block, response: { outcome: "cancelled" as const } }
+                        : block,
+                  ),
+                }
+              : session;
+        }
+        set({ sessions: next, promptQueues: nextQueues });
+        window.setTimeout(() => {
+          for (const id of Object.keys(get().sessions)) {
+            if (promptInFlightSessions.has(id)) continue;
+            flushPendingOfflineMerge(id);
+            drainPromptQueue(id);
+          }
+        }, 0);
+        break;
+      }
       case "prompt_queue": {
-        // CLI is authoritative: merge text/state/version, keep local attachment payloads by id.
+        // CLI is authoritative for known ids, but must not wipe local-only rows
+        // that have not been acknowledged yet (enqueue race with queue/changed).
         const previous = get().promptQueues[e.sessionId] ?? [];
-        const nextQueue: QueuedPrompt[] = e.entries.map((entry) => {
+        const fromCli: QueuedPrompt[] = e.entries.map((entry) => {
           const prior = previous.find((item) => item.id === entry.id);
           return {
             id: entry.id,
@@ -1191,6 +1280,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             source: "cli" as const,
           };
         });
+        const nextQueue = mergeCliQueueWithLocal(fromCli, previous);
         set({
           promptQueues: {
             ...get().promptQueues,
@@ -1208,12 +1298,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
     const state = get();
     const session = state.sessions[sessionId];
     const queue = state.promptQueues[sessionId] ?? [];
-    if (!session || session.status !== "idle" || queue.length === 0) return;
+    // Idle + not mid first-send bind (status can still be idle briefly while in-flight).
+    if (
+      !session ||
+      session.status !== "idle" ||
+      queue.length === 0 ||
+      promptInFlightSessions.has(sessionId)
+    ) {
+      return;
+    }
 
-    // Prefer interjected, then first local-owned entry.
-    const localIndex = queue.findIndex(
-      (item) => item.source !== "cli" && item.state !== "sending",
-    );
+    // Prefer interjected, then first local-owned entry (see nextLocalDrainIndex).
+    const localIndex = nextLocalDrainIndex(queue);
     if (localIndex < 0) {
       // Only CLI entries remain — clear sending ones the server already took.
       const remaining = queue.filter((item) => item.state !== "sending");
@@ -1242,6 +1338,31 @@ export const useDesktop = create<DesktopState>((set, get) => {
     });
     get().sendPrompt(next.text, next.attachments, sessionId);
   };
+
+  /** Apply offline transcript deferred because a turn was in flight. */
+  function flushPendingOfflineMerge(sessionId: string): void {
+    const pending = pendingOfflineMerge.get(sessionId);
+    if (!pending) return;
+    if (offlineHistoryDeleted.has(sessionId)) {
+      pendingOfflineMerge.delete(sessionId);
+      return;
+    }
+    if (promptInFlightSessions.has(sessionId)) return;
+    const cur = get().sessions[sessionId];
+    if (
+      cur &&
+      (cur.status === "running" ||
+        cur.status === "awaiting_permission" ||
+        cur.status === "awaiting_input")
+    ) {
+      return;
+    }
+    pendingOfflineMerge.delete(sessionId);
+    const merged = mergeOfflineWithLive(pending, cur);
+    set({ sessions: { ...get().sessions, [sessionId]: merged } });
+    if (merged.blocks.length > 0) scheduleSaveSessionCache(merged);
+    offlineHistoryComplete.add(sessionId);
+  }
 
   return {
     ready: false,
@@ -1285,12 +1406,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     modelsUpdatedAt: 0,
     effort: (localStorage.getItem("grok.effort") as Effort) ?? "high",
     mode: "agent",
-    permissionMode:
-      localStorage.getItem("grok.permissionMode") === "auto"
-        ? "auto"
-        : localStorage.getItem("grok.permissionMode") === "bypass"
-          ? "bypass"
-          : "default",
+    permissionMode: readStoredPermissionMode(),
     sessionComposers: loadSessionComposers(),
     promptQueues: {},
     queueNotice: null,
@@ -1329,6 +1445,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
           // Always free the scanning slot for this id (including cancelled abandon).
           offlineHistoryScanning.delete(payload.id);
 
+          // Tombstone: deleted missions must not be resurrected by late scan.
+          if (offlineHistoryDeleted.has(payload.id)) {
+            if (get().fullHistoryLoadingId === payload.id) {
+              set({
+                fullHistoryLoadingId: null,
+                historyLoadMode: null,
+                diskHistoryProgress: null,
+              });
+            } else if (get().diskHistoryProgress?.id === payload.id) {
+              set({ diskHistoryProgress: null });
+            }
+            return;
+          }
+
           const loadingId = get().fullHistoryLoadingId;
           const progressId = get().diskHistoryProgress?.id ?? null;
           // Never stop the poll for an unrelated session's terminal event.
@@ -1339,31 +1469,70 @@ export const useDesktop = create<DesktopState>((set, get) => {
             startOfflineScanPoll(loadingId);
           }
 
-          // cancelled/error are retryable — do not permanent-complete.
-          if (
-            payload.phase === "complete" ||
-            payload.phase === "no-updates" ||
-            payload.phase === "missing"
-          ) {
-            offlineHistoryComplete.add(payload.id);
+          // Only merge body if still in catalog or memory (not deleted mid-scan).
+          const stillCatalogued = get().sessionIndex.some((m) => m.id === payload.id);
+          const existing = get().sessions[payload.id];
+          if (!stillCatalogued && !existing) {
+            if (get().fullHistoryLoadingId === payload.id && get().historyLoadMode === "disk") {
+              set({
+                fullHistoryLoadingId: null,
+                historyLoadMode: null,
+                diskHistoryProgress: null,
+              });
+            }
+            return;
           }
 
-          const existing = get().sessions[payload.id];
           const liveBusy =
             existing &&
             (existing.status === "running" ||
               existing.status === "awaiting_permission" ||
-              existing.status === "awaiting_input");
-          if (!liveBusy && payload.session) {
+              existing.status === "awaiting_input" ||
+              promptInFlightSessions.has(payload.id));
+
+          const phaseComplete =
+            payload.phase === "complete" ||
+            payload.phase === "no-updates" ||
+            payload.phase === "missing";
+
+          // cancelled/error are retryable — do not permanent-complete until merge
+          // can run. Live turn must not mark complete (else re-open never rescans).
+          if (payload.session) {
             const next = normalizeOfflineSession(payload.session, existing);
-            if (next) {
-              window.setTimeout(() => {
-                set({
-                  sessions: { ...get().sessions, [payload.id]: next },
-                });
-                if (next.blocks.length > 0) scheduleSaveSessionCache(next);
-              }, 0);
+            if (next && !offlineHistoryDeleted.has(payload.id)) {
+              if (liveBusy) {
+                pendingOfflineMerge.set(payload.id, next);
+              } else {
+                pendingOfflineMerge.delete(payload.id);
+                window.setTimeout(() => {
+                  if (offlineHistoryDeleted.has(payload.id)) return;
+                  if (promptInFlightSessions.has(payload.id)) {
+                    pendingOfflineMerge.set(payload.id, next);
+                    return;
+                  }
+                  const cur = get().sessions[payload.id];
+                  if (
+                    cur &&
+                    (cur.status === "running" ||
+                      cur.status === "awaiting_permission" ||
+                      cur.status === "awaiting_input")
+                  ) {
+                    pendingOfflineMerge.set(payload.id, next);
+                    return;
+                  }
+                  const merged = mergeOfflineWithLive(next, cur);
+                  set({
+                    sessions: { ...get().sessions, [payload.id]: merged },
+                  });
+                  if (merged.blocks.length > 0) scheduleSaveSessionCache(merged);
+                  if (phaseComplete) offlineHistoryComplete.add(payload.id);
+                }, 0);
+              }
+            } else if (phaseComplete && !liveBusy) {
+              offlineHistoryComplete.add(payload.id);
             }
+          } else if (phaseComplete && !liveBusy) {
+            offlineHistoryComplete.add(payload.id);
           }
 
           if (get().fullHistoryLoadingId === payload.id && get().historyLoadMode === "disk") {
@@ -1398,6 +1567,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
           bridge.getModelState(),
           bridge.getProviderStatus(),
         ]);
+        // Product default Auto: if the operator never set a mode, persist + push to bridge.
+        if (localStorage.getItem("grok.permissionMode") == null) {
+          localStorage.setItem("grok.permissionMode", DEFAULT_PERMISSION_MODE);
+          bridge.setPermissionMode(DEFAULT_PERMISSION_MODE);
+          set({ permissionMode: DEFAULT_PERMISSION_MODE });
+        } else {
+          bridge.setPermissionMode(get().permissionMode);
+        }
         const sessionIndex = decorateSessions(loadJson<SessionMeta[]>("grox.sessionCatalog", []));
         set({
           workspace,
@@ -1430,8 +1607,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (workspaceWatchTimer === undefined) {
           workspaceWatchTimer = window.setInterval(() => {
             if (document.visibilityState !== "visible" || get().auth.inProgress || get().view !== "session") return;
+            if (get().providerSwitching) return;
             workspaceWatchTick += 1;
-            void get().refreshWorkspaceDiffs();
+            // Diff poll only when inspector is open (otherwise wasted agent IPC).
+            if (get().inspectorOpen && workspaceWatchTick % 2 === 0) {
+              void get().refreshWorkspaceDiffs();
+            }
             if (workspaceWatchTick % 3 === 0) void get().refreshWorkspaceFiles();
             if (get().projectPreview.status === "starting") void get().refreshProjectPreview();
           }, 2_000);
@@ -1451,12 +1632,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const prompt = params.get("prompt");
       if (open) void get().openSession(open);
       else if (prompt) {
-        await get().newSession();
-        get().sendPrompt(prompt);
+        const id = await get().newSession();
+        if (id) get().sendPrompt(prompt, [], id);
       }
     },
 
     goHome: () => {
+      bumpOpenSessionGeneration();
       if (bridge.kind === "acp") {
         void invoke("cancel_offline_session_history").catch(() => {});
       }
@@ -1520,7 +1702,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
     async openAppUpdateDownload() {
       const info = get().appUpdate;
       const url = info?.downloadUrl || info?.releaseUrl || "https://github.com/congqianv/Grox/releases";
-      await invoke("open_external", { url });
+      // R22: reuse shared dual-gate (HTTPS + non-metadata) before open_external.
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== "https:" || !isSafeMarkdownOpenUrl(parsed)) return;
+        await invoke("open_external", { url: parsed.toString() });
+      } catch {
+        // invalid URL — ignore
+      }
     },
 
     async installAppUpdate() {
@@ -1677,8 +1866,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
           stopOfflineScanPoll();
         }
 
+        openSessionTargetId = id;
         const openGen = ++openSessionGeneration;
-        const stillThisOpen = () => openGen === openSessionGeneration;
+        const stillThisOpen = () =>
+          openGen === openSessionGeneration && openSessionTargetId === id;
 
         const meta = current.sessionIndex.find((entry) => entry.id === id);
         if (meta) bridge.rememberSessionMeta?.(meta);
@@ -1689,14 +1880,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
           model: state.model || state.models[0]?.id || MODELS[0]?.id || "grok-build",
           effort: state.effort || "high",
           mode: state.mode || "agent",
-          permissionMode: state.permissionMode || "default",
+          permissionMode: state.permissionMode || DEFAULT_PERMISSION_MODE,
         });
         const sessionComposers = { ...state.sessionComposers, [id]: composer };
         persistSessionComposers(sessionComposers);
 
+        // Explicit open means the mission is back in play for this process.
+        offlineHistoryDeleted.delete(id);
+
         const kickOfflineHistory = (session?: Session | null) => {
           if (!stillThisOpen()) return;
           if (bridge.kind !== "acp") return;
+          if (offlineHistoryDeleted.has(id)) return;
           if (offlineHistoryComplete.has(id)) return;
           // Already scanning this id — join poll, do not re-invoke.
           if (offlineHistoryScanning.has(id)) {
@@ -1734,7 +1929,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         };
 
         const applyChrome = (session?: Session | null, opts?: { loadingDisk?: boolean }) => {
-          if (!stillThisOpen()) return;
+          if (!stillThisOpen() || offlineHistoryDeleted.has(id)) return;
           const crossProject = meta && !samePath(meta.cwd, get().workspace);
           const projects =
             meta && crossProject
@@ -1900,10 +2095,46 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     async newSession() {
       try {
-        await bridge.newSession(get().workspace);
-        set({ startupError: null });
+        // Invalidate in-flight openSession so a late applyChrome cannot steal focus.
+        bumpOpenSessionGeneration();
+        // session_ready fires during this await while activeId is often still null
+        // (Home). That path only *stores* the session — it does not focus. Focus
+        // here so Home launch + sendPrompt actually target the new id.
+        const id = await bridge.newSession(get().workspace);
+        const session = get().sessions[id];
+        const projects = session
+          ? ensureProject(get().projects, session.cwd, { force: true })
+          : get().projects;
+        const composer = normalizeComposer(get().sessionComposers[id], {
+          model: get().model || get().models[0]?.id || MODELS[0]?.id || "grok-build",
+          effort: get().effort || "high",
+          mode: get().mode || "agent",
+          permissionMode: get().permissionMode || DEFAULT_PERMISSION_MODE,
+        });
+        const sessionComposers = { ...get().sessionComposers, [id]: composer };
+        persistSessionComposers(sessionComposers);
+        bridge.setPermissionMode(composer.permissionMode);
+        set({
+          startupError: null,
+          activeId: id,
+          view: "session",
+          sessionComposers,
+          model: composer.model,
+          effort: composer.effort,
+          mode: composer.mode,
+          permissionMode: composer.permissionMode,
+          ...(session
+            ? {
+                workspace: session.cwd,
+                activeProjectId: projectId(session.cwd),
+                projects,
+              }
+            : {}),
+        });
+        return id;
       } catch (error) {
         set({ startupError: error instanceof Error ? error.message : String(error) });
+        return null;
       }
     },
 
@@ -2025,6 +2256,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async setWorkspace(cwd) {
+      bumpOpenSessionGeneration();
       await bridge.setWorkspace(cwd);
       const workspace = await bridge.getWorkspace();
       const fetchedSessions = await bridge.listSessions(workspace);
@@ -2138,6 +2370,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
       // Always activate after save so the just-configured provider is what the
       // agent uses — no separate "switch + edit config.toml" step required.
+      if (get().providerSwitching || promptInFlightSessions.size > 0) {
+        await get().refreshProviderProfiles();
+        set({
+          startupError:
+            "供应商已保存。当前有任务/切换进行中，请稍后再在输入框左侧切换到该供应商。",
+        });
+        return profile;
+      }
       if (Object.values(get().sessions).some((session) => session.status !== "idle")) {
         await get().refreshProviderProfiles();
         set({
@@ -2152,7 +2392,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await bridge.activateProviderProfile(profile.id);
         await get().refreshProviderProfiles();
         await Promise.all([get().refreshAccount(), get().refreshModels()]);
-        if (activeId) {
+        if (activeId && get().activeId === activeId && get().sessions[activeId]) {
           await bridge.loadSession(activeId, { background: true, silent: true });
         }
         set({ providerSwitching: false, startupError: null });
@@ -2172,8 +2412,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async activateProviderProfile(id) {
+      if (get().providerSwitching) {
+        throw new Error("正在切换模型服务，请稍候");
+      }
       if (Object.values(get().sessions).some((session) => session.status !== "idle")) {
         throw new Error("请先终止正在执行的任务，再切换模型服务");
+      }
+      if (promptInFlightSessions.size > 0) {
+        throw new Error("请等待当前发送完成，再切换模型服务");
       }
       const activeId = get().activeId;
       set({ providerSwitching: true });
@@ -2181,7 +2427,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await bridge.activateProviderProfile(id);
         await get().refreshProviderProfiles();
         await Promise.all([get().refreshAccount(), get().refreshModels()]);
-        if (activeId) {
+        // Re-bind only if still the same focused mission after the agent restart.
+        if (activeId && get().activeId === activeId && get().sessions[activeId]) {
           await bridge.loadSession(activeId, { background: true, silent: true });
         }
         set({ providerSwitching: false, startupError: null });
@@ -2256,10 +2503,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
     async installOfficialRuntime() {
       set({ runtimeBusy: true });
       try {
+        // Opens official install docs in the browser (no remote irm|iex).
+        // Throws with instructions when CLI is not yet on PATH.
         await invoke<GrokRuntimeInfo>("install_official_grok_cli");
-        window.location.reload();
+        await get().refreshRuntime();
+        set({ runtimeBusy: false });
       } catch (error) {
         set({ runtimeBusy: false });
+        // Still re-detect after user may have installed out-of-band.
+        try {
+          await get().refreshRuntime();
+        } catch {
+          /* ignore */
+        }
         throw error;
       }
     },
@@ -2267,6 +2523,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
     setAccountSetupOpen: (accountSetupOpen) => set({ accountSetupOpen }),
 
     async refreshWorkspaceFiles() {
+      if (workspaceFilesInFlight) return;
+      workspaceFilesInFlight = true;
       try {
         const workspaceFiles = await invoke<WorkspaceEntry[]>("list_workspace_files", {
           cwd: get().workspace,
@@ -2274,36 +2532,61 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({ workspaceFiles });
       } catch (error) {
         set({ previewError: error instanceof Error ? error.message : String(error) });
+      } finally {
+        workspaceFilesInFlight = false;
       }
     },
 
     async refreshWorkspaceDiffs() {
       if (bridge.kind === "mock") return;
+      if (workspaceDiffsInFlight) return;
+      const now = Date.now();
+      // Min 3.5s between full diffs — interval + agent cost on large repos.
+      if (now - lastWorkspaceDiffAt < 3_500) return;
+      workspaceDiffsInFlight = true;
+      lastWorkspaceDiffAt = now;
       try {
         const response = await bridge.callExtension<unknown>("x.ai/git/diffs", {
           gitRoot: get().workspace,
           from: "HEAD",
           to: "working",
           includePatch: true,
-          includeContent: true,
-          maxPatchBytes: 2_000_000,
-          maxPatchLines: 20_000,
+          // Patch is enough for UI hunks; full file contents double IPC size.
+          includeContent: false,
+          maxPatchBytes: 1_000_000,
+          maxPatchLines: 12_000,
         });
         set({ workspaceDiffs: mapGitDiffs(response), workspaceDiffReady: true });
       } catch {
         // Non-git workspaces and older agents simply have no project-level diff.
+      } finally {
+        workspaceDiffsInFlight = false;
       }
     },
 
-    async refreshProjectPreview(start = false) {
+    async refreshProjectPreview(start = false, opts?: { confirmStart?: boolean }) {
       if (bridge.kind === "mock") {
         set({ projectPreview: { status: "none" } });
         return;
       }
       try {
+        // Never use window.confirm (unreliable in Tauri WebView). The Inspector
+        // in-app confirm UI must pass confirmStart:true after the operator accepts.
+        const confirmStart = start === true && opts?.confirmStart === true;
+        if (start && !confirmStart) {
+          // Detect-only probe: do not spawn package.json scripts.
+          const projectPreview = await invoke<ProjectPreview>("start_project_preview", {
+            cwd: get().workspace,
+            start: false,
+            confirmStart: false,
+          });
+          set({ projectPreview });
+          return;
+        }
         const projectPreview = await invoke<ProjectPreview>("start_project_preview", {
           cwd: get().workspace,
           start,
+          confirmStart,
         });
         const shouldOpen = start && (projectPreview.status === "starting" || projectPreview.status === "ready");
         set({
@@ -2358,6 +2641,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async openPreview(path) {
+      const gen = ++previewOpenGeneration;
       set({
         previewOpen: true,
         planPreviewOpen: false,
@@ -2369,8 +2653,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
           cwd: get().workspace,
           path,
         });
+        if (gen !== previewOpenGeneration) return;
         set({ previewFile, previewLoading: false });
       } catch (error) {
+        if (gen !== previewOpenGeneration) return;
         set({
           previewFile: null,
           previewLoading: false,
@@ -2379,11 +2665,32 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
     },
 
-    closePreview: () => set({ previewOpen: false, previewFile: null, previewError: null }),
+    closePreview: () => {
+      previewOpenGeneration += 1;
+      set({ previewOpen: false, previewFile: null, previewError: null });
+    },
 
     async deleteSession(id) {
+      // Tombstone first so late offline scan / in-flight openSession cannot resurrect.
+      offlineHistoryDeleted.add(id);
+      pendingOfflineMerge.delete(id);
+      promptInFlightSessions.delete(id);
+      cancelSaveSessionCache(id);
+      // Only abort openSession if it targets this id (do not cancel opening B when deleting A).
+      if (openSessionTargetId === id || get().activeId === id) {
+        bumpOpenSessionGeneration();
+      }
+      offlineHistoryScanning.delete(id);
+      offlineHistoryComplete.delete(id);
+      if (get().fullHistoryLoadingId === id || get().diskHistoryProgress?.id === id) {
+        stopOfflineScanPoll();
+        // Abandon any in-flight worker; gen bump is enough (start owns finish).
+        if (bridge.kind === "acp") {
+          void invoke("cancel_offline_session_history").catch(() => {});
+        }
+      }
       await bridge.deleteSession(id);
-      const { sessionIndex, sessions, activeId, sessionComposers } = get();
+      const { sessionIndex, sessions, activeId, sessionComposers, promptQueues } = get();
       const rest = { ...sessions };
       delete rest[id];
       const nextComposers = { ...sessionComposers };
@@ -2391,11 +2698,29 @@ export const useDesktop = create<DesktopState>((set, get) => {
       persistSessionComposers(nextComposers);
       const nextIndex = sessionIndex.filter((m) => m.id !== id);
       persistSessionCatalog(nextIndex);
+      const nextQueues = { ...promptQueues };
+      delete nextQueues[id];
       set({
         sessionIndex: nextIndex,
         sessions: rest,
         sessionComposers: nextComposers,
-        ...(activeId === id ? { activeId: null, view: "home" as View } : {}),
+        promptQueues: nextQueues,
+        ...(activeId === id
+          ? {
+              activeId: null,
+              view: "home" as View,
+              fullHistoryLoadingId: null,
+              historyLoadMode: null,
+              diskHistoryProgress: null,
+              agentBindStartedAt: null,
+            }
+          : get().fullHistoryLoadingId === id
+            ? {
+                fullHistoryLoadingId: null,
+                historyLoadMode: null,
+                diskHistoryProgress: null,
+              }
+            : {}),
       });
     },
 
@@ -2478,8 +2803,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
         return;
       }
 
-      // Busy turn → enqueue follow-up (Grok Build CLI-style queue).
-      if (session.status !== "idle") {
+      // Busy turn (or first-send still binding) → enqueue follow-up.
+      if (session.status !== "idle" || promptInFlightSessions.has(session.id)) {
         const entry: QueuedPrompt = {
           id: uid(),
           text: trimmed,
@@ -2509,20 +2834,53 @@ export const useDesktop = create<DesktopState>((set, get) => {
           },
         });
 
-        // Try CLI queue path (concurrent prompt) — if it succeeds, CLI owns execution.
-        void bridge
-          .enqueuePrompt(
-            session.id,
-            trimmed,
-            {
-              model: composer.model,
-              effort: composer.effort,
-              mode: composer.mode,
-              attachments,
-            },
-            { promptId: entry.id },
-          )
-          .then(() => {
+        // CU ensure on concurrent queue (same refuse/attach policy as promptInner).
+        void (async () => {
+          if (bridge.prepareComputerForPrompt) {
+            const cu = await bridge.prepareComputerForPrompt(session.id, trimmed);
+            if (cu === "refused") {
+              // Drop the queue entry and restore the draft — queue path already
+              // cleared sessionComposers; losing the text on CU refuse is a UX bug.
+              const q = get().promptQueues[session.id] ?? [];
+              const comps = get().sessionComposers;
+              const cur = comps[session.id] ?? composer;
+              const restored = {
+                ...comps,
+                [session.id]: {
+                  ...cur,
+                  text: trimmed || cur.text,
+                  attachments: attachments.length > 0 ? [...attachments] : cur.attachments,
+                },
+              };
+              persistSessionComposers(restored);
+              set({
+                promptQueues: {
+                  ...get().promptQueues,
+                  [session.id]: q.filter((item) => item.id !== entry.id),
+                },
+                sessionComposers: restored,
+                queueNotice: {
+                  id: uid(),
+                  message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
+                  state: "blocked",
+                  at: Date.now(),
+                },
+              });
+              return;
+            }
+          }
+          try {
+            await bridge.enqueuePrompt(
+              session.id,
+              trimmed,
+              {
+                model: composer.model,
+                effort: composer.effort,
+                mode: composer.mode,
+                attachments,
+              },
+              { promptId: entry.id },
+            );
             const current = get().promptQueues[session.id] ?? [];
             if (!current.some((item) => item.id === entry.id)) return;
             set({
@@ -2533,10 +2891,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
                 ),
               },
             });
-          })
-          .catch(() => {
+          } catch {
             // CLI rejected — keep local ownership and drain on idle.
-          });
+          }
+        })();
         return;
       }
 
@@ -2547,6 +2905,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
           : m,
       );
       persistSessionCatalog(nextIndex);
+
+      // Claim the in-flight slot before any await/set so double-click cannot dual-paint.
+      if (promptInFlightSessions.has(session.id)) return;
+      promptInFlightSessions.add(session.id);
 
       const nextComposers = {
         ...sessionComposers,
@@ -2588,7 +2950,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
       bridge.setPermissionMode(composer.permissionMode);
       // Bind agent only when the user actually continues the chat (first send).
       // Opening/switching never does session/load — that was the freeze source.
-      promptInFlightSessions.add(session.id);
       void (async () => {
         const clearAgentBannerIfOurs = () => {
           const s = get();
@@ -2631,8 +2992,38 @@ export const useDesktop = create<DesktopState>((set, get) => {
           });
         } catch (error) {
           const s = get();
+          // Never resurrect a deleted mission from a late prompt failure.
+          if (offlineHistoryDeleted.has(session.id) || !s.sessions[session.id]) {
+            return;
+          }
           const clearAgent =
             s.fullHistoryLoadingId === session.id && s.historyLoadMode === "agent";
+          const curSession = get().sessions[session.id];
+          let blocks = curSession?.blocks ?? [];
+          // Pop the optimistic user bubble we painted so retry does not duplicate it.
+          const last = blocks[blocks.length - 1];
+          if (last?.type === "user" && last.text === trimmed) {
+            blocks = blocks.slice(0, -1);
+          }
+          // Restore composer draft — bind/prompt failure must not wipe operator text.
+          const restoredComposers = {
+            ...get().sessionComposers,
+            [session.id]: {
+              ...(get().sessionComposers[session.id] ?? composer),
+              text: trimmed,
+              attachments: [...attachments],
+              model: composer.model,
+              effort: composer.effort,
+              mode: composer.mode,
+              permissionMode: composer.permissionMode,
+            },
+          };
+          persistSessionComposers(restoredComposers);
+          const errText = error instanceof Error ? error.message : String(error);
+          const friendly =
+            /请求超时|session\/load|超时/.test(errText)
+              ? `${errText}（首次绑定大会话可能较久；草稿已恢复，可重试）`
+              : errText;
           set({
             ...(clearAgent
               ? {
@@ -2643,20 +3034,26 @@ export const useDesktop = create<DesktopState>((set, get) => {
               : {}),
             queueNotice: {
               id: uid(),
-              message: error instanceof Error ? error.message : String(error),
+              message: friendly,
               state: "blocked",
               at: Date.now(),
             },
+            sessionComposers: restoredComposers,
             sessions: {
               ...get().sessions,
               [session.id]: {
-                ...(get().sessions[session.id] ?? session),
+                ...get().sessions[session.id],
                 status: "idle",
+                blocks,
               },
             },
           });
         } finally {
           promptInFlightSessions.delete(session.id);
+          flushPendingOfflineMerge(session.id);
+          // R15: if agent_reconnected skipped drain while we were in-flight,
+          // pick up local queue once this turn fully ends.
+          window.setTimeout(() => drainPromptQueue(session.id), 0);
         }
       })();
     },
@@ -2666,19 +3063,21 @@ export const useDesktop = create<DesktopState>((set, get) => {
         get();
       const targetId = sessionId ?? activeId;
       const session = targetId ? sessions[targetId] : null;
-      if (!session) return;
+      if (!session) return false;
 
       const trimmed = text.trim();
-      if (!trimmed && attachments.length === 0) return;
+      if (!trimmed && attachments.length === 0) return false;
 
       if (session.status === "idle") {
         get().sendPrompt(trimmed, attachments, session.id);
-        return;
+        return true;
       }
 
       if (session.status === "awaiting_permission" || session.status === "awaiting_input") {
+        // Gate only — sendPrompt posts a notice and does not accept the draft.
+        // Return false so callers (Composer) do not clear the composer text.
         get().sendPrompt(trimmed, attachments, session.id);
-        return;
+        return false;
       }
 
       const composer = sessionComposers[session.id] ?? {
@@ -2697,6 +3096,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
           mode: composer.mode,
           attachments,
         });
+
+        // Computer Use opt-in refuse: show notice, keep composer text, no queue.
+        // Do not persist empty composer (would wipe draft on reload).
+        if (result.state === "refused") {
+          set({
+            queueNotice: {
+              id: uid(),
+              message: result.message,
+              state: "interjected",
+              at: Date.now(),
+            },
+          });
+          return false;
+        }
 
         const nextComposers = {
           ...sessionComposers,
@@ -2726,7 +3139,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
               at: Date.now(),
             },
           });
-          return;
+          return true;
         }
 
         set({
@@ -2739,6 +3152,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             at: Date.now(),
           },
         });
+        return true;
       } catch (error) {
         // Hard failure — still pin to queue head so the operator does not lose text.
         const entry: QueuedPrompt = {
@@ -2771,6 +3185,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             at: Date.now(),
           },
         });
+        return true;
       }
     },
 

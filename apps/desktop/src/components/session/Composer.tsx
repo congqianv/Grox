@@ -320,10 +320,14 @@ export function Composer() {
     setCursor(0);
   };
 
+  const sendInFlight = useRef(false);
+
   const send = () => {
     const t = text.trim();
-    if ((!t && attachments.length === 0) || readingFiles || interjecting) return;
+    if ((!t && attachments.length === 0) || readingFiles || interjecting || sendInFlight.current)
+      return;
     void (async () => {
+      sendInFlight.current = true;
       setAttachmentError("");
       try {
         const turnAttachments = await attachExplicitPromptImages(workspace, t, attachments);
@@ -337,14 +341,18 @@ export function Composer() {
       } catch (cause) {
         const code = cause instanceof Error ? cause.message : String(cause);
         setAttachmentError(attachmentErrorMessage(code, language));
+      } finally {
+        sendInFlight.current = false;
       }
     })();
   };
 
   const interject = () => {
     const t = text.trim();
-    if ((!t && attachments.length === 0) || readingFiles || interjecting) return;
+    if ((!t && attachments.length === 0) || readingFiles || interjecting || sendInFlight.current)
+      return;
     void (async () => {
+      sendInFlight.current = true;
       setAttachmentError("");
       try {
         const turnAttachments = await attachExplicitPromptImages(workspace, t, attachments);
@@ -359,14 +367,16 @@ export function Composer() {
         }
         setInterjecting(true);
         try {
-          await interjectPrompt(t, turnAttachments);
-          clearComposer();
+          const accepted = await interjectPrompt(t, turnAttachments);
+          if (accepted) clearComposer();
         } finally {
           setInterjecting(false);
         }
       } catch (cause) {
         const code = cause instanceof Error ? cause.message : String(cause);
         setAttachmentError(attachmentErrorMessage(code, language));
+      } finally {
+        sendInFlight.current = false;
       }
     })();
   };
@@ -995,7 +1005,7 @@ export function Composer() {
             {!busy && (
               <button
                 onClick={send}
-                disabled={!canSubmit}
+                disabled={!canSubmit || gated}
                 title={
                   gated
                     ? submitBlockReason

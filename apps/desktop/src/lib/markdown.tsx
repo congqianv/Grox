@@ -12,6 +12,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type { MouseEvent } from "react";
 import { memo, useEffect, useId, useMemo, useRef } from "react";
 import "katex/dist/katex.min.css";
+import { isSafeMarkdownOpenUrl } from "./openUrlSafety";
+
+export { isSafeMarkdownOpenUrl } from "./openUrlSafety";
 
 const ESCAPES: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
 const escapeHtml = (text: string) => text.replace(/[&<>"]/g, (char) => ESCAPES[char]);
@@ -304,9 +307,9 @@ export const Markdown = memo(function Markdown({
     if (!href) return;
     try {
       const url = new URL(href);
-      if (url.protocol === "https:" || url.protocol === "http:") {
-        void invoke("open_external", { url: url.toString() });
-      }
+      // Dual-gate with Rust open_external (R13/R16/R19): HTTPS remote or loopback HTTP.
+      if (!isSafeMarkdownOpenUrl(url)) return;
+      void invoke("open_external", { url: url.toString() });
     } catch {
       // Relative links stay inert because there is no trusted navigation base.
     }

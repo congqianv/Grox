@@ -46,7 +46,7 @@ export class MockBridge implements GrokBridge {
   private permissionWaiters = new Map<string, (o: PermissionOption) => void>();
   private resolvedPermissions = new Map<string, PermissionOption>();
   private workspace = DEMO_CWD;
-  private permissionMode: PermissionMode = "default";
+  private permissionMode: PermissionMode = "auto";
   private providerProfiles: ProviderProfileSummary[] = [];
   private activeProviderProfileId: string | undefined;
   private configDrafts: Record<ConfigDocument["id"], string> = {
@@ -223,7 +223,7 @@ export class MockBridge implements GrokBridge {
     this.emit({ type: "mode_state", sessionId, mode });
   }
 
-  async newSession(cwd: string): Promise<void> {
+  async newSession(cwd: string): Promise<string> {
     const now = Date.now();
     const session: Session = {
       id: uid(),
@@ -238,6 +238,7 @@ export class MockBridge implements GrokBridge {
     };
     this.sessions.set(session.id, session);
     this.emit({ type: "session_ready", session });
+    return session.id;
   }
 
   async loadSession(

@@ -136,6 +136,57 @@ fn current_http_auth() -> Option<(String, String)> {
     Some((auth.token.clone(), auth.lease_id.clone()))
 }
 
+/// Constant-time equality for bearer tokens (length mismatch still fails closed).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// R21: parse Content-Length when present (fail closed on garbage / oversize).
+/// R22 review-close: conflicting duplicate Content-Length headers → reject.
+fn parse_content_length(headers: &str) -> Result<Option<usize>, ()> {
+    const MAX_BODY: usize = 512 * 1024;
+    let mut found = None;
+    for line in headers.lines() {
+        let lower = line.to_ascii_lowercase();
+        let Some(rest) = lower.strip_prefix("content-length:") else {
+            continue;
+        };
+        let Ok(n) = rest.trim().parse::<usize>() else {
+            return Err(());
+        };
+        if n > MAX_BODY {
+            return Err(());
+        }
+        if let Some(prev) = found {
+            if prev != n {
+                return Err(());
+            }
+        }
+        found = Some(n);
+    }
+    Ok(found)
+}
+
+/// Truncate `s` to at most `n` bytes without panicking on mid-char UTF-8 indices.
+fn safe_str_byte_prefix(s: &str, n: usize) -> &str {
+    let n = n.min(s.len());
+    if s.is_char_boundary(n) {
+        return &s[..n];
+    }
+    let mut i = n;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    &s[..i]
+}
+
 fn handle_http(mut stream: TcpStream, state: Arc<Mutex<ComputerState>>) {
     let mut buffer = vec![0_u8; 1024 * 1024];
     let Ok(size) = stream.read(&mut buffer) else { return };
@@ -146,15 +197,43 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<ComputerState>>) {
     let Some((token, session_id)) = current_http_auth() else {
         return;
     };
+    // R17: constant-time bearer compare (localhost MCP still holds desktop control).
     let authorized = headers.lines().any(|line| {
-        line.to_ascii_lowercase().starts_with("authorization: bearer ")
-            && line.trim()["authorization: bearer ".len()..].trim() == token
+        let lower = line.to_ascii_lowercase();
+        const PREFIX: &str = "authorization: bearer ";
+        if !lower.starts_with(PREFIX) {
+            return false;
+        }
+        let presented = line.trim()[PREFIX.len()..].trim();
+        constant_time_eq(presented.as_bytes(), token.as_bytes())
     });
+    // R21: Content-Length must not exceed buffer body; incomplete bodies rejected.
+    let content_length_ok = match parse_content_length(headers) {
+        Ok(None) => body.len() <= 512 * 1024,
+        Ok(Some(n)) => body.len() >= n && n <= 512 * 1024,
+        Err(()) => false,
+    };
+    let request_line = headers.lines().next().unwrap_or_default();
+    // R22: parse origin-form path (accept /mcp and /mcp/).
+    let post_mcp = {
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default();
+        let target = parts.next().unwrap_or_default();
+        let path = target.split('?').next().unwrap_or(target);
+        method.eq_ignore_ascii_case("POST") && (path == "/mcp" || path == "/mcp/")
+    };
     let (status, reason, response) = if !authorized {
         (401, "Unauthorized", Some(json!({"error":"Unauthorized"})))
-    } else if !headers.starts_with("POST ") {
+    } else if !content_length_ok {
+        (413, "Payload Too Large", Some(json!({"error":"body too large or incomplete"})))
+    } else if !post_mcp {
         (405, "Method Not Allowed", Some(json!({"error":"Method Not Allowed"})))
     } else {
+        // R22: never panic-slice mid-UTF-8 (Content-Length is bytes, not chars).
+        let body = match parse_content_length(headers).ok().flatten() {
+            Some(n) => safe_str_byte_prefix(body, n),
+            None => body,
+        };
         match serde_json::from_str::<Value>(body.trim()) {
             Ok(request) => {
                 let id = request.get("id").cloned();
@@ -402,7 +481,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "computer_key",
-            "按下组合键，例如 CTRL+L、ALT+TAB、ENTER、ESC。",
+            "按下组合键，例如 CTRL+L、ENTER、ESC（禁止 ALT+TAB / WIN 等焦点跳转键）。",
             json!({"type":"object","properties":{"keys":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8},"stateId":{"type":"integer"}},"required":["keys","stateId"],"additionalProperties":false}),
         ),
         tool(
@@ -568,14 +647,20 @@ fn call_tool_inner(name: &str, args: &Value, state: &mut ComputerState) -> Resul
         "set_value" => {
             check_state(args, state)?;
             let hwnd = state.active_window.ok_or("尚未选择窗口")?;
+            let value = args
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or("缺少 value")?;
+            const MAX_VALUE_CHARS: usize = 20_000;
+            if value.chars().count() > MAX_VALUE_CHARS {
+                return Err(format!("value 超过 {MAX_VALUE_CHARS} 字符上限"));
+            }
             platform::set_value(
                 hwnd,
                 args.get("elementId")
                     .and_then(Value::as_str)
                     .ok_or("缺少 elementId")?,
-                args.get("value")
-                    .and_then(Value::as_str)
-                    .ok_or("缺少 value")?,
+                value,
             )?;
             observe(state)
         }
@@ -1084,15 +1169,34 @@ mod platform {
             "grok build desktop",
             "grok-build-desktop",
             "chatgpt",
+            // Shells / consoles — Computer Use must not type into these.
             "powershell",
             "pwsh",
             "cmd",
             "windowsterminal",
             "wt",
             "conhost",
+            "openconsole",
+            "powershell_ise",
+            "bash",
+            "sh",
+            "zsh",
+            "fish",
+            "mintty",
+            "wsl",
+            "wslhost",
+            "ubuntu",
+            "debian",
+            "kali",
+            "alacritty",
+            "wezterm",
+            "wezterm-gui",
+            "hyper",
+            "tabby",
+            "windowsterminal.exe",
         ]
         .iter()
-        .any(|value| process == *value)
+        .any(|value| process == *value || process.starts_with(&format!("{value}.")))
             || [
                 "grox",
                 "grok build desktop",
@@ -1796,6 +1900,45 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_time_eq_matches_and_rejects() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn parse_content_length_bounds() {
+        assert_eq!(
+            parse_content_length("POST /mcp HTTP/1.1\r\nContent-Length: 12\r\n"),
+            Ok(Some(12))
+        );
+        assert_eq!(parse_content_length("POST /mcp HTTP/1.1\r\n"), Ok(None));
+        assert!(parse_content_length("Content-Length: not-a-number\r\n").is_err());
+        assert!(parse_content_length("Content-Length: 99999999\r\n").is_err());
+        // Conflicting duplicates fail closed.
+        assert!(parse_content_length(
+            "Content-Length: 10\r\nContent-Length: 11\r\n"
+        )
+        .is_err());
+        // Identical duplicates ok.
+        assert_eq!(
+            parse_content_length("Content-Length: 10\r\nContent-Length: 10\r\n"),
+            Ok(Some(10))
+        );
+    }
+
+    #[test]
+    fn safe_str_byte_prefix_never_panics_mid_char() {
+        let s = "éabc"; // first char is 2 bytes
+        assert_eq!(safe_str_byte_prefix(s, 0), "");
+        assert_eq!(safe_str_byte_prefix(s, 1), ""); // mid first char → floor
+        assert_eq!(safe_str_byte_prefix(s, 2), "é");
+        assert_eq!(safe_str_byte_prefix(s, 100), s);
+    }
 
     #[test]
     fn action_schemas_are_specific_and_stateful() {
