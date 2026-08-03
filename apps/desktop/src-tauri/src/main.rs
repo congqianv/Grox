@@ -2021,36 +2021,38 @@ fn write_runtime_preference(app: &tauri::AppHandle, preference: &str) -> Result<
 
 /// ACP process topology preference for `grok agent … stdio`.
 ///
-/// - `shared` (default) → `--leader` — join the machine-wide Grok leader (lower
-///   process count when CLI / other ACP clients also use leader; most common).
-/// - `local` → `--no-leader` — dedicated agent so `--plugin-dir` (Computer Use)
-///   works and the shell is isolated from a busy shared leader.
+/// - `local` (default) → `--no-leader` — dedicated agent process (industry
+///   default: Cursor / Claude Code / Codex style isolation). Enables
+///   process-scoped `--plugin-dir` (Computer Use) and avoids shared-leader
+///   contention with CLI / VS Code mid-turn.
+/// - `shared` → `--leader` — join the machine-wide Grok leader (fewer
+///   processes when multiple ACP clients share one backend).
 fn agent_leader_mode_path() -> Result<PathBuf, String> {
     Ok(grok_home()?.join("desktop-agent-leader-mode.json"))
 }
 
 fn normalize_agent_leader_mode(raw: Option<&str>) -> &'static str {
     match raw.map(str::trim) {
-        Some("local") | Some("no-leader") => "local",
         Some("shared") | Some("leader") => "shared",
-        // Default and all unknown / legacy values: shared machine leader.
-        _ => "shared",
+        Some("local") | Some("no-leader") => "local",
+        // Default and all unknown / legacy values: dedicated local agent.
+        _ => "local",
     }
 }
 
 fn agent_leader_cli_flag(mode: &str) -> &'static str {
     match normalize_agent_leader_mode(Some(mode)) {
-        "local" => "--no-leader",
-        _ => "--leader",
+        "shared" => "--leader",
+        _ => "--no-leader",
     }
 }
 
 fn read_agent_leader_mode() -> String {
     let Ok(path) = agent_leader_mode_path() else {
-        return "shared".into();
+        return "local".into();
     };
     let Ok(content) = read_bounded_text(&path, 16 * 1024) else {
-        return "shared".into();
+        return "local".into();
     };
     let mode = serde_json::from_str::<serde_json::Value>(&content)
         .ok()
@@ -7253,7 +7255,7 @@ fn export_support_diagnostics() -> Result<String, String> {
         "notes": [
             "API keys are redacted or marked [dpapi-sealed]; never paste unredacted dumps.",
             "Managed ~/.grok/.env secrets are not included in this export.",
-            "agentLeaderMode: shared=--leader (default), local=--no-leader.",
+            "agentLeaderMode: local=--no-leader (default), shared=--leader.",
         ],
     });
     serde_json::to_string_pretty(&dump).map_err(|error| format!("无法序列化诊断信息：{error}"))
@@ -8662,18 +8664,18 @@ api_key = "local-key"
     }
 
     #[test]
-    fn agent_leader_mode_defaults_to_shared_leader() {
-        assert_eq!(normalize_agent_leader_mode(None), "shared");
-        assert_eq!(normalize_agent_leader_mode(Some("")), "shared");
+    fn agent_leader_mode_defaults_to_local_process() {
+        assert_eq!(normalize_agent_leader_mode(None), "local");
+        assert_eq!(normalize_agent_leader_mode(Some("")), "local");
         assert_eq!(normalize_agent_leader_mode(Some("local")), "local");
         assert_eq!(normalize_agent_leader_mode(Some("no-leader")), "local");
         assert_eq!(normalize_agent_leader_mode(Some("shared")), "shared");
         assert_eq!(normalize_agent_leader_mode(Some("leader")), "shared");
-        assert_eq!(normalize_agent_leader_mode(Some("weird")), "shared");
+        assert_eq!(normalize_agent_leader_mode(Some("weird")), "local");
         assert_eq!(agent_leader_cli_flag("local"), "--no-leader");
         assert_eq!(agent_leader_cli_flag("shared"), "--leader");
         assert_eq!(agent_leader_cli_flag("leader"), "--leader");
-        assert_eq!(agent_leader_cli_flag("garbage"), "--leader");
+        assert_eq!(agent_leader_cli_flag("garbage"), "--no-leader");
     }
 
     #[test]

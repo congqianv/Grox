@@ -1605,11 +1605,11 @@ export class AcpBridge implements GrokBridge {
       /* older shell without preflight_agent_boot — continue */
     }
 
-    let preferredMode = "shared";
+    let preferredMode = "local";
     try {
       preferredMode = await invoke<string>("get_agent_leader_mode");
     } catch {
-      preferredMode = "shared";
+      preferredMode = "local";
     }
     const wantShared = preferredMode !== "local";
     const sharedBudget = sharedInitTimeoutMs(machineLeaderAlive);
@@ -4219,11 +4219,11 @@ export class AcpBridge implements GrokBridge {
     }
     this.productGateFallbackInFlight = true;
     try {
-      let mode = "shared";
+      let mode = "local";
       try {
         mode = await invoke<string>("get_agent_leader_mode");
       } catch {
-        /* older shell without the command */
+        /* older shell without the command — assume local default */
       }
       if (mode === "local") {
         this.emit({

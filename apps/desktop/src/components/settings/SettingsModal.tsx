@@ -197,12 +197,12 @@ function General() {
   </div>;
 }
 
-/** shared = machine leader (`--leader`, default); local = dedicated agent (`--no-leader`). */
+/** local = dedicated agent (`--no-leader`, default); shared = machine leader (`--leader`). */
 type AgentLeaderMode = "local" | "shared";
 
 function AgentLeaderModeRow({ zh, bridgeKind }: { zh: boolean; bridgeKind: string }) {
   const forceReconnectAgent = useDesktop((state) => state.forceReconnectAgent);
-  const [mode, setMode] = useState<AgentLeaderMode>("shared");
+  const [mode, setMode] = useState<AgentLeaderMode>("local");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -264,15 +264,15 @@ function AgentLeaderModeRow({ zh, bridgeKind }: { zh: boolean; bridgeKind: strin
         label={zh ? "Agent 进程模式" : "Agent process mode"}
         hint={
           zh
-            ? "默认「共享 Leader」：与本机 CLI / 其他 ACP 共用 agent，更省资源、使用更常见。可选「独立进程」适合 Computer Use（--plugin-dir）或要与 CLI 完全隔离时。若共享出现 403「coming soon」或握手超时，会自动切回独立。"
-            : "Default Shared leader: reuses the machine-wide agent with CLI/other ACP (common, fewer processes). Optional Local process for Computer Use (--plugin-dir) or isolation. On product-gate 403 or handshake timeout, auto-falls back to Local."
+            ? "默认「独立进程」：每个桌面实例独占 agent（与 Cursor/Claude Code 同类，隔离好、不抢共享 Leader）。可选「共享 Leader」与本机 CLI/其他 ACP 共用后端、更省资源。共享遇 403/握手超时时本次会软降级为独立。"
+            : "Default Local process: dedicated agent per desktop instance (Cursor/Claude Code style isolation). Optional Shared leader reuses the machine-wide backend with CLI/other ACP. Soft-falls back to Local on product-gate 403 or handshake timeout."
         }
       >
         <div className="flex gap-1">
           {(
             [
-              { id: "shared" as const, label: zh ? "共享（默认）" : "Shared (default)" },
-              { id: "local" as const, label: zh ? "独立进程" : "Local process" },
+              { id: "local" as const, label: zh ? "独立进程（默认）" : "Local (default)" },
+              { id: "shared" as const, label: zh ? "共享 Leader" : "Shared leader" },
             ] as const
           ).map((item) => (
             <button
