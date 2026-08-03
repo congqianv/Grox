@@ -52,7 +52,39 @@ import {
   isComputerUseOperatorEnabled,
   setComputerUseHostEnvEnabled,
 } from "../lib/computerUse";
+import {
+  permissionToolLabel,
+  pickSilentAllowOptionId,
+  shouldAutoApproveToolPermission,
+} from "../lib/permissionAuto";
+import {
+  pickRejectOption,
+  shouldRejectPermission,
+} from "../lib/planGate";
+import {
+  GROX_PLAN_PRIMER,
+  isPrimerText,
+} from "../lib/planPrimer";
+import {
+  recordPlanVerdict,
+  restoreDecisionForSession,
+  verdictFromPermissionOption,
+} from "../lib/planHistory";
+import {
+  collectToolImages,
+  extractGeneratedMediaPaths,
+  isMediaGenToolCall,
+  type MediaRef,
+} from "../lib/toolMedia";
 import { shouldDropSilentInbound } from "../lib/silentAcp";
+import { FIRST_EVENT_STALL_MS } from "../lib/firstEventWatch";
+import {
+  LOCAL_INIT_TIMEOUT_MS,
+  SPAWN_TIMEOUT_MS,
+  bootFallbackNoticeText,
+  sharedInitTimeoutMs,
+} from "../lib/bootPhase";
+import type { BootPhase } from "./types";
 
 export const ACP_METHODS = {
   initialize: "initialize",
@@ -75,6 +107,21 @@ export const ACP_METHODS = {
   compact: "x.ai/compact_conversation",
   promptHistory: "x.ai/prompt_history",
 } as const;
+
+/**
+ * Identity sent to the Grok agent / xAI proxy on initialize and session meta.
+ *
+ * Do **not** use `grok-desktop` / `desktop` here: the upstream API currently
+ * answers those surfaces with HTTP 403
+ * "Grok Build is coming soon. You don't have access now."
+ * CLI-compatible identifiers are allowed; Grox still brands itself via
+ * `clientInfo.title` for local diagnostics only (avoid the word "Desktop" in
+ * title — some agent paths treat clientInfo as a product surface hint).
+ */
+const ACP_CLIENT_IDENTIFIER = "cli";
+const ACP_CLIENT_TYPE = "cli";
+/** Branding only — never use as clientIdentifier / clientType. */
+const ACP_CLIENT_INFO = { name: "grok", title: "Grox", version: "0.1.0" } as const;
 
 type JsonObject = Record<string, unknown>;
 type RpcId = string | number;
@@ -139,6 +186,8 @@ interface PendingInteraction {
   kind: "permission" | "plan" | "question";
   optionIds: Partial<Record<PermissionOption, string>>;
   questions?: QuestionItem[];
+  /** Plan markdown from x.ai/exit_plan_mode (for local verdict history). */
+  planText?: string;
 }
 
 class AcpRpcError extends Error {
@@ -208,6 +257,24 @@ function errorText(value: unknown): string {
     string(object?.message) ??
     string(object?.data) ??
     (value instanceof Error ? value.message : String(value))
+  );
+}
+
+/**
+ * xAI product gate that returns HTTP 403 with "Grok Build is coming soon".
+ * Seen on desktop client identities and occasionally on shared-leader paths.
+ *
+ * Keep this narrow: bare "don't have access" also appears on normal auth /
+ * subscription errors and must NOT force a Shared→Local demotion.
+ */
+function isProductGate403(detail: string): boolean {
+  const d = detail.toLowerCase();
+  if (d.includes("coming soon") && d.includes("grok")) return true;
+  if (d.includes("coming soon") && (d.includes("403") || d.includes("forbidden"))) return true;
+  return (
+    (d.includes("403") || d.includes("forbidden")) &&
+    d.includes("grok build") &&
+    (d.includes("coming soon") || d.includes("access now"))
   );
 }
 
@@ -576,19 +643,55 @@ function extractDiffs(value: unknown): DiffHunk[] | undefined {
   return diffs.length > 0 ? diffs : undefined;
 }
 
-function extractImages(value: unknown): ToolCall["images"] {
+function mediaRefToToolImage(ref: MediaRef): NonNullable<ToolCall["images"]>[number] | null {
+  if (ref.kind === "data") {
+    return { data: ref.data, mime: ref.mimeType };
+  }
+  if (ref.kind === "path") {
+    // ToolCallCard accepts data-URL-like src; file paths are shown as locations + optional convert.
+    return { data: "", mime: ref.mimeType ?? (ref.media === "video" ? "video/mp4" : "image/png"), path: ref.path, mediaKind: ref.media };
+  }
+  if (ref.kind === "uri") {
+    return { data: "", mime: ref.mimeType ?? "image/png", uri: ref.uri, mediaKind: ref.media };
+  }
+  return null;
+}
+
+function extractImages(value: unknown, toolPayload?: JsonObject): ToolCall["images"] {
   const images: NonNullable<ToolCall["images"]> = [];
   const seen = new Set<string>();
+  const push = (img: NonNullable<ToolCall["images"]>[number]) => {
+    const signature =
+      img.data && img.mime
+        ? `${img.mime}:${img.data.slice(0, 96)}:${img.data.length}`
+        : img.path
+          ? `path:${img.path}`
+          : img.uri
+            ? `uri:${img.uri}`
+            : undefined;
+    if (!signature || seen.has(signature)) return;
+    // Skip empty data-only entries without path/uri.
+    if (!img.data && !img.path && !img.uri) return;
+    seen.add(signature);
+    images.push(img);
+  };
   walkJson(value, (object) => {
     if (string(object.type) !== "image") return;
     const data = string(object.data);
     const mime = string(object.mimeType) ?? string(object.mime_type);
-    const signature = data && mime ? `${mime}:${data.slice(0, 96)}:${data.length}` : undefined;
-    if (data && mime && signature && !seen.has(signature)) {
-      seen.add(signature);
-      images.push({ data, mime });
-    }
+    if (data && mime) push({ data, mime });
   });
+  // SuperGrok-style path/uri/video harvest from tool content (imagine / image_gen / …).
+  if (toolPayload) {
+    const refs = [
+      ...collectToolImages(toolPayload),
+      ...(isMediaGenToolCall(toolPayload) ? extractGeneratedMediaPaths(toolPayload) : []),
+    ];
+    for (const ref of refs) {
+      const img = mediaRefToToolImage(ref);
+      if (img) push(img);
+    }
+  }
   return images.length > 0 ? images : undefined;
 }
 
@@ -669,6 +772,10 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "auth_state":
     case "model_state":
     case "mode_state":
+    case "boot_phase":
+    case "agent_reconnected":
+    case "permission_restored":
+    case "question_restored":
       return session;
     case "session_meta":
       return { ...session, ...event.patch };
@@ -791,7 +898,7 @@ export class AcpBridge implements GrokBridge {
    * Sessions currently being restored via `session/load`. While set, emit() keeps
    * a private replay buffer AND periodically flushes it to the UI so the shell
    * is not stuck on the full-screen "Restoring session…" spinner for long
-   * transcripts (especially under agent --leader).
+   * transcripts (especially under shared agent --leader; local --no-leader is similar).
    */
   private progressiveLoad = new Set<string>();
   private progressiveFlushTimers = new Map<string, number>();
@@ -802,6 +909,29 @@ export class AcpBridge implements GrokBridge {
   private silentReplaying = new Set<string>();
   /** In-flight session/load promises — dedupe open + first-send races. */
   private loadPromises = new Map<string, Promise<void>>();
+  /**
+   * Primary `promptInner` turns still awaiting session/prompt (channel-bound).
+   * Used so concurrent follow-ups do not idle the UI while the primary is live,
+   * and primary finish does not idle while concurrent follow-ups are still open.
+   */
+  private primaryPromptSessions = new Set<string>();
+  /** Generation so a late primary `finally` cannot clear a newer primary turn. */
+  private primaryPromptGen = new Map<string, number>();
+  /** Count of concurrent (queue) session/prompt RPCs still open per session. */
+  private concurrentPromptCount = new Map<string, number>();
+  /** Generation so a late concurrent `finally` cannot settle a newer turn after cancel. */
+  private concurrentPromptGen = new Map<string, number>();
+  /**
+   * Wall clock of the last live session/update (or gate request) while a primary
+   * prompt is open. Used to detect "0 条事件" stalls after session/prompt write.
+   */
+  private liveTurnActivityAt = new Map<string, number>();
+  /**
+   * Sessions deleted this process lifetime — late session/load must not re-bind
+   * or re-emit into the store after the operator removed the mission.
+   */
+  private abandonedSessions = new Set<string>();
+
   /**
    * Exclusive ACP channel queue for heavy ops (session/load + session/prompt).
    * Prevents concurrent silent binds from globally black-holing another session's
@@ -822,6 +952,19 @@ export class AcpBridge implements GrokBridge {
    * instead of racing ready or sticking crashReconnectInFlight.
    */
   private reconnectEpoch = 0;
+  /**
+   * Runtime (mid-session) product-gate 403 recovery latch — separate from boot.
+   * Reset after a successful non-gate turn so a later regression can recover again.
+   */
+  private productGateFallbackInFlight = false;
+  private productGateFallbackDone = false;
+  /** Last boot phase — replayed for subscribers that attach mid-connect. */
+  private lastBootPhase: BootPhase | null = null;
+  private lastBootPhaseDetail: string | undefined;
+  /** Sessions that already received GROX_PLAN_PRIMER this process lifetime. */
+  private planPrimerSent = new Set<string>();
+  /** Operator entered plan while a turn was live — inject primer after idle. */
+  private planPrimerNeeded = new Set<string>();
   /** Child died again while crash-reconnect was still finishing success path. */
   private reconnectChildDied = false;
   /** When true, restartAgentInner must not steal `ready` from runCrashReconnect. */
@@ -864,7 +1007,10 @@ export class AcpBridge implements GrokBridge {
   private authMethodId: string | undefined;
   private authState: AuthState = { required: false, inProgress: false };
   private modelState: ModelState = { models: MODELS, currentId: MODELS[0].id };
-  private permissionMode: PermissionMode = readStoredPermissionMode();
+  /** Product default (localStorage) for new / unbound sessions. */
+  private permissionModeDefault: PermissionMode = readStoredPermissionMode();
+  /** Per-session override so multi-session turns do not bleed Bypass/Default. */
+  private permissionModeBySession = new Map<string, PermissionMode>();
   private workspace = "";
   private computerLeases = new Map<string, string>();
   private activeComputerSessions = new Set<string>();
@@ -884,6 +1030,14 @@ export class AcpBridge implements GrokBridge {
 
   subscribe(callback: (event: BridgeEvent) => void) {
     this.listeners.add(callback);
+    // connect() starts in the constructor; store may subscribe after preflight.
+    if (this.lastBootPhase) {
+      callback({
+        type: "boot_phase",
+        phase: this.lastBootPhase,
+        detail: this.lastBootPhaseDetail,
+      });
+    }
     return () => this.listeners.delete(callback);
   }
 
@@ -958,6 +1112,7 @@ export class AcpBridge implements GrokBridge {
 
   /** Seed catalogue so loadSession skips a full x.ai/session/list round-trip. */
   rememberSessionMeta(meta: SessionMeta): void {
+    this.abandonedSessions.delete(meta.id);
     this.catalogue.set(meta.id, meta);
   }
 
@@ -1319,6 +1474,13 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
+  /** Live session/prompt must never keep silent history filter (drops first events). */
+  private async clearSilentForLiveTurn(sessionId: string): Promise<void> {
+    this.silentReplaying.delete(sessionId);
+    this.replaying.delete(sessionId);
+    await this.setSilentStream(false, sessionId);
+  }
+
   /** Serialize heavy ACP ops so silent bind cannot overlap another session's live stream. */
   private runOnChannel<T>(op: () => Promise<T>): Promise<T> {
     const run = this.channelTail.then(op, op);
@@ -1336,6 +1498,15 @@ export class AcpBridge implements GrokBridge {
     this.silentReplaying.clear();
     this.replaying.clear();
     this.progressiveLoad.clear();
+    this.primaryPromptSessions.clear();
+    this.primaryPromptGen.clear();
+    this.concurrentPromptCount.clear();
+    this.concurrentPromptGen.clear();
+    this.liveTurnActivityAt.clear();
+    // Dead agent cannot receive plan/permission answers — drop locks.
+    this.resolvedPlanDecisions.clear();
+    this.resolvedPlanByBlock.clear();
+    this.interactions.clear();
     for (const timer of this.progressiveFlushTimers.values()) {
       window.clearTimeout(timer);
     }
@@ -1389,26 +1560,135 @@ export class AcpBridge implements GrokBridge {
     await this.initializeAgent();
   }
 
+  private setBootPhase(phase: BootPhase, detail?: string): void {
+    this.lastBootPhase = phase;
+    this.lastBootPhaseDetail = detail;
+    this.emit({ type: "boot_phase", phase, detail });
+  }
+
+  /**
+   * Shared-first boot:
+   * 1) preflight (clear stale auth.json.lock, probe machine leader)
+   * 2) try preferred mode — cold/warm shared handshake budget
+   * 3) on shared timeout/busy → soft local for this process only
+   *    (does NOT rewrite Settings; no auth.error / reconnect bait)
+   * Runtime product-gate 403 recovery still sticky-writes local.
+   */
   private async initializeAgent(): Promise<void> {
     // Diagnostics belong to one concrete child process. Keeping stderr from a
     // process replaced during a Tauri hot reload produces misleading errors.
     this.diagnostics = [];
+    this.setBootPhase("preflight");
+
+    let machineLeaderAlive: boolean | undefined;
+    try {
+      const preflight = await invoke<{
+        authLockCleared?: boolean;
+        authLockAgeSecs?: number | null;
+        notes?: string[];
+        leaderMode?: string;
+        machineLeaderAlive?: boolean;
+      }>("preflight_agent_boot");
+      machineLeaderAlive = preflight?.machineLeaderAlive;
+      if (preflight?.authLockCleared) {
+        this.diagnostics.push(
+          `preflight: cleared stale auth.json.lock` +
+            (preflight.authLockAgeSecs != null
+              ? ` (age ${preflight.authLockAgeSecs}s)`
+              : ""),
+        );
+      }
+      for (const note of preflight?.notes ?? []) {
+        this.diagnostics.push(`preflight: ${note}`);
+      }
+    } catch {
+      /* older shell without preflight_agent_boot — continue */
+    }
+
+    let preferredMode = "local";
+    try {
+      preferredMode = await invoke<string>("get_agent_leader_mode");
+    } catch {
+      preferredMode = "local";
+    }
+    const wantShared = preferredMode !== "local";
+    const sharedBudget = sharedInitTimeoutMs(machineLeaderAlive);
+
+    if (wantShared) {
+      try {
+        await this.spawnAndHandshake("shared", sharedBudget);
+        this.setBootPhase("ready");
+        return;
+      } catch (sharedError) {
+        const detail = errorText(sharedError);
+        this.diagnostics.push(`shared boot failed: ${detail}`);
+        this.setBootPhase("fallback_local", detail);
+        // Soft only: do NOT rewrite desktop-agent-leader-mode.json.
+        // Must NOT bare-acp_kill while suppressExitHandling is false: onExit would
+        // permanently reject `this.ready` mid-recovery (PR-A review B1).
+        this.suppressExitHandling = true;
+        try {
+          await this.spawnAndHandshake("local", LOCAL_INIT_TIMEOUT_MS);
+        } catch (localError) {
+          const localDetail = errorText(localError);
+          throw new Error(
+            `初始化失败：共享 Leader 不可用（${detail}），独立进程亦失败（${localDetail}）。` +
+              `请确认 Grok Build CLI 已安装，或在设置中检查进程模式。`,
+          );
+        } finally {
+          this.suppressExitHandling = false;
+        }
+        const notice = bootFallbackNoticeText(true, detail);
+        this.setBootPhase("ready", notice);
+        // Banner only — never auth.error (StatusBar would demand reconnect).
+        return;
+      }
+    }
+
+    // Operator prefers local.
+    try {
+      await this.spawnAndHandshake("local", LOCAL_INIT_TIMEOUT_MS);
+      this.setBootPhase("ready");
+    } catch (error) {
+      const detail = errorText(error);
+      throw new Error(
+        `初始化失败：${detail}。CLI 已启动但未在 ${Math.round(LOCAL_INIT_TIMEOUT_MS / 1000)} 秒内完成握手。`,
+      );
+    }
+  }
+
+  /** Spawn ACP child and complete initialize + authenticate for one leader mode. */
+  private async spawnAndHandshake(
+    mode: "shared" | "local",
+    initTimeoutMs: number,
+  ): Promise<void> {
+    this.setBootPhase(mode === "shared" ? "spawning_shared" : "spawning_local");
     try {
       await Promise.race([
-        invoke("acp_spawn", { cwd: this.workspace }),
+        // Pass leaderMode so soft fallback can use --no-leader without sticky pref.
+        invoke("acp_spawn", { cwd: this.workspace, leaderMode: mode }),
         new Promise<never>((_, reject) => {
           window.setTimeout(
-            () => reject(new Error("启动 Grok Agent 超时（30 秒）")),
-            30_000,
+            () =>
+              reject(
+                new Error(
+                  `启动进程超时（${Math.round(SPAWN_TIMEOUT_MS / 1000)} 秒）`,
+                ),
+              ),
+            SPAWN_TIMEOUT_MS,
           );
         }),
       ]);
     } catch (error) {
       const detail = errorText(error);
       throw new Error(
-        `无法启动 Grok Agent：${detail}。请确认 Grok Build CLI 已安装，或通过 GROK_DESKTOP_CLI 指定可执行文件。`,
+        `无法启动 Grok CLI：${detail}。请确认已安装，或通过 GROK_DESKTOP_CLI 指定可执行文件。`,
       );
     }
+
+    this.setBootPhase(
+      mode === "shared" ? "initializing_shared" : "initializing_local",
+    );
     let response: unknown;
     try {
       response = await this.requestRaw(
@@ -1419,17 +1699,18 @@ export class AcpBridge implements GrokBridge {
             fs: { readTextFile: false, writeTextFile: false },
             terminal: false,
           },
-          clientInfo: { name: "grox-desktop", title: "Grox Desktop", version: "0.1.0" },
+          clientInfo: { ...ACP_CLIENT_INFO },
           _meta: {
-            clientIdentifier: "grok-desktop",
-            clientType: "desktop",
+            clientIdentifier: ACP_CLIENT_IDENTIFIER,
+            clientType: ACP_CLIENT_TYPE,
           },
         },
-        20_000,
+        initTimeoutMs,
       );
     } catch (error) {
+      const detail = errorText(error);
       throw new Error(
-        `Grok Agent 初始化失败：${errorText(error)}。CLI 已启动但未在 20 秒内完成握手。`,
+        `握手失败（${mode}，${Math.round(initTimeoutMs / 1000)}s）：${detail}`,
       );
     }
     this.captureModelState(response);
@@ -1447,6 +1728,56 @@ export class AcpBridge implements GrokBridge {
       () => undefined,
     );
     return run;
+  }
+
+  /**
+   * Manual reconnect from the shell: clears flap cooldown, aborts auto-reconnect
+   * ownership, restarts the child, and notifies the store to re-drain queues.
+   */
+  async forceReconnectAgent(): Promise<void> {
+    this.reconnectCoolingUntil = 0;
+    this.reconnectSuccessTimes = [];
+    this.reconnectEpoch += 1;
+    this.crashReconnectInFlight = false;
+    this.reconnectChildDied = false;
+    this.cancelReconnectDelay();
+    this.setAuthState({
+      ...this.authState,
+      inProgress: true,
+      error: "正在手动重连 Agent…",
+    });
+    try {
+      await this.restartAgent();
+      this.setAuthState({
+        ...this.authState,
+        inProgress: false,
+        error: undefined,
+      });
+      const active = this.activeSessionId();
+      if (active) {
+        this.enqueueBackgroundLoad(active);
+        this.emit({
+          type: "block_add",
+          sessionId: active,
+          block: {
+            type: "system",
+            id: uid(),
+            text: "已手动重连 Agent；可继续对话",
+            ts: Date.now(),
+            kind: "info",
+          },
+        });
+      }
+      this.emit({ type: "agent_reconnected" });
+    } catch (error) {
+      const msg = errorText(error);
+      this.setAuthState({
+        required: this.authState.required,
+        inProgress: false,
+        error: `手动重连失败：${msg}`,
+      });
+      throw error instanceof Error ? error : new Error(msg);
+    }
   }
 
   /** Wake any crash-reconnect backoff waiter and drop the timer. */
@@ -1832,14 +2163,20 @@ export class AcpBridge implements GrokBridge {
 
   private onServerRequest(message: JsonRpcMessage) {
     if (message.method === ACP_METHODS.requestPermission) {
+      const sid = string(record(message.params)?.sessionId);
+      if (sid) this.noteLiveTurnActivity(sid);
       this.handlePermission(message.id!, message.params);
       return;
     }
     if (message.method === "x.ai/exit_plan_mode") {
+      const sid = string(record(message.params)?.sessionId);
+      if (sid) this.noteLiveTurnActivity(sid);
       this.handlePlanApproval(message.id!, message.params);
       return;
     }
     if (message.method === "x.ai/ask_user_question") {
+      const sid = string(record(message.params)?.sessionId);
+      if (sid) this.noteLiveTurnActivity(sid);
       this.handleQuestion(message.id!, message.params);
       return;
     }
@@ -1855,12 +2192,25 @@ export class AcpBridge implements GrokBridge {
     });
   }
 
+  /** Record that the agent produced a live turn signal (stream or gate). */
+  private noteLiveTurnActivity(sessionId: string): void {
+    if (
+      this.primaryPromptSessions.has(sessionId) ||
+      (this.concurrentPromptCount.get(sessionId) ?? 0) > 0
+    ) {
+      this.liveTurnActivityAt.set(sessionId, Date.now());
+    }
+  }
+
   private onNotification(method: string, paramsValue: unknown) {
     if (method === "session/update" || method === "x.ai/session/update") {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
       if (sessionId && this.silentReplaying.has(sessionId)) return;
-      if (sessionId) this.handleSessionUpdate(sessionId, params?.update);
+      if (sessionId) {
+        this.noteLiveTurnActivity(sessionId);
+        this.handleSessionUpdate(sessionId, params?.update);
+      }
       return;
     }
     if (method === "x.ai/session_notification") {
@@ -1908,7 +2258,7 @@ export class AcpBridge implements GrokBridge {
       method: wireMethod(method),
       params: {
         sessionId,
-        clientIdentifier: "grox-desktop",
+        clientIdentifier: ACP_CLIENT_IDENTIFIER,
         ...params,
       },
     }).catch(() => {
@@ -1929,8 +2279,16 @@ export class AcpBridge implements GrokBridge {
 
     switch (type) {
       case "user_message_chunk": {
-        if (!this.replaying.has(sessionId)) return;
         const delta = contentText(update.content);
+        // Hide plan primers (and legacy SuperGrok primers) from the transcript.
+        if (isPrimerText(delta) || isPrimerText(`${cursor.userText ?? ""}${delta}`)) {
+          cursor.userOpen = false;
+          cursor.userId = undefined;
+          cursor.userText = undefined;
+          return;
+        }
+        // Live user text is painted optimistically by promptInner; only replay paints here.
+        if (!this.replaying.has(sessionId)) return;
         const promptIndex = number(record(update._meta)?.promptIndex);
         const userId = cursor.userId;
         const beginsNewPrompt =
@@ -2043,7 +2401,19 @@ export class AcpBridge implements GrokBridge {
       case "current_mode_update": {
         const modeId = string(update.currentModeId);
         const mode: AgentMode = modeId === "plan" ? "plan" : modeId === "ask" ? "ask" : "agent";
+        const prev = this.sessionOptions.get(sessionId);
+        if (prev) this.sessionOptions.set(sessionId, { ...prev, mode });
+        else {
+          this.sessionOptions.set(sessionId, {
+            model: this.modelState.currentId,
+            effort: "high",
+            mode,
+          });
+        }
         this.emit({ type: "mode_state", sessionId, mode });
+        // Do NOT inject primer here: agent-driven mode flips often mid-turn, and
+        // session/prompt would race the live turn. Primer is host-initiated only
+        // (setSessionMode / applyPlanRestore / deferred after finishTurn).
         return;
       }
       case "tool_call":
@@ -2096,7 +2466,7 @@ export class AcpBridge implements GrokBridge {
       input: jsonText(update.rawInput),
       output: toolOutputText(update.rawOutput, content),
       diff: extractDiffs([content, update.rawInput, update.rawOutput]),
-      images: extractImages([content, update.rawOutput]),
+      images: extractImages([content, update.rawOutput], update),
       terminal: extractTerminal(
         kind,
         update.title,
@@ -2167,7 +2537,9 @@ export class AcpBridge implements GrokBridge {
         ...(content.length > 0 || update.rawInput !== undefined || update.rawOutput !== undefined
           ? { diff: extractDiffs([content, update.rawInput, update.rawOutput]) }
           : {}),
-        ...(content.length > 0 || update.rawOutput !== undefined ? { images: extractImages([content, update.rawOutput]) } : {}),
+        ...(content.length > 0 || update.rawOutput !== undefined
+          ? { images: extractImages([content, update.rawOutput], update) }
+          : {}),
         ...(terminal ? { terminal } : {}),
         ...(locations ? { locations } : {}),
       },
@@ -2274,7 +2646,34 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
+  /** True when a permission / plan / question RPC is still waiting on the operator. */
+  private hasOpenInteraction(sessionId: string): boolean {
+    for (const item of this.interactions.values()) {
+      if (
+        item.sessionId === sessionId &&
+        (item.kind === "permission" || item.kind === "plan" || item.kind === "question")
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private finishTurn(sessionId: string, usageValue?: JsonObject) {
+    // A concurrent follow-up may still be on the wire after the primary returns
+    // (or vice versa). Do not paint 就绪 while any session/prompt is open.
+    if (
+      this.primaryPromptSessions.has(sessionId) ||
+      (this.concurrentPromptCount.get(sessionId) ?? 0) > 0
+    ) {
+      if (usageValue) this.emitUsage(sessionId, usageValue);
+      // Keep/restore running so Composer stays in queue/interject mode —
+      // but never demote an open gate (Permission/Question card must stay active).
+      if (!this.hasOpenInteraction(sessionId)) {
+        this.emit({ type: "status", sessionId, status: "running" });
+      }
+      return;
+    }
     this.closeUser(sessionId);
     this.closeThinking(sessionId);
     this.closeAssistant(sessionId);
@@ -2282,6 +2681,151 @@ export class AcpBridge implements GrokBridge {
     this.resetTurnRetryState(this.cursor(sessionId));
     if (usageValue) this.emitUsage(sessionId, usageValue);
     this.emit({ type: "status", sessionId, status: "idle" });
+    // Deferred plan primer (operator switched to plan mid-turn).
+    if (this.planPrimerNeeded.has(sessionId)) {
+      void this.ensurePlanPrimer(sessionId).catch((error) => {
+        console.warn("deferred plan primer inject failed", error);
+      });
+    }
+  }
+
+  /** Start a JSON-RPC request; resolve only after the line is written (not the result). */
+  private beginRequest(
+    method: string,
+    params: unknown,
+    timeoutMs: number,
+  ): { rpcId: number; response: Promise<unknown>; written: Promise<void> } {
+    const rpcId = ++this.requestId;
+    const response = new Promise<unknown>((resolve, reject) => {
+      this.pending.set(rpcId, {
+        resolve,
+        reject,
+        method,
+        timeoutId:
+          timeoutMs > 0
+            ? window.setTimeout(() => {
+                const pending = this.pending.get(rpcId);
+                if (!pending) return;
+                this.pending.delete(rpcId);
+                pending.reject(new Error(`Grok Agent 请求超时：${method}`));
+              }, timeoutMs)
+            : undefined,
+      });
+    });
+    const written = this.sendRaw({
+      jsonrpc: "2.0",
+      id: rpcId,
+      method: wireMethod(method),
+      params,
+    }).catch((cause) => {
+      const pending = this.pending.get(rpcId);
+      if (pending) {
+        this.pending.delete(rpcId);
+        if (pending.timeoutId !== undefined) window.clearTimeout(pending.timeoutId);
+      }
+      throw cause instanceof Error ? cause : new Error(String(cause));
+    });
+    return { rpcId, response, written };
+  }
+
+  /**
+   * After session/prompt is on the wire: if the agent never emits a live update
+   * (or gate) within FIRST_EVENT_STALL_MS, auto session/cancel and fail the
+   * turn so the UI leaves "0 条事件" without requiring manual Stop.
+   */
+  private withFirstEventWatchdog(
+    sessionId: string,
+    primaryGen: number,
+    writtenAt: number,
+    response: Promise<unknown>,
+  ): Promise<unknown> {
+    return new Promise<unknown>((resolve, reject) => {
+      let settled = false;
+      const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        window.clearInterval(timer);
+        fn();
+      };
+      const timer = window.setInterval(() => {
+        if (this.primaryPromptGen.get(sessionId) !== primaryGen) {
+          finish(() => {
+            /* superseded — leave response orphaned */
+          });
+          return;
+        }
+        const activity = this.liveTurnActivityAt.get(sessionId) ?? 0;
+        if (activity >= writtenAt) {
+          // First event arrived — stop watching; response still settles the turn.
+          window.clearInterval(timer);
+          return;
+        }
+        if (Date.now() - writtenAt < FIRST_EVENT_STALL_MS) return;
+        finish(() => {
+          void this.notify(ACP_METHODS.sessionCancel, {
+            sessionId,
+            _meta: { trigger: "first_event_watchdog", cancelSubagents: true },
+          }).catch(() => {});
+          // Drop bookkeeping so finishTurn can paint idle (invalidate bumps gen).
+          this.invalidatePromptFlights(sessionId);
+          this.finishTurn(sessionId);
+          reject(
+            new Error(
+              `Agent 超过 ${Math.round(FIRST_EVENT_STALL_MS / 1000)}s 无事件返回（常见于上一轮工具未结束）。已自动终止，草稿可重试。`,
+            ),
+          );
+        });
+      }, 500);
+      response.then(
+        (value) => finish(() => resolve(value)),
+        (error) => finish(() => reject(error)),
+      );
+    });
+  }
+
+  /** Begin a concurrent follow-up; returns generation for the matching end. */
+  private noteConcurrentStart(sessionId: string): number {
+    const gen = this.concurrentPromptGen.get(sessionId) ?? 0;
+    this.concurrentPromptCount.set(
+      sessionId,
+      (this.concurrentPromptCount.get(sessionId) ?? 0) + 1,
+    );
+    return gen;
+  }
+
+  /**
+   * End one concurrent follow-up. Returns false if this RPC was superseded
+   * (cancel / agent restart) and must not touch counts or UI settle.
+   */
+  private noteConcurrentEnd(sessionId: string, gen: number): boolean {
+    if ((this.concurrentPromptGen.get(sessionId) ?? 0) !== gen) return false;
+    const next = (this.concurrentPromptCount.get(sessionId) ?? 1) - 1;
+    if (next <= 0) this.concurrentPromptCount.delete(sessionId);
+    else this.concurrentPromptCount.set(sessionId, next);
+    return true;
+  }
+
+  /** Invalidate all open primary/concurrent bookkeeping for a session (cancel/exit). */
+  private invalidatePromptFlights(sessionId: string): void {
+    this.primaryPromptGen.set(sessionId, (this.primaryPromptGen.get(sessionId) ?? 0) + 1);
+    this.concurrentPromptGen.set(sessionId, (this.concurrentPromptGen.get(sessionId) ?? 0) + 1);
+    this.primaryPromptSessions.delete(sessionId);
+    this.concurrentPromptCount.delete(sessionId);
+  }
+
+  /** Soft system error — never forces store status→idle (unlike BridgeEvent error). */
+  private emitSoftError(sessionId: string, message: string): void {
+    this.emit({
+      type: "block_add",
+      sessionId,
+      block: {
+        type: "system",
+        id: uid(),
+        text: message,
+        ts: Date.now(),
+        kind: "error",
+      },
+    });
   }
 
   private emitUsage(sessionId: string, usageValue: JsonObject) {
@@ -2312,7 +2856,8 @@ export class AcpBridge implements GrokBridge {
       return;
     }
     const toolCallId = string(tool.toolCallId) ?? string(params.toolCallId) ?? uid();
-    const blockId = `permission-${toolCallId}`;
+    // Include rpcId so two concurrent tools with the same toolCallId do not share a card.
+    const blockId = `permission-${toolCallId}-${String(rpcId)}`;
     const optionIds: PendingInteraction["optionIds"] = {};
     for (const rawOption of array(params.options)) {
       const option = record(rawOption) ?? {};
@@ -2366,48 +2911,115 @@ export class AcpBridge implements GrokBridge {
       toolName: tool.toolName ?? tool.tool_name,
       rawInput: tool.rawInput ?? tool.raw_input ?? params.rawInput,
     });
-    // Auto-select when product mode is Auto/Bypass (CLI may still raise
-    // request_permission — FE must not stall the turn), or when CU opt-in
-    // already authorized the desktop harness for grok_desktop_computer tools.
-    const modeAuto =
-      this.permissionMode === "auto" || this.permissionMode === "bypass";
+    // Auto / Bypass / CU auto-approve (see permissionAuto.ts).
+    // Auto ≠ Bypass: Auto only read-ish tools; Bypass is YOLO for trusted envs.
+    // Never auto while another manual gate is open (ordered stacked cards).
     const cuAuto =
       isComputerUseOperatorEnabled() && isComputerUseMcpTool(toolName);
-    if (modeAuto || cuAuto) {
-      const autoOptionId = optionIds.allow_always ?? optionIds.allow_once;
+    const hasOpenManualGate = this.hasOpenInteraction(sessionId);
+    const toolLabel = permissionToolLabel({
+      title: tool.title,
+      kind: tool.kind,
+      name: tool.name,
+      toolName: tool.toolName ?? tool.tool_name ?? toolName,
+    });
+    const paintManualPermissionCard = () => {
+      this.interactions.set(blockId, {
+        rpcId,
+        sessionId,
+        blockId,
+        kind: "permission",
+        optionIds,
+      });
+      this.emit({
+        type: "permission_request",
+        sessionId,
+        blockId,
+        req: {
+          id: String(rpcId),
+          toolCallId,
+          title: string(tool.title) ?? "Tool approval",
+          description: string(tool.kind) ?? "Grok requests permission to continue.",
+          payload: jsonText(tool.rawInput),
+          options,
+          purpose: "tool",
+        },
+      });
+    };
+    // Plan mode host gate (vscode-supergrok): auto-reject mutating tools until plan approved.
+    const sessionMode = this.sessionOptions.get(sessionId)?.mode ?? "agent";
+    if (sessionMode === "plan") {
+      const toolKind = string(tool.kind) ?? string(tool.name) ?? toolLabel;
+      if (
+        shouldRejectPermission(toolKind, {
+          active: true,
+          workspaceRoot: this.workspace,
+        })
+      ) {
+        const rejectId =
+          optionIds.deny ??
+          pickRejectOption(
+            array(params.options).map((raw) => {
+              const o = record(raw) ?? {};
+              return {
+                optionId: string(o.optionId) ?? "",
+                kind: string(o.kind) ?? string(o.name) ?? "",
+                name: string(o.name),
+              };
+            }).filter((o) => o.optionId),
+          );
+        if (rejectId) {
+          void this.sendRaw({
+            jsonrpc: "2.0",
+            id: rpcId,
+            result: { outcome: { outcome: "selected", optionId: rejectId } },
+          }).catch((error) => {
+            this.emitSoftError(sessionId, `Plan 模式自动拒绝失败：${errorText(error)}`);
+          });
+          this.emit({
+            type: "block_add",
+            sessionId,
+            block: {
+              type: "system",
+              id: uid(),
+              text:
+                "Plan 模式已拦截会修改工作区的工具。请先批准计划，或切换到 Agent 模式。",
+              ts: Date.now(),
+              kind: "info",
+            },
+          });
+          return;
+        }
+      }
+    }
+    if (
+      shouldAutoApproveToolPermission({
+        permissionMode: this.permissionModeFor(sessionId),
+        toolLabel,
+        computerUseAuto: cuAuto,
+        hasOpenManualGate,
+      })
+    ) {
+      // Prefer once over always — sticky allow_always outlives Default switch.
+      const autoOptionId = pickSilentAllowOptionId(optionIds);
       if (autoOptionId) {
         void this.sendRaw({
           jsonrpc: "2.0",
           id: rpcId,
           result: { outcome: { outcome: "selected", optionId: autoOptionId } },
         }).catch((error) => {
-          this.emit({ type: "error", sessionId, message: errorText(error) });
+          // Soft notice alone leaves the agent blocked on request_permission with
+          // no card and no retry path — fall through to a manual gate.
+          this.emitSoftError(sessionId, `自动批准失败：${errorText(error)}`);
+          if (!this.interactions.has(blockId)) {
+            paintManualPermissionCard();
+          }
         });
         return;
       }
     }
 
-    this.interactions.set(blockId, {
-      rpcId,
-      sessionId,
-      blockId,
-      kind: "permission",
-      optionIds,
-    });
-    this.emit({
-      type: "permission_request",
-      sessionId,
-      blockId,
-      req: {
-        id: String(rpcId),
-        toolCallId,
-        title: string(tool.title) ?? "Tool approval",
-        description: string(tool.kind) ?? "Grok requests permission to continue.",
-        payload: jsonText(tool.rawInput),
-        options,
-        purpose: "tool",
-      },
-    });
+    paintManualPermissionCard();
   }
 
   private handlePlanApproval(rpcId: RpcId, paramsValue: unknown) {
@@ -2418,13 +3030,19 @@ export class AcpBridge implements GrokBridge {
       return;
     }
     const toolCallId = string(params.toolCallId) ?? uid();
-    const blockId = `plan-approval-${toolCallId}`;
+    const blockId = `plan-approval-${toolCallId}-${String(rpcId)}`;
+    const planText =
+      string(params.planContent) ??
+      string(params.plan) ??
+      string(params.content) ??
+      "";
     this.interactions.set(blockId, {
       rpcId,
       sessionId,
       blockId,
       kind: "plan",
       optionIds: {},
+      planText,
     });
     this.emit({
       type: "permission_request",
@@ -2435,7 +3053,7 @@ export class AcpBridge implements GrokBridge {
         toolCallId,
         title: "Approve execution plan",
         description: "Grok has finished planning and is waiting to enter agent mode.",
-        payload: string(params.planContent),
+        payload: planText || undefined,
         options: ["allow_once", "deny"],
         purpose: "plan",
       },
@@ -2446,6 +3064,8 @@ export class AcpBridge implements GrokBridge {
     const params = record(paramsValue) ?? {};
     const sessionId = string(params.sessionId);
     const toolCallId = string(params.toolCallId) ?? uid();
+    // Unique per RPC so stacked ask_user interviews never share one card/map slot.
+    const blockId = `question-${toolCallId}-${String(rpcId)}`;
     const questions: QuestionItem[] = [];
     for (const value of array(params.questions)) {
       const question = record(value);
@@ -2475,7 +3095,6 @@ export class AcpBridge implements GrokBridge {
       return;
     }
 
-    const blockId = `question-${toolCallId}`;
     this.interactions.set(blockId, {
       rpcId,
       sessionId,
@@ -2591,35 +3210,92 @@ export class AcpBridge implements GrokBridge {
     return { ...this.modelState, models: [...this.modelState.models] };
   }
 
-  setPermissionMode(mode: PermissionMode): void {
-    this.permissionMode = mode;
+  setPermissionMode(mode: PermissionMode, sessionId?: string): void {
+    if (sessionId) {
+      this.permissionModeBySession.set(sessionId, mode);
+    } else {
+      // Product default for new sessions + apply to all known sessions so Settings
+      // "global" mode does not leave background turns on a stale Bypass/Default.
+      this.permissionModeDefault = mode;
+      for (const id of this.knownSessions) {
+        this.permissionModeBySession.set(id, mode);
+      }
+    }
     localStorage.setItem("grok.permissionMode", mode);
     void this.notify("x.ai/yolo_mode_changed", {
-      clientIdentifier: "grok-desktop",
+      clientIdentifier: ACP_CLIENT_IDENTIFIER,
       permission_mode:
         mode === "bypass" ? "always-approve" : mode === "auto" ? "auto" : "default",
       yolo_mode: mode === "bypass",
       auto_mode: mode === "auto",
+      ...(sessionId ? { sessionId } : {}),
     }).catch((error) => {
-      for (const sessionId of this.knownSessions) {
-        this.emit({ type: "error", sessionId, message: errorText(error) });
+      for (const id of this.knownSessions) {
+        this.emit({ type: "error", sessionId: id, message: errorText(error) });
       }
     });
+    // Switching into YOLO must clear already-painted tool cards; otherwise the
+    // operator still has to click 仅本次允许 for the open request (and every
+    // later tool used to stack behind hasOpenManualGate).
+    if (mode === "bypass") {
+      this.flushPendingToolPermissionsForMode(sessionId);
+    }
   }
 
-  private sessionPermissionMeta() {
+  /**
+   * Silent-allow open tool permission RPCs after the operator picks YOLO.
+   * Plan / question gates stay (product: YOLO is tool-only).
+   */
+  private flushPendingToolPermissionsForMode(sessionId?: string): void {
+    const pending = [...this.interactions.entries()].filter(
+      ([, item]) =>
+        item.kind === "permission" &&
+        (sessionId === undefined || item.sessionId === sessionId),
+    );
+    for (const [blockId, item] of pending) {
+      const optionId = pickSilentAllowOptionId(item.optionIds);
+      if (!optionId) continue;
+      this.interactions.delete(blockId);
+      this.emit({
+        type: "permission_resolved",
+        sessionId: item.sessionId,
+        blockId,
+        option: "allow_once",
+      });
+      void this.sendRaw({
+        jsonrpc: "2.0",
+        id: item.rpcId,
+        result: { outcome: { outcome: "selected", optionId } },
+      }).catch((error) => {
+        this.interactions.set(blockId, item);
+        this.emit({ type: "permission_restored", sessionId: item.sessionId, blockId });
+        this.emitSoftError(
+          item.sessionId,
+          `YOLO 自动批准失败，请手动点允许：${errorText(error)}`,
+        );
+      });
+    }
+  }
+
+  /** Mode used for tool auto-approve for this session (no cross-session bleed). */
+  private permissionModeFor(sessionId: string): PermissionMode {
+    return this.permissionModeBySession.get(sessionId) ?? this.permissionModeDefault;
+  }
+
+  private sessionPermissionMeta(sessionId?: string) {
+    const mode = sessionId ? this.permissionModeFor(sessionId) : this.permissionModeDefault;
     return {
-      clientIdentifier: "grok-desktop",
-      yoloMode: this.permissionMode === "bypass",
-      autoMode: this.permissionMode === "auto",
+      clientIdentifier: ACP_CLIENT_IDENTIFIER,
+      yoloMode: mode === "bypass",
+      autoMode: mode === "auto",
     };
   }
 
-  private async sessionMeta(cwd: string) {
+  private async sessionMeta(cwd: string, sessionId?: string) {
     const cached = this.sessionMetaCache.get(cwd);
     if (cached && cached.expires > Date.now()) {
       // Permission flags may change from the composer; always merge live flags.
-      return { ...cached.value, ...this.sessionPermissionMeta() };
+      return { ...cached.value, ...this.sessionPermissionMeta(sessionId) };
     }
     let systemPromptOverride: string | undefined;
     try {
@@ -2636,7 +3312,7 @@ export class AcpBridge implements GrokBridge {
     this.sessionMetaCache.set(cwd, { expires: Date.now() + 60_000, value: base });
     return {
       ...base,
-      ...this.sessionPermissionMeta(),
+      ...this.sessionPermissionMeta(sessionId),
     };
   }
 
@@ -2762,6 +3438,72 @@ export class AcpBridge implements GrokBridge {
     });
     const current = this.sessionOptions.get(sessionId);
     if (current) this.sessionOptions.set(sessionId, { ...current, mode });
+    else {
+      this.sessionOptions.set(sessionId, {
+        model: this.modelState.currentId,
+        effort: "high",
+        mode,
+      });
+    }
+    if (mode === "plan") {
+      void this.ensurePlanPrimer(sessionId).catch((error) => {
+        console.warn("plan primer inject failed", error);
+      });
+    }
+  }
+
+  /**
+   * Inject a hidden plan-mode primer once per session (not shown in UI).
+   * Uses session/prompt under silent stream so "ok" does not paint a bubble.
+   * Skips (and defers) when a live turn or permission gate is open.
+   */
+  private async ensurePlanPrimer(sessionId: string): Promise<void> {
+    if (this.planPrimerSent.has(sessionId)) {
+      this.planPrimerNeeded.delete(sessionId);
+      return;
+    }
+    if (
+      this.primaryPromptSessions.has(sessionId) ||
+      (this.concurrentPromptCount.get(sessionId) ?? 0) > 0 ||
+      this.hasOpenInteraction(sessionId)
+    ) {
+      this.planPrimerNeeded.add(sessionId);
+      return;
+    }
+    this.planPrimerNeeded.delete(sessionId);
+    this.planPrimerSent.add(sessionId);
+    try {
+      // Silent filter drops stream paint for this session during inject.
+      await this.setSilentStream(true, sessionId);
+      await this.requestRaw(
+        ACP_METHODS.sessionPrompt,
+        {
+          sessionId,
+          prompt: [{ type: "text", text: GROX_PLAN_PRIMER }],
+        },
+        90_000,
+      );
+    } catch (error) {
+      // Allow retry on next plan enter if inject failed.
+      this.planPrimerSent.delete(sessionId);
+      this.planPrimerNeeded.add(sessionId);
+      throw error;
+    } finally {
+      await this.setSilentStream(false, sessionId).catch(() => {});
+    }
+  }
+
+  /** After session/load, re-enter plan mode if last stored verdict was rejected. */
+  private async applyPlanRestore(sessionId: string): Promise<void> {
+    const decision = restoreDecisionForSession(sessionId);
+    if (!decision.planActive) return;
+    const current = this.sessionOptions.get(sessionId)?.mode;
+    if (current === "plan") {
+      void this.ensurePlanPrimer(sessionId).catch(() => {});
+      return;
+    }
+    await this.setSessionMode(sessionId, "plan");
+    this.emit({ type: "mode_state", sessionId, mode: "plan" });
   }
 
   async deleteProviderProfile(id: string): Promise<void> {
@@ -2883,7 +3625,12 @@ export class AcpBridge implements GrokBridge {
       updatedAt: now,
       model: string(detail?.modelId) ?? localStorage.getItem("grok.model") ?? "grok-build",
     };
+    this.abandonedSessions.delete(sessionId);
     this.knownSessions.add(sessionId);
+    // Inherit product default until store pushes a per-session override.
+    if (!this.permissionModeBySession.has(sessionId)) {
+      this.permissionModeBySession.set(sessionId, this.permissionModeDefault);
+    }
     this.catalogue.set(sessionId, meta);
     this.cursors.set(sessionId, { toolBlocks: new Map() });
     this.usage.set(sessionId, { ...EMPTY_USAGE });
@@ -2895,6 +3642,9 @@ export class AcpBridge implements GrokBridge {
     id: string,
     options?: { background?: boolean; silent?: boolean },
   ): Promise<void> {
+    if (this.abandonedSessions.has(id)) {
+      throw new Error(`会话已删除：${id}`);
+    }
     const inflight = this.loadPromises.get(id);
     if (inflight) return inflight;
 
@@ -2910,6 +3660,9 @@ export class AcpBridge implements GrokBridge {
     id: string,
     options?: { background?: boolean; silent?: boolean },
   ): Promise<void> {
+    if (this.abandonedSessions.has(id)) {
+      throw new Error(`会话已删除：${id}`);
+    }
     const background = options?.background === true;
     // Silent agent-bind: CLI rehydrates context; UI keeps offline disk history.
     const silentBind = options?.silent === true;
@@ -2920,6 +3673,9 @@ export class AcpBridge implements GrokBridge {
       meta = this.catalogue.get(id);
     }
     if (!meta) throw new Error(`找不到会话：${id}`);
+    if (this.abandonedSessions.has(id)) {
+      throw new Error(`会话已删除：${id}`);
+    }
 
     // Foreground non-silent: paint empty shell. Background/silent: keep UI.
     if (!background && !silentBind) {
@@ -2936,7 +3692,7 @@ export class AcpBridge implements GrokBridge {
     }
 
     try {
-      const metaRequest = await this.sessionMeta(meta.cwd);
+      const metaRequest = await this.sessionMeta(meta.cwd, id);
       // Silent/background loads are for offline history + first-send bind only.
       // Starting Computer Use MCP there leaks localhost listeners on every visit
       // and adds bind latency that fights the offline-history path.
@@ -2995,6 +3751,14 @@ export class AcpBridge implements GrokBridge {
           silentBind ? 5 * 60_000 : 2 * 60_000,
         );
       }
+      // Deleted while awaiting session/load — drop all bind side-effects.
+      if (this.abandonedSessions.has(id)) {
+        this.clearProgressiveLoad(id);
+        this.replaying.delete(id);
+        this.silentReplaying.delete(id);
+        await this.setSilentStream(false, id);
+        return;
+      }
       // Soft-fail CU (opt-in off) returns non-null computer with empty lists —
       // must NOT write computerLeases or ensureComputerAttachedForPrompt short-circuits.
       const loadLease = computerLeaseIfAttached(computer);
@@ -3018,8 +3782,17 @@ export class AcpBridge implements GrokBridge {
       this.clearProgressiveLoad(id);
       this.replaying.delete(id);
       this.silentReplaying.delete(id);
-      this.knownSessions.add(id);
       await this.setSilentStream(false, id);
+      // Final abandoned check after stream cleanup (delete can race the whole load).
+      if (this.abandonedSessions.has(id)) {
+        this.knownSessions.delete(id);
+        this.computerLeases.delete(id);
+        return;
+      }
+      this.knownSessions.add(id);
+      if (!this.permissionModeBySession.has(id)) {
+        this.permissionModeBySession.set(id, this.permissionModeDefault);
+      }
 
       if (silentBind) {
         // Bound for prompt; do not overwrite offline disk history with empty replay.
@@ -3030,15 +3803,21 @@ export class AcpBridge implements GrokBridge {
         ...replayed,
         usage: this.usage.get(id) ?? replayed.usage,
         status: "idle",
-        blocks: replayed.blocks.map((block) =>
-          block.type === "assistant"
-            ? { ...block, streaming: false }
-            : block.type === "thinking"
-              ? { ...block, live: false }
-              : block,
-        ),
+        blocks: replayed.blocks
+          .filter((block) => !(block.type === "user" && isPrimerText(block.text)))
+          .map((block) =>
+            block.type === "assistant"
+              ? { ...block, streaming: false }
+              : block.type === "thinking"
+                ? { ...block, live: false }
+                : block,
+          ),
       };
       this.emit({ type: "session_ready", session: finalized });
+      // Restore plan mode when last stored verdict was "rejected".
+      void this.applyPlanRestore(id).catch((error) => {
+        console.warn("plan restore failed", error);
+      });
     } catch (error) {
       this.clearProgressiveLoad(id);
       this.replaying.delete(id);
@@ -3089,6 +3868,8 @@ export class AcpBridge implements GrokBridge {
           type: "user",
           id: interjectionId,
           text: trimmed,
+          // Keep inside the live turn — see Timeline groupTurns.
+          interjected: true,
           attachments: (options.attachments ?? []).map(({ id, kind, name, mime, size, data, path }) => ({
             id,
             kind,
@@ -3131,32 +3912,83 @@ export class AcpBridge implements GrokBridge {
     const promptId = queueOptions.promptId ?? uid();
     const sendNow = queueOptions.sendNow === true;
     const content = promptContent(trimmed, options.attachments ?? []);
+    const params = {
+      sessionId,
+      prompt: content,
+      _meta: {
+        promptId,
+        sendNow,
+        clientIdentifier: ACP_CLIENT_IDENTIFIER,
+      },
+    };
 
-    // Must not race silent bind: serialize behind the same channel as load/prompt.
-    // Await the wire write so callers keep `source: local` on failure (R7).
+    /**
+     * Concurrent follow-ups must NOT await the full session/prompt turn.
+     * Contract: wait only until the JSON-RPC request is written; track the
+     * response in the background. Emit running so UI does not flip to 就绪
+     * while the follow-up is still open on the wire.
+     *
+     * Bookkeeping starts *before* the write so a primary that settles mid-write
+     * cannot finishTurn→idle and drain a second primary on top of this one.
+     */
+    // Capture gen before waiting on the exclusive channel so Stop/cancel during
+    // the wait aborts without starting a fresh concurrent flight.
+    const genAtEnqueue = this.concurrentPromptGen.get(sessionId) ?? 0;
     try {
       await this.runOnChannel(async () => {
-        await this.requestRaw(
-          ACP_METHODS.sessionPrompt,
-          {
-            sessionId,
-            prompt: content,
-            _meta: {
-              promptId,
-              sendNow,
-              clientIdentifier: "grox-desktop",
-            },
-          },
-          1_800_000,
-        );
+        if ((this.concurrentPromptGen.get(sessionId) ?? 0) !== genAtEnqueue) {
+          // Cancelled while queued for the channel — do not write.
+          throw new Error("队列提交已取消");
+        }
+        const concurrentGen = this.noteConcurrentStart(sessionId);
+        try {
+          const { response, written } = this.beginRequest(
+            ACP_METHODS.sessionPrompt,
+            params,
+            1_800_000,
+          );
+          await written;
+          // Cancelled mid-write: do not re-raise running; fail the store await so
+          // it does not markConsumed / drop the local row as "accepted".
+          if ((this.concurrentPromptGen.get(sessionId) ?? 0) !== concurrentGen) {
+            throw new Error("队列提交已取消");
+          }
+          // Follow-up is live — keep Composer in busy (queue/interject) mode,
+          // but never demote an open permission/question gate.
+          if (!this.hasOpenInteraction(sessionId)) {
+            this.emit({ type: "status", sessionId, status: "running" });
+          }
+          void response
+            .catch((error) => {
+              // Soft only: BridgeEvent "error" forces store status→idle and would
+              // yank a still-running primary turn (queue fail mid-turn).
+              this.emitSoftError(sessionId, `队列消息失败：${errorText(error)}`);
+            })
+            .finally(() => {
+              if (!this.noteConcurrentEnd(sessionId, concurrentGen)) return;
+              // Settle UI only when nothing else is still in-flight for this session.
+              this.finishTurn(sessionId);
+            });
+        } catch (writeError) {
+          // Write failed / cancelled after counting concurrent — unwind + settle.
+          if (this.noteConcurrentEnd(sessionId, concurrentGen)) {
+            this.finishTurn(sessionId);
+          }
+          throw writeError;
+        }
       });
     } catch (error) {
-      this.emit({
-        type: "error",
-        sessionId,
-        message: `队列消息失败：${errorText(error)}`,
-      });
-      throw error instanceof Error ? error : new Error(errorText(error));
+      const detail = errorText(error);
+      // Cancel is expected after Stop — soft notice only for real write failures.
+      if (!/已取消|cancelled/i.test(detail)) {
+        this.emitSoftError(sessionId, `队列消息失败：${detail}`);
+      }
+      throw error instanceof Error ? error : new Error(detail);
+    }
+
+    // Final cancel race: channel finished but gen was invalidated after return.
+    if ((this.concurrentPromptGen.get(sessionId) ?? 0) !== genAtEnqueue) {
+      throw new Error("队列提交已取消");
     }
 
     return {
@@ -3231,8 +4063,13 @@ export class AcpBridge implements GrokBridge {
 
   async prompt(sessionId: string, text: string, options: PromptOptions): Promise<void> {
     await this.ready;
-    // Channel-serialized with session/load so silent bind cannot overlap live turns.
-    return this.runOnChannel(() => this.promptInner(sessionId, text, options));
+    /**
+     * Channel only for setup + wire write — not the full turn duration.
+     * Holding the exclusive channel for the entire session/prompt blocked
+     * other sessions' silent bind / first-send for minutes (multi-mission UX).
+     * Primary flight tracking still prevents premature 就绪.
+     */
+    return this.promptInner(sessionId, text, options);
   }
 
   private async promptInner(sessionId: string, text: string, options: PromptOptions): Promise<void> {
@@ -3244,58 +4081,187 @@ export class AcpBridge implements GrokBridge {
     this.cursor(sessionId).thinkingId = undefined;
     this.cursor(sessionId).thinkingStartedAt = undefined;
     this.cursor(sessionId).planId = undefined;
+    const primaryGen = (this.primaryPromptGen.get(sessionId) ?? 0) + 1;
+    this.primaryPromptGen.set(sessionId, primaryGen);
+    this.primaryPromptSessions.add(sessionId);
     this.emit({ type: "status", sessionId, status: "running" });
     try {
-      // Silent-bound sessions skip Computer MCP at load time; attach once when
-      // the operator's prompt explicitly needs desktop control.
-      // Refuse (opt-in off) aborts the turn — do not session/prompt (R4A-CU-02).
-      const cu = await this.ensureComputerAttachedForPrompt(sessionId, text);
-      if (cu === "refused") {
-        // Throw so store can restore draft + pop optimistic bubble (busy-queue parity).
-        throw new Error(COMPUTER_USE_OPT_IN_REFUSE_MESSAGE);
-      }
-      const previous = this.sessionOptions.get(sessionId);
-      if (!previous || previous.model !== options.model || previous.effort !== options.effort) {
-        await this.requestRaw(ACP_METHODS.sessionSetModel, {
+      // Setup + write are channel-serialized so silent bind cannot interleave mid-op.
+      // IMPORTANT: do not return/await the response Promise inside runOnChannel —
+      // that would keep the exclusive channel held for the whole turn again.
+      let responsePromise: Promise<unknown> | undefined;
+      await this.runOnChannel(async () => {
+        // Silent-bound sessions skip Computer MCP at load time; attach once when
+        // the operator's prompt explicitly needs desktop control.
+        // Refuse (opt-in off) aborts the turn — do not session/prompt (R4A-CU-02).
+        const cu = await this.ensureComputerAttachedForPrompt(sessionId, text);
+        if (cu === "refused") {
+          throw new Error(COMPUTER_USE_OPT_IN_REFUSE_MESSAGE);
+        }
+        // Live turn must receive session/update — never leave silent filter on
+        // after silent bind / CU attach (would freeze UI at "0 条事件").
+        await this.clearSilentForLiveTurn(sessionId);
+        if (this.primaryPromptGen.get(sessionId) !== primaryGen) {
+          return;
+        }
+        // Evidence fix (AUTO 0-events hang): agent disk often left mid tool_call
+        // after sleep/crash/long timeout:0 tools. Offline UI forces status=idle so
+        // the operator sends a primary prompt; without cancel the agent never
+        // emits user_message_chunk / first events until the operator hits Stop
+        // (session/cancel). Pre-clear matches that manual recovery.
+        await this.notify(ACP_METHODS.sessionCancel, {
           sessionId,
-          modelId: options.model,
-          _meta: { reasoningEffort: options.effort },
+          _meta: { trigger: "pre_prompt_clear", cancelSubagents: true },
+        }).catch(() => {
+          /* older / idle agents — ignore */
         });
-      }
-      if (!previous || previous.mode !== options.mode) {
-        await this.requestRaw(ACP_METHODS.sessionSetMode, {
+        // Brief yield so the CLI can abort a zombie tool turn before session/prompt.
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, 120);
+        });
+        if (this.primaryPromptGen.get(sessionId) !== primaryGen) {
+          return;
+        }
+        const previous = this.sessionOptions.get(sessionId);
+        if (!previous || previous.model !== options.model || previous.effort !== options.effort) {
+          await this.requestRaw(ACP_METHODS.sessionSetModel, {
+            sessionId,
+            modelId: options.model,
+            _meta: { reasoningEffort: options.effort },
+          });
+        }
+        if (!previous || previous.mode !== options.mode) {
+          await this.requestRaw(ACP_METHODS.sessionSetMode, {
+            sessionId,
+            modeId: options.mode === "agent" ? "default" : options.mode,
+          });
+        }
+        this.sessionOptions.set(sessionId, {
+          model: options.model,
+          effort: options.effort,
+          mode: options.mode,
+        });
+
+        // Stop/cancel while waiting for channel or mid setup — do not write prompt.
+        if (this.primaryPromptGen.get(sessionId) !== primaryGen) {
+          return;
+        }
+        // Finite timeout: timeout 0 left "0 条事件" forever until operator Stop.
+        const started = this.beginRequest(
+          ACP_METHODS.sessionPrompt,
+          {
+            sessionId,
+            prompt: promptContent(text, options.attachments ?? []),
+          },
+          15 * 60_000,
+        );
+        await started.written;
+        if (this.primaryPromptGen.get(sessionId) !== primaryGen) {
+          // Cancelled mid-write: drop response tracking; finally will no-op settle.
+          return;
+        }
+        // Only count activity after the wire write (pre_prompt_clear noise ignored).
+        const writtenAt = Date.now();
+        this.liveTurnActivityAt.set(sessionId, 0);
+        responsePromise = this.withFirstEventWatchdog(
           sessionId,
-          modeId: options.mode === "agent" ? "default" : options.mode,
-        });
-      }
-      this.sessionOptions.set(sessionId, {
-        model: options.model,
-        effort: options.effort,
-        mode: options.mode,
+          primaryGen,
+          writtenAt,
+          started.response,
+        );
       });
 
-      const responseValue = await this.requestRaw(ACP_METHODS.sessionPrompt, {
-        sessionId,
-        prompt: promptContent(text, options.attachments ?? []),
-      }, 0);
-      const response = record(responseValue);
-      const meta = record(response?._meta);
+      // Wait for turn completion without holding the exclusive channel.
+      if (this.primaryPromptGen.get(sessionId) !== primaryGen) return;
+      const responseValue = await (responsePromise ?? Promise.resolve(undefined));
+      if (this.primaryPromptGen.get(sessionId) !== primaryGen) return;
+      const responseRecord = record(responseValue);
+      const meta = record(responseRecord?._meta);
       const promptUsage = record(meta?.usage);
       if (promptUsage) this.emitUsage(sessionId, promptUsage);
       await this.refreshSessionInfo(sessionId);
+      // Healthy turn: allow another auto-fallback if the gate regresses later.
+      this.productGateFallbackDone = false;
     } catch (error) {
       const detail = errorText(error);
-      this.emit({ type: "error", sessionId, message: detail });
-      // Propagate CU refuse so the store restores composer draft + pops the
-      // optimistic user bubble (mirrors busy-queue CU refuse path).
+      // CU refuse is handled by the store (restore draft); avoid dual error paint.
       if (
         detail === COMPUTER_USE_OPT_IN_REFUSE_MESSAGE
         || /computer\s*use|GROX_COMPUTER_USE|未启用/i.test(detail)
       ) {
         throw error instanceof Error ? error : new Error(detail);
       }
+      if (isProductGate403(detail)) {
+        const recovered = await this.tryRecoverFromProductGate403(sessionId, detail);
+        if (recovered) return;
+      }
+      this.emit({ type: "error", sessionId, message: detail });
     } finally {
+      // Superseded by cancel or a newer primary — do not clear the new flight.
+      if (this.primaryPromptGen.get(sessionId) !== primaryGen) return;
+      this.primaryPromptSessions.delete(sessionId);
+      // If a concurrent follow-up is still open, finishTurn keeps status=running.
       this.finishTurn(sessionId);
+    }
+  }
+
+  /**
+   * Shared-leader product gate recovery: force `local` (`--no-leader`), reconnect,
+   * and ask the operator to resend. One attempt per failure streak.
+   */
+  private async tryRecoverFromProductGate403(
+    sessionId: string,
+    detail: string,
+  ): Promise<boolean> {
+    if (this.productGateFallbackInFlight || this.productGateFallbackDone) {
+      this.emit({ type: "error", sessionId, message: detail });
+      return true;
+    }
+    this.productGateFallbackInFlight = true;
+    try {
+      let mode = "local";
+      try {
+        mode = await invoke<string>("get_agent_leader_mode");
+      } catch {
+        /* older shell without the command — assume local default */
+      }
+      if (mode === "local") {
+        this.emit({
+          type: "error",
+          sessionId,
+          message: `${detail}\n（已在独立进程模式下仍遇产品门控，请检查登录/订阅后重试。）`,
+        });
+        return true;
+      }
+      try {
+        await invoke<string>("set_agent_leader_mode", { mode: "local" });
+      } catch (cause) {
+        this.emit({
+          type: "error",
+          sessionId,
+          message: `${detail}\n（自动切到独立进程失败：${errorText(cause)}）`,
+        });
+        return true;
+      }
+      await this.forceReconnectAgent();
+      // Latch only after reconnect succeeds so a failed recovery can retry later.
+      this.productGateFallbackDone = true;
+      this.emit({
+        type: "error",
+        sessionId,
+        message:
+          "共享 Leader 触发 403「Grok Build is coming soon」产品门控。已自动切换为独立进程并重连 Agent — 请再发一次消息。",
+      });
+      return true;
+    } catch (cause) {
+      this.emit({
+        type: "error",
+        sessionId,
+        message: `${detail}\n（自动恢复失败：${errorText(cause)}）`,
+      });
+      return true;
+    } finally {
+      this.productGateFallbackInFlight = false;
     }
   }
 
@@ -3303,18 +4269,41 @@ export class AcpBridge implements GrokBridge {
     for (const [blockId, interaction] of this.interactions) {
       if (interaction.sessionId !== sessionId) continue;
       this.interactions.delete(blockId);
+      // Resolve UI cards so Question/Permission do not stay "answerable" after Stop
+      // (wire abandon alone does not emit permission_resolved / question_resolved).
+      if (interaction.kind === "permission" || interaction.kind === "plan") {
+        this.emit({
+          type: "permission_resolved",
+          sessionId,
+          blockId,
+          option: "deny",
+        });
+      } else if (interaction.kind === "question") {
+        this.emit({
+          type: "question_resolved",
+          sessionId,
+          blockId,
+          response: { outcome: "cancelled" },
+        });
+      }
       const result =
         interaction.kind === "permission"
           ? { outcome: { outcome: "cancelled" } }
           : { outcome: "cancelled" };
       void this.sendRaw({ jsonrpc: "2.0", id: interaction.rpcId, result });
     }
+    // Unblock live stream if we cancelled mid silent-bind / CU attach.
+    void this.clearSilentForLiveTurn(sessionId);
+    // Invalidate primary + concurrent gens so late finally handlers are no-ops.
+    this.invalidatePromptFlights(sessionId);
     void this.notify(ACP_METHODS.sessionCancel, {
       sessionId,
       _meta: { trigger: "user", cancelSubagents: true },
     }).catch((error) => {
       this.emit({ type: "error", sessionId, message: errorText(error) });
     });
+    // Force UI settle (finishTurn is unblocked now that counts are cleared).
+    this.finishTurn(sessionId);
   }
 
   async compact(sessionId: string): Promise<void> {
@@ -3401,21 +4390,32 @@ export class AcpBridge implements GrokBridge {
         outcome: option === "deny" ? "cancelled" : "approved",
         ...(option === "deny" && feedback?.trim() ? { feedback: feedback.trim() } : {}),
       };
+      // Persist verdict for offline/session restore (last rejected → stay in plan).
+      recordPlanVerdict(sessionId, {
+        text: pending.planText?.trim() || "(plan)",
+        verdict: verdictFromPermissionOption(option, feedback),
+      });
     } else {
       const optionId = pending.optionIds[option];
       result = optionId
         ? { outcome: { outcome: "selected", optionId } }
         : { outcome: { outcome: "cancelled" } };
     }
+    // Optimistic UI resolve; restore the card if the wire write fails.
+    this.emit({ type: "permission_resolved", sessionId, blockId, option });
     void this.sendRaw({ jsonrpc: "2.0", id: pending.rpcId, result }).catch((error) => {
-      // Roll back the lock so the operator can retry if the wire write failed.
+      // Roll back locks + interaction so the operator can retry.
       if (pending.kind === "plan") {
         this.resolvedPlanDecisions.delete(`${sessionId}:${String(pending.rpcId)}`);
         this.resolvedPlanByBlock.delete(blockId);
       }
-      this.emit({ type: "error", sessionId, message: errorText(error) });
+      this.interactions.set(blockId, pending);
+      this.emit({ type: "permission_restored", sessionId, blockId });
+      this.emitSoftError(
+        sessionId,
+        `权限响应发送失败，请重试：${errorText(error)}`,
+      );
     });
-    this.emit({ type: "permission_resolved", sessionId, blockId, option });
     return { duplicate: false };
   }
 
@@ -3446,10 +4446,13 @@ export class AcpBridge implements GrokBridge {
       result = { outcome: response.outcome, partial_answers: response.partialAnswers };
     }
 
-    void this.sendRaw({ jsonrpc: "2.0", id: pending.rpcId, result }).catch((error) => {
-      this.emit({ type: "error", sessionId, message: errorText(error) });
-    });
+    // Optimistic UI; restore card if wire write fails (same as permission).
     this.emit({ type: "question_resolved", sessionId, blockId, response });
+    void this.sendRaw({ jsonrpc: "2.0", id: pending.rpcId, result }).catch((error) => {
+      this.interactions.set(blockId, pending);
+      this.emit({ type: "question_restored", sessionId, blockId });
+      this.emitSoftError(sessionId, `问答响应发送失败，请重试：${errorText(error)}`);
+    });
   }
 
   async renameSession(id: string, title: string): Promise<void> {
@@ -3464,6 +4467,8 @@ export class AcpBridge implements GrokBridge {
   }
 
   async deleteSession(id: string): Promise<void> {
+    // Mark abandoned first so a concurrent loadSessionInner cannot re-bind.
+    this.abandonedSessions.add(id);
     const meta = this.catalogue.get(id);
     this.cancel(id);
     const computerLease = this.computerLeases.get(id);
@@ -3496,6 +4501,8 @@ export class AcpBridge implements GrokBridge {
     this.replaying.delete(id);
     this.sessionOptions.delete(id);
     this.cliQueues.delete(id);
+    this.backgroundLoadFailed.add(id);
+    this.clearProgressiveLoad(id);
     void this.setSilentStream(false, id);
   }
 
@@ -3606,11 +4613,9 @@ export class AcpBridge implements GrokBridge {
       case "already_attached":
         return "ok";
       case "refuse_opt_in":
-        this.emit({
-          type: "error",
-          sessionId,
-          message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
-        });
+        // Soft: hard BridgeEvent error forces store status→idle mid-turn when
+        // a busy-path queue prepareComputer refuses CU (would unlock send early).
+        this.emitSoftError(sessionId, COMPUTER_USE_OPT_IN_REFUSE_MESSAGE);
         return "refused";
       case "revoke_stale_and_refuse":
         await this.revokeComputerLease(sessionId);
@@ -3620,11 +4625,7 @@ export class AcpBridge implements GrokBridge {
         if (this.computerLeases.size === 0) {
           await invoke("computer_revoke_http_auth").catch(() => {});
         }
-        this.emit({
-          type: "error",
-          sessionId,
-          message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
-        });
+        this.emitSoftError(sessionId, COMPUTER_USE_OPT_IN_REFUSE_MESSAGE);
         return "refused";
       case "attach":
         await this.attachComputerMcp(sessionId);
@@ -3662,7 +4663,7 @@ export class AcpBridge implements GrokBridge {
       // Soft-fail / non-Windows / harness unavailable — leave turn without MCP.
       return;
     }
-    const metaRequest = await this.sessionMeta(meta.cwd);
+    const metaRequest = await this.sessionMeta(meta.cwd, sessionId);
     this.silentReplaying.add(sessionId);
     await this.setSilentStream(true, sessionId);
     try {

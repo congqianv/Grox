@@ -13,6 +13,7 @@ import {
 import type { Session, SessionBlock } from "../../bridge/types";
 import { useDesktop } from "../../state/store";
 import { useI18n } from "../../lib/i18n";
+import { isPrimerText } from "../../lib/planPrimer";
 import { Icon } from "../fx/Icon";
 import { BlackHole } from "../fx/BlackHole";
 import { AssistantMsg, SystemEvent, UserMsg } from "./blocks";
@@ -178,11 +179,23 @@ function isRetryTwinText(prev: string, next: string): boolean {
   return longer.includes(shorter.slice(0, window)) && shorter.length / longer.length > 0.55;
 }
 
-function groupTurns(blocks: SessionBlock[]): Turn[] {
+/**
+ * Group blocks into operator turns.
+ * Mid-turn interjections (`user.interjected`) stay inside the current turn so
+ * the live process chrome does not collapse and yank the scroller through history.
+ */
+export function groupTurns(blocks: SessionBlock[]): Turn[] {
   const turns: Turn[] = [];
   let promptIndex = -1;
   for (const block of blocks) {
+    // Hide plan primers (host inject / legacy SuperGrok history).
+    if (block.type === "user" && isPrimerText(block.text)) continue;
     if (block.type === "user") {
+      // Same-turn 插话: append, do not open a new turn / promptIndex.
+      if (block.interjected && turns.length > 0) {
+        turns[turns.length - 1].blocks.push(block);
+        continue;
+      }
       promptIndex += 1;
       turns.push({ id: block.id, blocks: [block], promptIndex });
     } else if (turns.length === 0) turns.push({ id: block.id, blocks: [block], promptIndex: -1 });
@@ -199,7 +212,7 @@ function renderBlock(block: SessionBlock, sessionId: string, processing = false)
     case "tool": return <ToolCallCard key={block.id} block={block} />;
     case "plan": return <PlanCard key={block.id} block={block} />;
     case "permission": return <PermissionCard key={block.id} block={block} sessionId={sessionId} />;
-    case "question": return <QuestionCard key={block.id} block={block} />;
+    case "question": return <QuestionCard key={block.id} block={block} sessionId={sessionId} />;
     case "system": return <SystemEvent key={block.id} block={block} />;
   }
 }
@@ -231,8 +244,19 @@ function ToolBatch({ blocks }: { blocks: Extract<SessionBlock, { type: "tool" }>
 function RenderSequence({ blocks, sessionId, processing }: { blocks: SessionBlock[]; sessionId: string; processing: boolean }) {
   const output: React.ReactNode[] = [];
   for (let index = 0; index < blocks.length;) {
-    if (blocks[index].type !== "tool") {
-      output.push(renderBlock(blocks[index], sessionId, processing));
+    const block = blocks[index];
+    // Mid-turn 插话: full-width user bubble, break out of the process rail indent.
+    if (block.type === "user") {
+      output.push(
+        <div key={block.id} className="relative -ml-5 mb-1 pl-0">
+          {renderBlock(block, sessionId, processing)}
+        </div>,
+      );
+      index += 1;
+      continue;
+    }
+    if (block.type !== "tool") {
+      output.push(renderBlock(block, sessionId, processing));
       index += 1;
       continue;
     }
@@ -260,14 +284,22 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
   // otherwise prior answers reappear as thinking/process text.
   const complete = !active || status === "idle";
   const [processOpen, setProcessOpen] = useState(!complete);
-  const user = turn.blocks.find((block): block is Extract<SessionBlock, { type: "user" }> => block.type === "user");
+  // Primary operator prompt (not mid-turn 插话) for rewind / collapse chrome.
+  const user = turn.blocks.find(
+    (block): block is Extract<SessionBlock, { type: "user" }> =>
+      block.type === "user" && !block.interjected,
+  );
 
-  useEffect(() => {
+  // Collapse before paint so becoming inactive never flashes full process height
+  // (that flash + follow-pin is what felt like "scroll through old history").
+  useLayoutEffect(() => {
     if (complete) setProcessOpen(false);
   }, [complete]);
 
   if (!complete) {
+    // Keep interjections in chronological order inside the live rail.
     const liveBlocks = turn.blocks.filter((block) => block !== user);
+    const eventCount = liveBlocks.filter((block) => block.type !== "user").length;
     return (
       <section className="timeline-turn mb-8">
         {user && (
@@ -282,7 +314,7 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
             <BlackHole size={15} spin />
             <span className="text-[10.5px] font-medium text-fg2">{status === "awaiting_permission" ? (language === "zh-CN" ? "等待批准" : "Awaiting approval") : status === "awaiting_input" ? (language === "zh-CN" ? "等待你的回答" : "Awaiting input") : (language === "zh-CN" ? "Grok 正在处理" : "Grok is working")}</span>
             <span className="h-1 w-1 animate-pulse-dot rounded-full bg-acc" />
-            <span className="font-mono text-[9px] tracking-[0.08em] text-faint">{language === "zh-CN" ? `${liveBlocks.length} 条事件` : `${liveBlocks.length} events`}</span>
+            <span className="font-mono text-[9px] tracking-[0.08em] text-faint">{language === "zh-CN" ? `${eventCount} 条事件` : `${eventCount} events`}</span>
           </div>
           <div className="process-sequence process-rail ml-[7px] pl-5">
             {liveBlocks.length > 0 ? (
@@ -304,8 +336,16 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
   // closes each segment before the next tool, so only showing assistants.at(-1)
   // hides most of the answer inside the collapsed "Processed" fold.
   const assistants = turn.blocks.filter((block): block is Extract<SessionBlock, { type: "assistant" }> => block.type === "assistant");
+  const interjections = turn.blocks.filter(
+    (block): block is Extract<SessionBlock, { type: "user" }> =>
+      block.type === "user" && Boolean(block.interjected),
+  );
   const process = turn.blocks.filter(
-    (block) => block !== user && block.type !== "assistant" && !unresolved.includes(block),
+    (block) =>
+      block !== user &&
+      block.type !== "assistant" &&
+      !(block.type === "user" && block.interjected) &&
+      !unresolved.includes(block),
   );
   const toolCount = process.filter((block) => block.type === "tool").length;
   const thoughts = process.filter((block): block is Extract<SessionBlock, { type: "thinking" }> => block.type === "thinking");
@@ -388,6 +428,9 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
         {turnElapsed > 0 && <div className="turn-elapsed"><span>{language === "zh-CN" ? `已处理 ${turnElapsed < 1000 ? `${turnElapsed}ms` : `${(turnElapsed / 1000).toFixed(turnElapsed < 10_000 ? 1 : 0)}s`}` : `Processed in ${(turnElapsed / 1000).toFixed(1)}s`}</span><i /></div>}
       </div>
       {unresolved.map((block) => renderBlock(block, sessionId))}
+      {interjections.map((block) => (
+        <UserMsg key={block.id} block={block} canEdit={false} />
+      ))}
       {answerBlock && <AssistantMsg block={answerBlock} />}
       {/* Upstream: summarize file diffs for this turn + review/rewind */}
       <TurnChangeCard blocks={turn.blocks} promptIndex={turn.promptIndex} />
@@ -447,17 +490,40 @@ export function Timeline({ session }: { session: Session }) {
     session.status === "awaiting_permission" ||
     session.status === "awaiting_input";
 
-  /** Fingerprint of list growth / stream tokens so follow pin can re-run. */
+  /**
+   * Fingerprint of list growth / stream tokens so follow pin can re-run.
+   * Prefer the live stream head (streaming assistant / live thinking / running tool),
+   * not only the last array entry — an interjected user bubble can sit after the
+   * stream head while tokens still grow on an earlier block.
+   */
   const stickKey = useMemo(() => {
-    const last = session.blocks.at(-1);
-    if (!last) return "0";
+    const blocks = session.blocks;
+    if (blocks.length === 0) return "0";
+    for (let i = blocks.length - 1; i >= 0; i -= 1) {
+      const block = blocks[i];
+      if (block.type === "assistant" && block.streaming) {
+        return `live-a:${blocks.length}:${block.id}:${block.text.length}`;
+      }
+      if (block.type === "thinking" && block.live) {
+        return `live-t:${blocks.length}:${block.id}:${block.text.length}`;
+      }
+      if (
+        block.type === "tool" &&
+        (block.call.status === "running" ||
+          block.call.status === "pending" ||
+          block.call.status === "awaiting_permission")
+      ) {
+        return `live-tool:${blocks.length}:${block.id}:${block.call.status}:${block.call.output?.length ?? 0}`;
+      }
+    }
+    const last = blocks.at(-1)!;
     if (last.type === "assistant" || last.type === "thinking" || last.type === "user") {
-      return `${session.blocks.length}:${last.id}:${last.text.length}`;
+      return `${blocks.length}:${last.id}:${last.text.length}:${last.type === "user" && last.interjected ? "i" : ""}`;
     }
     if (last.type === "tool") {
-      return `${session.blocks.length}:${last.id}:${last.call.status}:${last.call.output?.length ?? 0}`;
+      return `${blocks.length}:${last.id}:${last.call.status}:${last.call.output?.length ?? 0}`;
     }
-    return `${session.blocks.length}:${last.id}:${last.type}`;
+    return `${blocks.length}:${last.id}:${last.type}`;
   }, [session.blocks]);
 
   const markers = useMemo<RequestMarker[]>(() => {
@@ -567,6 +633,8 @@ export function Timeline({ session }: { session: Session }) {
   };
 
   // Pin to bottom only while follow is on (live stream / session open).
+  // useLayoutEffect: pin before paint so mid-turn block inserts cannot flash
+  // the viewport at scrollTop=0 / mid-history for a frame.
   useLayoutEffect(() => {
     if (!hasBlocks) return;
     if (!followRef.current) return;

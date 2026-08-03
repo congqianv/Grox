@@ -61,11 +61,23 @@ export function UserMsg({
   };
 
   const showActions = overflowing || expanded || rewindPromptIndex !== undefined || canEdit;
+  const isInterject = Boolean(block.interjected);
 
   return (
     <div className="group/user mb-5 flex animate-fade-up justify-end">
       <div className="relative w-fit max-w-[90%]">
-        <div className="rounded-[16px] rounded-br-md bg-high px-4 py-3">
+        {isInterject && (
+          <div className="mb-1 flex justify-end">
+            <span className="rounded-full border border-acc/30 bg-acc/10 px-2 py-0.5 text-[10px] font-medium tracking-wide text-acc">
+              {zh ? "插话" : "Interject"}
+            </span>
+          </div>
+        )}
+        <div
+          className={`rounded-[16px] rounded-br-md px-4 py-3 ${
+            isInterject ? "border border-acc/25 bg-acc/5" : "bg-high"
+          }`}
+        >
           {block.text ? (
             <div
               ref={textRef}

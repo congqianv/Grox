@@ -225,7 +225,29 @@ function ToolImages({ images }: { images: NonNullable<ToolCall["images"]> }) {
   return (
     <div className="mt-2 grid grid-cols-2 gap-2">
       {images.map((image, index) => {
-        const src = `data:${image.mime};base64,${image.data}`;
+        const isVideo = image.mediaKind === "video" || image.mime.startsWith("video/");
+        const src = image.data
+          ? `data:${image.mime};base64,${image.data}`
+          : image.uri
+            ? image.uri
+            : image.path
+              ? image.path
+              : "";
+        if (!src) return null;
+        // Path-only media: show path chip (Tauri convertFileSrc can be layered later).
+        if (!image.data && (image.path || image.uri)) {
+          const label = image.path ?? image.uri ?? "";
+          return (
+            <div
+              key={`${label}-${index}`}
+              className="col-span-2 truncate rounded-[4px] border border-line2 bg-void px-2 py-1.5 font-mono text-[10px] text-dim"
+              title={label}
+            >
+              {isVideo ? "🎬 " : "🖼 "}
+              {label}
+            </div>
+          );
+        }
         return (
           <button
             key={`${image.mime}-${index}`}
@@ -234,11 +256,11 @@ function ToolImages({ images }: { images: NonNullable<ToolCall["images"]> }) {
             onClick={() => setPreview({ src, alt: language === "zh-CN" ? "工具输出图片" : "Tool output" })}
             className="block overflow-hidden rounded-[4px] border border-line2 bg-void transition-opacity hover:opacity-95"
           >
-            <img
-              src={src}
-              alt="Tool output"
-              className="max-h-44 w-full object-contain"
-            />
+            {isVideo ? (
+              <video src={src} className="max-h-44 w-full object-contain" controls muted />
+            ) : (
+              <img src={src} alt="Tool output" className="max-h-44 w-full object-contain" />
+            )}
           </button>
         );
       })}

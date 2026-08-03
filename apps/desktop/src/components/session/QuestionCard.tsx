@@ -5,6 +5,7 @@ import type {
   QuestionResponse,
   SessionBlock,
 } from "../../bridge/types";
+import { topPendingQuestionId } from "../../lib/sessionGate";
 import { useDesktop } from "../../state/store";
 import { Icon } from "../fx/Icon";
 import { useI18n } from "../../lib/i18n";
@@ -26,15 +27,26 @@ function responseLabel(response: QuestionResponse, zh: boolean): string {
 
 export function QuestionCard({
   block,
+  sessionId,
 }: {
   block: QuestionBlock;
+  sessionId: string;
 }) {
   const { language } = useI18n();
   const zh = language === "zh-CN";
   const resolveQuestion = useDesktop((state) => state.resolveQuestion);
+  // Only the top unresolved interview is interactive when several stack.
+  const isTopPending = useDesktop((s) => {
+    if (s.activeId !== sessionId) return false;
+    const session = s.sessions[sessionId];
+    if (!session) return false;
+    if (block.response) return false;
+    return topPendingQuestionId(session) === block.id;
+  });
   const [answers, setAnswers] = useState<QuestionAnswers>({});
   const [notes, setNotes] = useState<QuestionNotes>({});
   const resolved = block.response;
+  const interactive = !resolved && isTopPending;
 
   const normalizedAnswers = useMemo(() => {
     const next: QuestionAnswers = {};
@@ -67,14 +79,26 @@ export function QuestionCard({
   return (
     <section
       className={`mb-5 animate-fade-up overflow-hidden rounded-[6px] border bg-raise transition-opacity ${
-        resolved ? "border-line2 opacity-65" : "border-gold/50"
+        resolved
+          ? "border-line2 opacity-65"
+          : interactive
+            ? "border-gold/50"
+            : "border-line2 opacity-70"
       }`}
       aria-label="Agent question"
     >
       <header className="flex items-center gap-2 border-b border-line2 bg-gold/[0.035] px-4 py-3">
         <Icon name={resolved ? "check" : "bolt"} size={13} className={resolved ? "text-dim" : "text-gold"} />
-        <span className={`lbl ${resolved ? "" : "!text-gold"}`}>
-          {resolved ? responseLabel(resolved, zh) : zh ? "需要用户输入" : "OPERATOR INPUT REQUIRED"}
+        <span className={`lbl ${resolved || !interactive ? "" : "!text-gold"}`}>
+          {resolved
+            ? responseLabel(resolved, zh)
+            : interactive
+              ? zh
+                ? "需要用户输入"
+                : "OPERATOR INPUT REQUIRED"
+              : zh
+                ? "等待前序问答完成"
+                : "WAITING FOR PRIOR QUESTION"}
         </span>
         {!resolved && <span className="ml-auto font-mono text-[9.5px] tracking-[0.12em] text-faint">{zh ? `${block.req.questions.length} 项` : `${block.req.questions.length} FIELD${block.req.questions.length === 1 ? "" : "S"}`}</span>}
       </header>
@@ -92,7 +116,7 @@ export function QuestionCard({
           )?.preview;
 
           return (
-            <fieldset key={question.question} disabled={Boolean(resolved)}>
+            <fieldset key={question.question} disabled={!interactive}>
               <legend className="flex w-full items-start gap-3 text-[12px] text-fg2">
                 <span className="mt-px font-mono text-[9.5px] text-gold">{String(questionIndex + 1).padStart(2, "0")}</span>
                 <span>{question.question}</span>
@@ -140,7 +164,7 @@ export function QuestionCard({
         })}
       </div>
 
-      {!resolved && (
+      {interactive && (
         <footer className="flex flex-wrap items-center gap-2 border-t border-line2 px-4 py-3">
           <button
             type="button"

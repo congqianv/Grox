@@ -28,6 +28,7 @@ import {
   validateAttachmentSet,
 } from "../../lib/attachments";
 import { attachExplicitPromptImages } from "../../lib/pathAttachments";
+import { topPendingPermissionId } from "../../lib/sessionGate";
 import {
   elementContainsPoint,
   isNativeDragDropActive,
@@ -37,6 +38,7 @@ import {
 import { useImeGuard } from "../../lib/ime";
 import { Markdown } from "../../lib/markdown";
 import { looksLikeMarkdown } from "../../lib/markdownInput";
+import { getSlashQuery } from "../../lib/slashFilter";
 import { ActiveProcessBar } from "./ActiveProcessBar";
 import { RewindMenu } from "./RewindMenu";
 
@@ -107,6 +109,7 @@ export function Composer() {
   const setAttachments = useDesktop((s) => s.setComposerAttachments);
   const stop = useDesktop((s) => s.stop);
   const compact = useDesktop((s) => s.compact);
+  const resolvePermission = useDesktop((s) => s.resolvePermission);
   const status = useDesktop((s) => (s.activeId ? s.sessions[s.activeId]?.status : null));
   const model = useDesktop((s) => s.model);
   const models = useDesktop((s) => s.models);
@@ -124,11 +127,13 @@ export function Composer() {
   const workspaceFiles = useDesktop((s) => s.workspaceFiles);
   const refreshWorkspaceFiles = useDesktop((s) => s.refreshWorkspaceFiles);
 
-  /** Turn is in flight — Enter queues, Ctrl+Enter interjects. */
+  /** Agent actively streaming / tools — Enter queues, Ctrl+Enter interjects. */
   const busy = status === "running";
-  /** Plan / permission / question gate — typing allowed, submit blocked with reason. */
+  /** Plan / permission / question gate — may still *queue* follow-ups (local). */
   const gated = status === "awaiting_permission" || status === "awaiting_input";
-  const running = busy || gated;
+  /** Any non-idle turn: show queue affordances (not a hard block anymore). */
+  const turnActive = busy || gated;
+  const running = turnActive;
   const hasPendingPlan = Boolean(
     session &&
       status === "awaiting_permission" &&
@@ -187,9 +192,13 @@ export function Composer() {
     },
   ];
 
-  const slashOpen = text.startsWith("/") && !text.includes(" ");
-  const slashQuery = slashOpen ? text.slice(1).toLowerCase() : "";
-  const slashMatches = slashOpen ? slashCommands.filter((c) => c.id.slice(1).startsWith(slashQuery)) : [];
+  // Line-start / multiline slash query (vscode-supergrok slashFilter); product cmds stay local.
+  const slashQueryRaw = getSlashQuery(text, cursor);
+  const slashOpen = slashQueryRaw !== null;
+  const slashQuery = slashOpen ? slashQueryRaw.toLowerCase() : "";
+  const slashMatches = slashOpen
+    ? slashCommands.filter((c) => c.id.slice(1).toLowerCase().startsWith(slashQuery))
+    : [];
 
   const atMention = useMemo(() => activeAtQuery(text, cursor), [text, cursor]);
   const atOpen = Boolean(atMention) && !slashOpen;
@@ -331,13 +340,10 @@ export function Composer() {
       setAttachmentError("");
       try {
         const turnAttachments = await attachExplicitPromptImages(workspace, t, attachments);
-        // Keep the draft when gated — sendPrompt only posts a notice.
-        if (gated) {
-          sendPrompt(t, turnAttachments);
-          return;
-        }
-        sendPrompt(t, turnAttachments);
-        clearComposer();
+        // Keep the draft when duplicate/blocked — sendPrompt returns false.
+        // Gated turns may still *queue* (accepted=true clears draft into queue).
+        const accepted = sendPrompt(t, turnAttachments);
+        if (accepted) clearComposer();
       } catch (cause) {
         const code = cause instanceof Error ? cause.message : String(cause);
         setAttachmentError(attachmentErrorMessage(code, language));
@@ -356,13 +362,13 @@ export function Composer() {
       setAttachmentError("");
       try {
         const turnAttachments = await attachExplicitPromptImages(workspace, t, attachments);
+        // During permission/question: park as queue, do not mid-turn interject RPC.
         if (gated) {
-          sendPrompt(t, turnAttachments);
+          if (sendPrompt(t, turnAttachments)) clearComposer();
           return;
         }
         if (!busy) {
-          sendPrompt(t, turnAttachments);
-          clearComposer();
+          if (sendPrompt(t, turnAttachments)) clearComposer();
           return;
         }
         setInterjecting(true);
@@ -481,6 +487,24 @@ export function Composer() {
       if (e.key === "Escape") {
         setText("");
         return;
+      }
+    }
+
+    // Scheme A (Claude-like): while a tool/plan permission is open, Enter/Esc
+    // resolve the gate even when focus is still in the composer — do not send.
+    if (status === "awaiting_permission" && session && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      const pendingId = topPendingPermissionId(session);
+      if (pendingId) {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          resolvePermission(pendingId, "allow_once");
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          resolvePermission(pendingId, "deny");
+          return;
+        }
       }
     }
 
@@ -628,9 +652,9 @@ export function Composer() {
                     return (
                       <div
                         key={item.id}
-                        draggable={queue.length > 1 && item.state === "queued"}
+                        draggable={queue.length > 1 && item.state !== "sending"}
                         onDragStart={(event) => {
-                          if (queue.length <= 1 || item.state !== "queued") return;
+                          if (queue.length <= 1 || item.state === "sending") return;
                           setQueueDragIndex(index);
                           event.dataTransfer.effectAllowed = "move";
                           event.dataTransfer.setData("text/plain", String(index));
@@ -676,7 +700,7 @@ export function Composer() {
                               : item.state === "interjected"
                                 ? "bg-acc/5"
                                 : "hover:bg-high/40"
-                        } ${queue.length > 1 && item.state === "queued" ? "cursor-grab active:cursor-grabbing" : ""}`}
+                        } ${queue.length > 1 && item.state !== "sending" ? "cursor-grab active:cursor-grabbing" : ""}`}
                       >
                         {queue.length > 1 && (
                           <span
@@ -979,42 +1003,46 @@ export function Composer() {
               </button>
             )}
 
-            {busy && (
+            {turnActive && (
               <>
                 <button
                   type="button"
                   onClick={send}
                   disabled={!canSubmit}
-                  title={zh ? "加入队列 (Enter)" : "Queue (Enter)"}
+                  title={
+                    gated
+                      ? zh
+                        ? `${submitBlockReason} · Enter 可先加入队列`
+                        : `${submitBlockReason} · Enter queues for after`
+                      : zh
+                        ? "加入队列 (Enter)"
+                        : "Queue (Enter)"
+                  }
                   className="flex h-7 items-center gap-1 rounded-md border border-line2 px-2.5 text-[11.5px] text-fg2 transition-colors hover:bg-high disabled:opacity-40"
                 >
                   {zh ? "加入队列" : "Queue"}
                 </button>
-                <button
-                  type="button"
-                  onClick={interject}
-                  disabled={!canSubmit}
-                  title={zh ? "插入当前回合 (Ctrl+Enter)" : "Interject current turn (Ctrl+Enter)"}
-                  className="flex h-7 items-center gap-1 rounded-md border border-acc/40 bg-acc/10 px-2.5 text-[11.5px] text-acc transition-colors hover:bg-acc/15 disabled:opacity-40"
-                >
-                  {interjecting ? (zh ? "插话中…" : "Interjecting…") : zh ? "插话" : "Interject"}
-                </button>
+                {busy && (
+                  <button
+                    type="button"
+                    onClick={interject}
+                    disabled={!canSubmit}
+                    title={zh ? "插入当前回合 (Ctrl+Enter)" : "Interject current turn (Ctrl+Enter)"}
+                    className="flex h-7 items-center gap-1 rounded-md border border-acc/40 bg-acc/10 px-2.5 text-[11.5px] text-acc transition-colors hover:bg-acc/15 disabled:opacity-40"
+                  >
+                    {interjecting ? (zh ? "插话中…" : "Interjecting…") : zh ? "插话" : "Interject"}
+                  </button>
+                )}
               </>
             )}
 
-            {!busy && (
+            {!turnActive && (
               <button
                 onClick={send}
-                disabled={!canSubmit || gated}
-                title={
-                  gated
-                    ? submitBlockReason
-                    : zh
-                      ? "发送"
-                      : "Send"
-                }
+                disabled={!canSubmit}
+                title={zh ? "发送" : "Send"}
                 className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
-                  canSubmit && !gated
+                  canSubmit
                     ? "bg-acc text-base hover:bg-acc-deep"
                     : "bg-high text-faint"
                 }`}
@@ -1030,12 +1058,12 @@ export function Composer() {
           <span className="text-[11.5px] text-faint">
             {zh
               ? gated
-                ? "可继续输入 · 先处理计划/权限/问题 · ⇧⏎ 换行"
+                ? "⏎ 先入队 · 处理完计划/权限/问题后自动发送 · ⇧⏎ 换行"
                 : busy
                   ? "⏎ 加入队列 · ⌃⏎ 插话 · ⇧⏎ 换行 · @ 文件 · / 命令"
                   : "⏎ 发送 · ⇧⏎ 换行 · @ 文件 · / 命令"
               : gated
-                ? "Keep typing · resolve plan/permission/question first · ⇧⏎ newline"
+                ? "⏎ queue now · auto-send after plan/permission/question · ⇧⏎ newline"
                 : busy
                   ? "⏎ queue · ⌃⏎ interject · ⇧⏎ newline · @ files · / commands"
                   : "⏎ send · ⇧⏎ newline · @ files · / commands"}

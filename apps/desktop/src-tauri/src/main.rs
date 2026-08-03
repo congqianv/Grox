@@ -2019,6 +2019,257 @@ fn write_runtime_preference(app: &tauri::AppHandle, preference: &str) -> Result<
     atomic_write(&runtime_preference_path(app)?, &content)
 }
 
+/// ACP process topology preference for `grok agent … stdio`.
+///
+/// - `local` (default) → `--no-leader` — dedicated agent process (industry
+///   default: Cursor / Claude Code / Codex style isolation). Enables
+///   process-scoped `--plugin-dir` (Computer Use) and avoids shared-leader
+///   contention with CLI / VS Code mid-turn.
+/// - `shared` → `--leader` — join the machine-wide Grok leader (fewer
+///   processes when multiple ACP clients share one backend).
+fn agent_leader_mode_path() -> Result<PathBuf, String> {
+    Ok(grok_home()?.join("desktop-agent-leader-mode.json"))
+}
+
+fn normalize_agent_leader_mode(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim) {
+        Some("shared") | Some("leader") => "shared",
+        Some("local") | Some("no-leader") => "local",
+        // Default and all unknown / legacy values: dedicated local agent.
+        _ => "local",
+    }
+}
+
+fn agent_leader_cli_flag(mode: &str) -> &'static str {
+    match normalize_agent_leader_mode(Some(mode)) {
+        "shared" => "--leader",
+        _ => "--no-leader",
+    }
+}
+
+fn read_agent_leader_mode() -> String {
+    let Ok(path) = agent_leader_mode_path() else {
+        return "local".into();
+    };
+    let Ok(content) = read_bounded_text(&path, 16 * 1024) else {
+        return "local".into();
+    };
+    let mode = serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|value| value.get("mode")?.as_str().map(str::to_owned));
+    normalize_agent_leader_mode(mode.as_deref()).to_owned()
+}
+
+fn write_agent_leader_mode(mode: &str) -> Result<String, String> {
+    let trimmed = mode.trim();
+    // Accept canonical names plus CLI-flag aliases; reject anything else.
+    if !matches!(trimmed, "local" | "shared" | "leader" | "no-leader") {
+        return Err("未知 Agent 进程模式（请使用 local 或 shared）".into());
+    }
+    let normalized = normalize_agent_leader_mode(Some(trimmed)).to_owned();
+    let content = serde_json::json!({ "mode": normalized }).to_string();
+    atomic_write(&agent_leader_mode_path()?, &content)?;
+    Ok(normalized)
+}
+
+#[tauri::command]
+fn get_agent_leader_mode() -> String {
+    read_agent_leader_mode()
+}
+
+#[tauri::command]
+fn set_agent_leader_mode(mode: String) -> Result<String, String> {
+    write_agent_leader_mode(&mode)
+}
+
+/// Age (seconds) after which `auth.json.lock` is treated as abandoned and safe to clear.
+/// A healthy writer refreshes the lock far more often; 60s covers wedged exits without
+/// racing a live auth write under normal load.
+const AUTH_LOCK_STALE_SECS: u64 = 60;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreflightAgentBootResult {
+    /// True when a stale `auth.json.lock` was removed this call.
+    auth_lock_cleared: bool,
+    /// Age of the lock file when inspected (even if not cleared).
+    auth_lock_age_secs: Option<u64>,
+    /// Whether the lock path existed before this call.
+    auth_lock_present: bool,
+    /// True when a machine-wide `grok agent leader` process appears to be running.
+    machine_leader_alive: bool,
+    /// Current agent leader preference after preflight (unchanged by this call).
+    leader_mode: String,
+    /// Human-readable notes for diagnostics / UI.
+    notes: Vec<String>,
+}
+
+fn auth_lock_path() -> Result<PathBuf, String> {
+    Ok(grok_home()?.join("auth.json.lock"))
+}
+
+/// Inspect a lock path and remove it when older than `stale_secs`.
+///
+/// A leftover lock from a crashed CLI / IDE session can block shared-leader attach and
+/// leave the desktop shell stuck on "Connecting to Grok…". Young locks are left alone
+/// so we do not interrupt a live auth write.
+fn clear_stale_auth_lock_at(
+    path: &Path,
+    stale_secs: u64,
+) -> (bool, Option<u64>, bool, Vec<String>) {
+    let mut notes = Vec::new();
+    if !path.exists() {
+        notes.push("auth.json.lock 不存在".into());
+        return (false, None, false, notes);
+    }
+    let metadata = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(error) => {
+            notes.push(format!("无法读取 auth.json.lock 元数据：{error}"));
+            return (false, None, true, notes);
+        }
+    };
+    let modified = match metadata.modified() {
+        Ok(t) => t,
+        Err(error) => {
+            notes.push(format!("无法读取 auth.json.lock 修改时间：{error}"));
+            return (false, None, true, notes);
+        }
+    };
+    let age_secs = match modified.elapsed() {
+        Ok(d) => d.as_secs(),
+        Err(_) => {
+            // Clock skew / future mtime — treat as fresh, do not clear.
+            notes.push("auth.json.lock 修改时间异常（未来时间），保留".into());
+            return (false, None, true, notes);
+        }
+    };
+    if age_secs <= stale_secs {
+        notes.push(format!(
+            "auth.json.lock 仍新鲜（{age_secs}s ≤ {stale_secs}s），保留"
+        ));
+        return (false, Some(age_secs), true, notes);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {
+            notes.push(format!(
+                "已清除过期 auth.json.lock（age {age_secs}s > {stale_secs}s）"
+            ));
+            (true, Some(age_secs), true, notes)
+        }
+        Err(error) => {
+            notes.push(format!("清除过期 auth.json.lock 失败：{error}"));
+            (false, Some(age_secs), true, notes)
+        }
+    }
+}
+
+fn clear_stale_auth_lock() -> (bool, Option<u64>, bool, Vec<String>) {
+    let Ok(path) = auth_lock_path() else {
+        return (
+            false,
+            None,
+            false,
+            vec!["无法解析 GROK_HOME，跳过 auth.lock 预检".into()],
+        );
+    };
+    clear_stale_auth_lock_at(&path, AUTH_LOCK_STALE_SECS)
+}
+
+/// Best-effort: is the machine-wide `grok agent leader` daemon running?
+///
+/// Used to choose cold vs warm shared-init budgets. False negatives only make
+/// the first handshake wait longer (safer than false positives).
+fn machine_leader_alive() -> (bool, Vec<String>) {
+    let mut notes = Vec::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // WMIC is present on Win10+; filter on CommandLine for "agent leader".
+        let mut cmd = std::process::Command::new("wmic");
+        cmd.args([
+            "process",
+            "where",
+            "name='grok.exe'",
+            "get",
+            "CommandLine",
+            "/format:list",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+        match cmd.output() {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+                // Match `agent leader` (daemon), not `agent --leader` (client attach).
+                let alive = text.contains("agent leader")
+                    || text.contains("agent\" leader")
+                    || text.contains("agent' leader");
+                notes.push(if alive {
+                    "检测到 machine leader 进程（agent leader）".into()
+                } else {
+                    "未检测到 machine leader 进程（将使用冷启动预算）".into()
+                });
+                return (alive, notes);
+            }
+            Ok(_) | Err(_) => {
+                // Fallback: leader.lock exists and is young → likely held by a live leader.
+                if let Ok(home) = grok_home() {
+                    let lock = home.join("leader.lock");
+                    if let Ok(meta) = fs::metadata(&lock) {
+                        if let Ok(modified) = meta.modified() {
+                            if let Ok(age) = modified.elapsed() {
+                                if age.as_secs() < 86_400 {
+                                    notes.push(format!(
+                                        "wmic 不可用，leader.lock 存在（age {}s）— 假定 leader 可能在线",
+                                        age.as_secs()
+                                    ));
+                                    return (true, notes);
+                                }
+                            }
+                        }
+                    }
+                }
+                notes.push("无法探测 machine leader，按冷启动处理".into());
+                return (false, notes);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // Unix: default socket path; presence is a weak signal.
+        if let Ok(home) = grok_home() {
+            let sock = home.join("leader.sock");
+            if sock.exists() {
+                notes.push("leader.sock 存在".into());
+                return (true, notes);
+            }
+        }
+        notes.push("未找到 leader.sock — 冷启动".into());
+        (false, notes)
+    }
+}
+
+/// Boot preflight before spawning `grok agent … stdio`.
+/// Clears abandoned auth locks; does not change leader-mode preference.
+#[tauri::command]
+fn preflight_agent_boot() -> Result<PreflightAgentBootResult, String> {
+    let (auth_lock_cleared, auth_lock_age_secs, auth_lock_present, mut notes) =
+        clear_stale_auth_lock();
+    let (machine_leader_alive, leader_notes) = machine_leader_alive();
+    notes.extend(leader_notes);
+    Ok(PreflightAgentBootResult {
+        auth_lock_cleared,
+        auth_lock_age_secs,
+        auth_lock_present,
+        machine_leader_alive,
+        leader_mode: read_agent_leader_mode(),
+        notes,
+    })
+}
+
 fn grok_binary_version(path: &str) -> Option<String> {
     let mut command = std::process::Command::new(path);
     command
@@ -2462,7 +2713,25 @@ async fn start_project_preview(
 
 async fn terminate_process(mut process: AgentProcess) {
     drop(process.stdin);
-    let _ = process.child.kill().await;
+    // Prefer process-tree kill on Windows so agent grandchildren (tool shells)
+    // do not orphan after the stdio child dies (ported idea from vscode-supergrok).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        if let Some(pid) = process.child.id() {
+            // std::process::Command — CommandExt::creation_flags applies cleanly.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .status();
+        }
+        // Fallback if taskkill is unavailable / failed — still reap the direct child.
+        let _ = process.child.kill().await;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = process.child.kill().await;
+    }
     let _ = process.child.wait().await;
 }
 
@@ -6977,6 +7246,8 @@ fn export_support_diagnostics() -> Result<String, String> {
         "buildCommit": GROX_BUILD_COMMIT,
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
+        "agentLeaderMode": read_agent_leader_mode(),
+        "agentLeaderCliFlag": agent_leader_cli_flag(&read_agent_leader_mode()),
         "activeProviderId": profiles.active_id,
         "providers": profiles_redacted,
         "providerStatus": env_status,
@@ -6984,6 +7255,7 @@ fn export_support_diagnostics() -> Result<String, String> {
         "notes": [
             "API keys are redacted or marked [dpapi-sealed]; never paste unredacted dumps.",
             "Managed ~/.grok/.env secrets are not included in this export.",
+            "agentLeaderMode: local=--no-leader (default), shared=--leader.",
         ],
     });
     serde_json::to_string_pretty(&dump).map_err(|error| format!("无法序列化诊断信息：{error}"))
@@ -7471,11 +7743,16 @@ fn open_preview_external(url: String) -> Result<(), String> {
 /// Start a fresh ACP child and stream each stdout JSON-RPC line to the webview.
 /// A repeated call intentionally replaces the old child so a webview reload
 /// cannot initialize the same agent process twice.
+///
+/// `leader_mode` (optional): `"shared"` / `"local"` overrides the on-disk
+/// preference for **this spawn only** — used for soft local fallback without
+/// permanently flipping Settings.
 #[tauri::command]
 async fn acp_spawn(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AcpState>>,
     cwd: String,
+    leader_mode: Option<String>,
 ) -> Result<(), String> {
     // One spawn at a time: terminate → spawn → store must not interleave.
     let _spawn_guard = state.spawn_lock.lock().await;
@@ -7511,11 +7788,29 @@ async fn acp_spawn(
     let command_path = PathBuf::from(&runtime.path);
     let mut command = Command::new(&command_path);
     command.arg("agent");
-    if let Some(plugin) = computer_plugin.as_ref() {
-        command.arg("--plugin-dir").arg(plugin);
+    // Shared (`--leader`) joins the machine-wide leader; process-scoped
+    // `--plugin-dir` is ignored there and has been implicated in flaky 403s when
+    // mixed with leader attach. Only attach Computer Use plugins in local mode.
+    let preferred_mode = read_agent_leader_mode();
+    let leader_mode = normalize_agent_leader_mode(
+        leader_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or(Some(preferred_mode.as_str())),
+    )
+    .to_owned();
+    let leader_flag = agent_leader_cli_flag(&leader_mode);
+    if leader_mode == "local" {
+        if let Some(plugin) = computer_plugin.as_ref() {
+            command.arg("--plugin-dir").arg(plugin);
+        }
     }
+    // Default shared (`--leader`): reuse machine-wide leader with CLI / other ACP.
+    // Operators can switch to local (`--no-leader`) in Settings → Agent when they
+    // need process-scoped `--plugin-dir` (Computer Use) or isolation.
     command
-        .args(["--leader", "--reasoning-effort", "high", "stdio"])
+        .args([leader_flag, "--reasoning-effort", "high", "stdio"])
         .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -8044,6 +8339,9 @@ fn main() {
             activate_provider_profile,
             delete_provider_profile,
             export_support_diagnostics,
+            get_agent_leader_mode,
+            set_agent_leader_mode,
+            preflight_agent_boot,
             grok_runtime_info,
             set_grok_runtime_preference,
             install_official_grok_cli,
@@ -8363,6 +8661,64 @@ api_key = "local-key"
         assert!(should_drop_silent_history_line(&state, flood_a));
         assert!(!should_drop_silent_history_line(&state, flood_b));
         assert!(!should_drop_silent_history_line(&state, rpc_ok));
+    }
+
+    #[test]
+    fn agent_leader_mode_defaults_to_local_process() {
+        assert_eq!(normalize_agent_leader_mode(None), "local");
+        assert_eq!(normalize_agent_leader_mode(Some("")), "local");
+        assert_eq!(normalize_agent_leader_mode(Some("local")), "local");
+        assert_eq!(normalize_agent_leader_mode(Some("no-leader")), "local");
+        assert_eq!(normalize_agent_leader_mode(Some("shared")), "shared");
+        assert_eq!(normalize_agent_leader_mode(Some("leader")), "shared");
+        assert_eq!(normalize_agent_leader_mode(Some("weird")), "local");
+        assert_eq!(agent_leader_cli_flag("local"), "--no-leader");
+        assert_eq!(agent_leader_cli_flag("shared"), "--leader");
+        assert_eq!(agent_leader_cli_flag("leader"), "--leader");
+        assert_eq!(agent_leader_cli_flag("garbage"), "--no-leader");
+    }
+
+    #[test]
+    fn clear_stale_auth_lock_at_skips_missing_and_fresh() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = std::env::temp_dir().join(format!(
+            "grox-preflight-auth-lock-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let lock = dir.join("auth.json.lock");
+
+        // Missing → not present.
+        let (cleared, age, present, _) = clear_stale_auth_lock_at(&lock, AUTH_LOCK_STALE_SECS);
+        assert!(!cleared && !present && age.is_none());
+
+        // Fresh file → keep.
+        fs::write(&lock, b"lock").expect("write fresh lock");
+        let (cleared, age, present, notes) = clear_stale_auth_lock_at(&lock, AUTH_LOCK_STALE_SECS);
+        assert!(!cleared && present);
+        assert!(age.unwrap_or(u64::MAX) <= AUTH_LOCK_STALE_SECS);
+        assert!(lock.exists());
+        assert!(notes.iter().any(|n| n.contains("仍新鲜")));
+
+        // Stale file → remove.
+        let stale_time = SystemTime::now() - Duration::from_secs(AUTH_LOCK_STALE_SECS + 45);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&lock)
+            .expect("open lock");
+        let times = std::fs::FileTimes::new().set_modified(stale_time);
+        file.set_times(times).expect("set mtime");
+        drop(file);
+
+        let (cleared, age, present, notes) = clear_stale_auth_lock_at(&lock, AUTH_LOCK_STALE_SECS);
+        assert!(cleared && present);
+        assert!(age.unwrap_or(0) > AUTH_LOCK_STALE_SECS);
+        assert!(!lock.exists());
+        assert!(notes.iter().any(|n| n.contains("已清除")));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
