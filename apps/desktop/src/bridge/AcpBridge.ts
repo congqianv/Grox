@@ -78,6 +78,13 @@ import {
 } from "../lib/toolMedia";
 import { shouldDropSilentInbound } from "../lib/silentAcp";
 import { FIRST_EVENT_STALL_MS } from "../lib/firstEventWatch";
+import {
+  LOCAL_INIT_TIMEOUT_MS,
+  SHARED_INIT_TIMEOUT_MS,
+  SPAWN_TIMEOUT_MS,
+  bootFallbackNoticeText,
+} from "../lib/bootPhase";
+import type { BootPhase } from "./types";
 
 export const ACP_METHODS = {
   initialize: "initialize",
@@ -765,6 +772,10 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "auth_state":
     case "model_state":
     case "mode_state":
+    case "boot_phase":
+    case "agent_reconnected":
+    case "permission_restored":
+    case "question_restored":
       return session;
     case "session_meta":
       return { ...session, ...event.patch };
@@ -942,12 +953,14 @@ export class AcpBridge implements GrokBridge {
    */
   private reconnectEpoch = 0;
   /**
-   * One-shot auto-fallback: if shared leader hits product-gate 403, switch to
-   * local (`--no-leader`) and reconnect. Reset after a successful non-gate turn
-   * so a later regression can recover again.
+   * Runtime (mid-session) product-gate 403 recovery latch — separate from boot.
+   * Reset after a successful non-gate turn so a later regression can recover again.
    */
   private productGateFallbackInFlight = false;
   private productGateFallbackDone = false;
+  /** Last boot phase — replayed for subscribers that attach mid-connect. */
+  private lastBootPhase: BootPhase | null = null;
+  private lastBootPhaseDetail: string | undefined;
   /** Sessions that already received GROX_PLAN_PRIMER this process lifetime. */
   private planPrimerSent = new Set<string>();
   /** Operator entered plan while a turn was live — inject primer after idle. */
@@ -1017,6 +1030,14 @@ export class AcpBridge implements GrokBridge {
 
   subscribe(callback: (event: BridgeEvent) => void) {
     this.listeners.add(callback);
+    // connect() starts in the constructor; store may subscribe after preflight.
+    if (this.lastBootPhase) {
+      callback({
+        type: "boot_phase",
+        phase: this.lastBootPhase,
+        detail: this.lastBootPhaseDetail,
+      });
+    }
     return () => this.listeners.delete(callback);
   }
 
@@ -1539,17 +1560,125 @@ export class AcpBridge implements GrokBridge {
     await this.initializeAgent();
   }
 
+  private setBootPhase(phase: BootPhase, detail?: string): void {
+    this.lastBootPhase = phase;
+    this.lastBootPhaseDetail = detail;
+    this.emit({ type: "boot_phase", phase, detail });
+  }
+
+  /**
+   * Shared-first boot:
+   * 1) preflight (clear stale auth.json.lock)
+   * 2) try preferred mode — shared uses a short handshake budget (12–15s)
+   * 3) on shared failure → sticky write `local` + re-spawn (suppressExitHandling)
+   * Runtime product-gate recovery stays on a separate latch.
+   */
   private async initializeAgent(): Promise<void> {
     // Diagnostics belong to one concrete child process. Keeping stderr from a
     // process replaced during a Tauri hot reload produces misleading errors.
     this.diagnostics = [];
+    this.setBootPhase("preflight");
+
+    try {
+      const preflight = await invoke<{
+        authLockCleared?: boolean;
+        authLockAgeSecs?: number | null;
+        notes?: string[];
+        leaderMode?: string;
+      }>("preflight_agent_boot");
+      if (preflight?.authLockCleared) {
+        this.diagnostics.push(
+          `preflight: cleared stale auth.json.lock` +
+            (preflight.authLockAgeSecs != null
+              ? ` (age ${preflight.authLockAgeSecs}s)`
+              : ""),
+        );
+      }
+      for (const note of preflight?.notes ?? []) {
+        this.diagnostics.push(`preflight: ${note}`);
+      }
+    } catch {
+      /* older shell without preflight_agent_boot — continue */
+    }
+
+    let preferredMode = "shared";
+    try {
+      preferredMode = await invoke<string>("get_agent_leader_mode");
+    } catch {
+      preferredMode = "shared";
+    }
+    const wantShared = preferredMode !== "local";
+
+    if (wantShared) {
+      try {
+        await this.spawnAndHandshake("shared", SHARED_INIT_TIMEOUT_MS);
+        this.setBootPhase("ready");
+        return;
+      } catch (sharedError) {
+        const detail = errorText(sharedError);
+        this.diagnostics.push(`shared boot failed: ${detail}`);
+        this.setBootPhase("fallback_local", detail);
+        // Sticky local so the next cold start does not hang again on a wedged leader.
+        try {
+          await invoke<string>("set_agent_leader_mode", { mode: "local" });
+        } catch (cause) {
+          this.diagnostics.push(`sticky local preference failed: ${errorText(cause)}`);
+        }
+        // Must NOT bare-acp_kill while suppressExitHandling is false: onExit would
+        // permanently reject `this.ready` mid-recovery (PR-A review B1).
+        this.suppressExitHandling = true;
+        try {
+          await this.spawnAndHandshake("local", LOCAL_INIT_TIMEOUT_MS);
+        } catch (localError) {
+          const localDetail = errorText(localError);
+          throw new Error(
+            `Grok Agent 初始化失败：共享 Leader 不可用（${detail}），独立进程亦失败（${localDetail}）。` +
+              `请确认 Grok Build CLI 已安装，或在设置中检查 Agent 进程模式。`,
+          );
+        } finally {
+          this.suppressExitHandling = false;
+        }
+        const notice = bootFallbackNoticeText(true, detail);
+        this.setBootPhase("ready", notice);
+        // Surface after shell paints (auth_state is visible on StatusBar / banners).
+        this.setAuthState({
+          ...this.authState,
+          error: notice,
+        });
+        return;
+      }
+    }
+
+    // Operator (or sticky fallback) already prefers local.
+    try {
+      await this.spawnAndHandshake("local", LOCAL_INIT_TIMEOUT_MS);
+      this.setBootPhase("ready");
+    } catch (error) {
+      const detail = errorText(error);
+      throw new Error(
+        `Grok Agent 初始化失败：${detail}。CLI 已启动但未在 ${Math.round(LOCAL_INIT_TIMEOUT_MS / 1000)} 秒内完成握手。`,
+      );
+    }
+  }
+
+  /** Spawn ACP child and complete initialize + authenticate for one leader mode. */
+  private async spawnAndHandshake(
+    mode: "shared" | "local",
+    initTimeoutMs: number,
+  ): Promise<void> {
+    this.setBootPhase(mode === "shared" ? "spawning_shared" : "spawning_local");
     try {
       await Promise.race([
         invoke("acp_spawn", { cwd: this.workspace }),
         new Promise<never>((_, reject) => {
           window.setTimeout(
-            () => reject(new Error("启动 Grok Agent 超时（30 秒）")),
-            30_000,
+            () =>
+              reject(
+                new Error(
+                  `启动 Grok Agent 超时（${Math.round(SPAWN_TIMEOUT_MS / 1000)} 秒）`,
+                ),
+              ),
+            SPAWN_TIMEOUT_MS,
           );
         }),
       ]);
@@ -1559,10 +1688,11 @@ export class AcpBridge implements GrokBridge {
         `无法启动 Grok Agent：${detail}。请确认 Grok Build CLI 已安装，或通过 GROK_DESKTOP_CLI 指定可执行文件。`,
       );
     }
+
+    this.setBootPhase(
+      mode === "shared" ? "initializing_shared" : "initializing_local",
+    );
     let response: unknown;
-    // Shared leader can be busy (many IDE clients / long turns / auth.lock).
-    // 45s avoids false "handshake timeout" under load; still fails closed.
-    const initTimeoutMs = 45_000;
     try {
       response = await this.requestRaw(
         ACP_METHODS.initialize,
@@ -1582,57 +1712,8 @@ export class AcpBridge implements GrokBridge {
       );
     } catch (error) {
       const detail = errorText(error);
-      // If shared leader is wedged, fall back to local once so the shell boots.
-      // Must NOT bare-acp_kill while suppressExitHandling is false: onExit would
-      // permanently reject `this.ready` mid-recovery (PR-A review B1).
-      if (!this.productGateFallbackDone && /timeout|超时|handshake/i.test(detail)) {
-        try {
-          const mode = await invoke<string>("get_agent_leader_mode").catch(() => "shared");
-          if (mode !== "local") {
-            await invoke<string>("set_agent_leader_mode", { mode: "local" });
-            this.suppressExitHandling = true;
-            try {
-              // acp_spawn terminates the previous child under spawn_lock; no bare kill.
-              await Promise.race([
-                invoke("acp_spawn", { cwd: this.workspace }),
-                new Promise<never>((_, reject) => {
-                  window.setTimeout(
-                    () => reject(new Error("启动 Grok Agent 超时（30 秒）")),
-                    30_000,
-                  );
-                }),
-              ]);
-              response = await this.requestRaw(
-                ACP_METHODS.initialize,
-                {
-                  protocolVersion: 1,
-                  clientCapabilities: {
-                    fs: { readTextFile: false, writeTextFile: false },
-                    terminal: false,
-                  },
-                  clientInfo: { ...ACP_CLIENT_INFO },
-                  _meta: {
-                    clientIdentifier: ACP_CLIENT_IDENTIFIER,
-                    clientType: ACP_CLIENT_TYPE,
-                  },
-                },
-                initTimeoutMs,
-              );
-              this.captureModelState(response);
-              await this.configureAuthentication(response);
-              // Latch only after a successful re-init.
-              this.productGateFallbackDone = true;
-              return;
-            } finally {
-              this.suppressExitHandling = false;
-            }
-          }
-        } catch {
-          /* fall through to original error */
-        }
-      }
       throw new Error(
-        `Grok Agent 初始化失败：${detail}。CLI 已启动但未在 ${Math.round(initTimeoutMs / 1000)} 秒内完成握手。若使用共享 Leader，请改「独立进程」或关闭其它占用 agent 的窗口后重试。`,
+        `握手失败（${mode}，${Math.round(initTimeoutMs / 1000)}s）：${detail}`,
       );
     }
     this.captureModelState(response);

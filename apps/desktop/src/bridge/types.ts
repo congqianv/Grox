@@ -407,11 +407,26 @@ export function readStoredPermissionMode(
   return DEFAULT_PERMISSION_MODE;
 }
 
+/**
+ * Agent boot progress for the connecting splash.
+ * Shared-first: preflight → try shared (short) → sticky local fallback → ready.
+ */
+export type BootPhase =
+  | "preflight"
+  | "spawning_shared"
+  | "initializing_shared"
+  | "fallback_local"
+  | "spawning_local"
+  | "initializing_local"
+  | "ready";
+
 /** Events a bridge pushes into the store. Wire-level naming kept close to ACP. */
 export type BridgeEvent =
   | { type: "auth_state"; state: AuthState }
   | { type: "model_state"; state: ModelState }
   | { type: "mode_state"; sessionId: string; mode: AgentMode }
+  /** Shell boot progress (shared-first resilience). Shown before `ready`. */
+  | { type: "boot_phase"; phase: BootPhase; detail?: string }
   | { type: "session_ready"; session: Session }
   | { type: "session_meta"; sessionId: string; patch: Partial<SessionMeta> }
   | { type: "block_add"; sessionId: string; block: SessionBlock }

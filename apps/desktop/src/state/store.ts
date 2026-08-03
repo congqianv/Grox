@@ -507,6 +507,11 @@ export interface QueueNotice {
 interface DesktopState {
   ready: boolean;
   startupError: string | null;
+  /** Agent boot progress for the connecting splash (shared-first). */
+  bootPhase: import("../bridge/types").BootPhase | null;
+  bootPhaseDetail: string | null;
+  /** Sticky shared→local fallback notice (dismissible). */
+  bootFallbackNotice: string | null;
   auth: AuthState;
   bridgeKind: "mock" | "acp";
   workspace: string;
@@ -583,6 +588,7 @@ interface DesktopState {
   appUpdateProgress: AppUpdateProgress | null;
 
   init(): Promise<void>;
+  dismissBootFallbackNotice(): void;
   checkAppUpdate(opts?: { force?: boolean }): Promise<AppUpdateInfo | null>;
   dismissAppUpdate(): void;
   openAppUpdateDownload(): Promise<void>;
@@ -1081,6 +1087,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (!e.state.required && !e.state.inProgress && get().historySyncedAt === 0 && !get().historySyncing) {
           window.setTimeout(() => void get().refreshHistory(), 250);
         }
+        break;
+      case "boot_phase":
+        set({
+          bootPhase: e.phase,
+          bootPhaseDetail: e.detail ?? null,
+          // Persist sticky-fallback detail for the post-ready banner.
+          ...(e.phase === "ready" && e.detail
+            ? { bootFallbackNotice: e.detail }
+            : e.phase === "fallback_local"
+              ? { bootFallbackNotice: e.detail ?? get().bootFallbackNotice }
+              : {}),
+        });
         break;
       case "model_state":
         {
@@ -1865,6 +1883,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
   return {
     ready: false,
     startupError: null,
+    bootPhase: null,
+    bootPhaseDetail: null,
+    bootFallbackNotice: null,
     auth: { required: false, inProgress: false },
     bridgeKind: bridge.kind,
     workspace: DEMO_CWD,
@@ -1927,6 +1948,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
     appUpdateInstalling: false,
     appUpdateInstallPhase: "idle",
     appUpdateProgress: null,
+
+    dismissBootFallbackNotice() {
+      set({ bootFallbackNotice: null });
+    },
 
     async init() {
       if (bridgeSubscribed) return;

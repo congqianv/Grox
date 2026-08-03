@@ -2080,6 +2080,112 @@ fn set_agent_leader_mode(mode: String) -> Result<String, String> {
     write_agent_leader_mode(&mode)
 }
 
+/// Age (seconds) after which `auth.json.lock` is treated as abandoned and safe to clear.
+/// A healthy writer refreshes the lock far more often; 60s covers wedged exits without
+/// racing a live auth write under normal load.
+const AUTH_LOCK_STALE_SECS: u64 = 60;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreflightAgentBootResult {
+    /// True when a stale `auth.json.lock` was removed this call.
+    auth_lock_cleared: bool,
+    /// Age of the lock file when inspected (even if not cleared).
+    auth_lock_age_secs: Option<u64>,
+    /// Whether the lock path existed before this call.
+    auth_lock_present: bool,
+    /// Current agent leader preference after preflight (unchanged by this call).
+    leader_mode: String,
+    /// Human-readable notes for diagnostics / UI.
+    notes: Vec<String>,
+}
+
+fn auth_lock_path() -> Result<PathBuf, String> {
+    Ok(grok_home()?.join("auth.json.lock"))
+}
+
+/// Inspect a lock path and remove it when older than `stale_secs`.
+///
+/// A leftover lock from a crashed CLI / IDE session can block shared-leader attach and
+/// leave the desktop shell stuck on "Connecting to Grok…". Young locks are left alone
+/// so we do not interrupt a live auth write.
+fn clear_stale_auth_lock_at(
+    path: &Path,
+    stale_secs: u64,
+) -> (bool, Option<u64>, bool, Vec<String>) {
+    let mut notes = Vec::new();
+    if !path.exists() {
+        notes.push("auth.json.lock 不存在".into());
+        return (false, None, false, notes);
+    }
+    let metadata = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(error) => {
+            notes.push(format!("无法读取 auth.json.lock 元数据：{error}"));
+            return (false, None, true, notes);
+        }
+    };
+    let modified = match metadata.modified() {
+        Ok(t) => t,
+        Err(error) => {
+            notes.push(format!("无法读取 auth.json.lock 修改时间：{error}"));
+            return (false, None, true, notes);
+        }
+    };
+    let age_secs = match modified.elapsed() {
+        Ok(d) => d.as_secs(),
+        Err(_) => {
+            // Clock skew / future mtime — treat as fresh, do not clear.
+            notes.push("auth.json.lock 修改时间异常（未来时间），保留".into());
+            return (false, None, true, notes);
+        }
+    };
+    if age_secs <= stale_secs {
+        notes.push(format!(
+            "auth.json.lock 仍新鲜（{age_secs}s ≤ {stale_secs}s），保留"
+        ));
+        return (false, Some(age_secs), true, notes);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {
+            notes.push(format!(
+                "已清除过期 auth.json.lock（age {age_secs}s > {stale_secs}s）"
+            ));
+            (true, Some(age_secs), true, notes)
+        }
+        Err(error) => {
+            notes.push(format!("清除过期 auth.json.lock 失败：{error}"));
+            (false, Some(age_secs), true, notes)
+        }
+    }
+}
+
+fn clear_stale_auth_lock() -> (bool, Option<u64>, bool, Vec<String>) {
+    let Ok(path) = auth_lock_path() else {
+        return (
+            false,
+            None,
+            false,
+            vec!["无法解析 GROK_HOME，跳过 auth.lock 预检".into()],
+        );
+    };
+    clear_stale_auth_lock_at(&path, AUTH_LOCK_STALE_SECS)
+}
+
+/// Boot preflight before spawning `grok agent … stdio`.
+/// Clears abandoned auth locks; does not change leader-mode preference.
+#[tauri::command]
+fn preflight_agent_boot() -> Result<PreflightAgentBootResult, String> {
+    let (auth_lock_cleared, auth_lock_age_secs, auth_lock_present, notes) = clear_stale_auth_lock();
+    Ok(PreflightAgentBootResult {
+        auth_lock_cleared,
+        auth_lock_age_secs,
+        auth_lock_present,
+        leader_mode: read_agent_leader_mode(),
+        notes,
+    })
+}
+
 fn grok_binary_version(path: &str) -> Option<String> {
     let mut command = std::process::Command::new(path);
     command
@@ -8138,6 +8244,7 @@ fn main() {
             export_support_diagnostics,
             get_agent_leader_mode,
             set_agent_leader_mode,
+            preflight_agent_boot,
             grok_runtime_info,
             set_grok_runtime_preference,
             install_official_grok_cli,
@@ -8472,6 +8579,49 @@ api_key = "local-key"
         assert_eq!(agent_leader_cli_flag("shared"), "--leader");
         assert_eq!(agent_leader_cli_flag("leader"), "--leader");
         assert_eq!(agent_leader_cli_flag("garbage"), "--leader");
+    }
+
+    #[test]
+    fn clear_stale_auth_lock_at_skips_missing_and_fresh() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = std::env::temp_dir().join(format!(
+            "grox-preflight-auth-lock-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let lock = dir.join("auth.json.lock");
+
+        // Missing → not present.
+        let (cleared, age, present, _) = clear_stale_auth_lock_at(&lock, AUTH_LOCK_STALE_SECS);
+        assert!(!cleared && !present && age.is_none());
+
+        // Fresh file → keep.
+        fs::write(&lock, b"lock").expect("write fresh lock");
+        let (cleared, age, present, notes) = clear_stale_auth_lock_at(&lock, AUTH_LOCK_STALE_SECS);
+        assert!(!cleared && present);
+        assert!(age.unwrap_or(u64::MAX) <= AUTH_LOCK_STALE_SECS);
+        assert!(lock.exists());
+        assert!(notes.iter().any(|n| n.contains("仍新鲜")));
+
+        // Stale file → remove.
+        let stale_time = SystemTime::now() - Duration::from_secs(AUTH_LOCK_STALE_SECS + 45);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&lock)
+            .expect("open lock");
+        let times = std::fs::FileTimes::new().set_modified(stale_time);
+        file.set_times(times).expect("set mtime");
+        drop(file);
+
+        let (cleared, age, present, notes) = clear_stale_auth_lock_at(&lock, AUTH_LOCK_STALE_SECS);
+        assert!(cleared && present);
+        assert!(age.unwrap_or(0) > AUTH_LOCK_STALE_SECS);
+        assert!(!lock.exists());
+        assert!(notes.iter().any(|n| n.contains("已清除")));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

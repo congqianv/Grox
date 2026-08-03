@@ -18,6 +18,7 @@ import { TerminalPanel } from "./components/terminal/TerminalPanel";
 import { ResizeHandle } from "./components/common/ResizeHandle";
 import { usePreferences } from "./state/preferences";
 import { useI18n } from "./lib/i18n";
+import { bootPhaseLabel } from "./lib/bootPhase";
 import { AccountSetup } from "./components/settings/AccountSetup";
 
 class SessionErrorBoundary extends Component<
@@ -64,6 +65,10 @@ export default function App() {
   const activeId = useDesktop((s) => s.activeId);
   const session = useDesktop((s) => (s.activeId ? s.sessions[s.activeId] : null));
   const startupError = useDesktop((s) => s.startupError);
+  const bootPhase = useDesktop((s) => s.bootPhase);
+  const bootPhaseDetail = useDesktop((s) => s.bootPhaseDetail);
+  const bootFallbackNotice = useDesktop((s) => s.bootFallbackNotice);
+  const dismissBootFallbackNotice = useDesktop((s) => s.dismissBootFallbackNotice);
   const inspectorOpen = useDesktop((s) => s.inspectorOpen);
   const previewOpen = useDesktop((s) => s.previewOpen);
   const planPreviewOpen = useDesktop((s) => s.planPreviewOpen);
@@ -71,6 +76,7 @@ export default function App() {
   const goHome = useDesktop((s) => s.goHome);
   const sidebarWidth = usePreferences((s) => s.sidebarWidth);
   const setSidebarWidth = usePreferences((s) => s.setSidebarWidth);
+  const zh = language === "zh-CN";
 
   useEffect(() => {
     void useDesktop.getState().init();
@@ -109,7 +115,10 @@ export default function App() {
     return (
       <div className="flex h-screen flex-col items-center justify-center gap-4 bg-base">
         <BlackHole size={38} spin />
-        <span className="text-[13px] text-mute">{language === "zh-CN" ? "正在连接 Grok…" : "Connecting to Grok…"}</span>
+        <span className="text-[13px] text-mute">{bootPhaseLabel(bootPhase, zh)}</span>
+        {bootPhaseDetail && bootPhase !== "ready" && (
+          <p className="max-w-md px-6 text-center text-[11.5px] text-faint">{bootPhaseDetail}</p>
+        )}
       </div>
     );
   }
@@ -127,6 +136,18 @@ export default function App() {
           {startupError && !inSession && (
             <div className="border-b border-red/20 bg-red/5 px-4 py-2 text-[12.5px] text-red">
               {startupError}
+            </div>
+          )}
+          {bootFallbackNotice && !startupError && (
+            <div className="flex items-start justify-between gap-3 border-b border-gold/25 bg-gold/5 px-4 py-2 text-[12.5px] text-gold">
+              <span className="min-w-0 flex-1">{bootFallbackNotice}</span>
+              <button
+                type="button"
+                className="shrink-0 rounded border border-gold/30 px-1.5 py-0.5 text-[11px] text-gold hover:bg-gold/10"
+                onClick={() => dismissBootFallbackNotice()}
+              >
+                {zh ? "知道了" : "Dismiss"}
+              </button>
             </div>
           )}
           <SessionErrorBoundary language={language} onReset={goHome}>
