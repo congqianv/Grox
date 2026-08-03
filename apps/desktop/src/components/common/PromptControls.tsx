@@ -75,7 +75,18 @@ export function PromptOptionsMenu({
         title={language === "zh-CN" ? "模式、权限与思考强度" : "Mode, access and reasoning effort"}
       >
         <Icon name="gear" size={11} />
-        <span className="truncate capitalize">{mode} · {effort}</span>
+        <span className="truncate capitalize">
+          {mode} · {effort} ·{" "}
+          {permissionMode === "bypass"
+            ? "YOLO"
+            : permissionMode === "auto"
+              ? language === "zh-CN"
+                ? "自动"
+                : "Auto"
+              : language === "zh-CN"
+                ? "确认"
+                : "Ask"}
+        </span>
         <Icon name="chevronDown" size={9} className="text-faint" />
       </button>
       <FloatingMenu

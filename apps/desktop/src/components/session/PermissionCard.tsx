@@ -7,6 +7,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { PermissionOption, SessionBlock } from "../../bridge/types";
+import { topPendingPermissionId } from "../../lib/sessionGate";
 import { useDesktop } from "../../state/store";
 import { Icon } from "../fx/Icon";
 import { useI18n } from "../../lib/i18n";
@@ -17,9 +18,13 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
   const { language } = useI18n();
   const zh = language === "zh-CN";
   const resolvePermission = useDesktop((s) => s.resolvePermission);
-  const isActive = useDesktop(
-    (s) => s.activeId === sessionId && s.sessions[sessionId]?.status === "awaiting_permission",
-  );
+  // Only the *top* unresolved card owns 1/2/3 — stacked permissions must not all fire.
+  const isActive = useDesktop((s) => {
+    if (s.activeId !== sessionId) return false;
+    const session = s.sessions[sessionId];
+    if (!session || session.status !== "awaiting_permission") return false;
+    return topPendingPermissionId(session) === block.id;
+  });
   const resolved = block.resolved;
   const isPlan = block.id.startsWith("plan-approval-");
   const [submitting, setSubmitting] = useState(false);
@@ -74,9 +79,14 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
     // optionKey is a stable string form of `options` (rebuilt each render).
   }, [resolved, isActive, optionKey, block.id, resolvePermission, submitting]);
 
+  // Wire-fail restore clears resolved — unlock so the operator can retry from
+  // either the timeline card or the plan side pane.
   useEffect(() => {
     if (resolved) {
       locked.current = true;
+      setSubmitting(false);
+    } else {
+      locked.current = false;
       setSubmitting(false);
     }
   }, [resolved]);

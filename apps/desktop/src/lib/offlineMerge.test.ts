@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mergeOfflineWithLive } from "./offlineMerge";
+import { blockContentKey, mergeOfflineWithLive } from "./offlineMerge";
 import type { Session } from "../bridge/types";
 
 function sess(
@@ -89,5 +89,60 @@ describe("mergeOfflineWithLive", () => {
     });
     const out = mergeOfflineWithLive(pending, cur);
     expect(out.status).toBe("awaiting_permission");
+  });
+
+  it("does not duplicate when offline and live use different ids for same content", () => {
+    // Disk scan uses stable ids; UI painted optimistic UUIDs for the same turns.
+    const pending = sess({
+      id: "a",
+      status: "idle",
+      blocks: [
+        { type: "user", id: "disk-u1", text: "hello world", ts: 1 },
+        { type: "assistant", id: "disk-a1", text: "hi there", ts: 2, streaming: false },
+      ],
+    });
+    const cur = sess({
+      id: "a",
+      status: "idle",
+      blocks: [
+        { type: "user", id: "uuid-u1", text: "hello world", ts: 1 },
+        { type: "assistant", id: "uuid-a1", text: "hi there", ts: 2, streaming: false },
+      ],
+    });
+    const out = mergeOfflineWithLive(pending, cur);
+    expect(out.blocks).toHaveLength(2);
+    expect(out.blocks.map((b) => b.id)).toEqual(["disk-u1", "disk-a1"]);
+  });
+
+  it("appends only a new live user turn after offline prefix (content-aware)", () => {
+    const pending = sess({
+      id: "a",
+      status: "idle",
+      blocks: [
+        { type: "user", id: "disk-u1", text: "old", ts: 1 },
+        { type: "assistant", id: "disk-a1", text: "reply", ts: 2, streaming: false },
+      ],
+    });
+    const cur = sess({
+      id: "a",
+      status: "idle",
+      blocks: [
+        { type: "user", id: "uuid-u1", text: "old", ts: 1 },
+        { type: "assistant", id: "uuid-a1", text: "reply", ts: 2, streaming: false },
+        { type: "user", id: "uuid-u2", text: "brand new", ts: 3 },
+      ],
+    });
+    const out = mergeOfflineWithLive(pending, cur);
+    expect(out.blocks.map((b) => (b.type === "user" || b.type === "assistant" ? b.text : b.id))).toEqual([
+      "old",
+      "reply",
+      "brand new",
+    ]);
+  });
+
+  it("blockContentKey distinguishes interjected users", () => {
+    const a = blockContentKey({ type: "user", id: "1", text: "x", ts: 1 });
+    const b = blockContentKey({ type: "user", id: "2", text: "x", ts: 1, interjected: true });
+    expect(a).not.toBe(b);
   });
 });

@@ -51,6 +51,12 @@ export interface GrokBridge {
   getAuthState(): Promise<AuthState>;
   authenticate(): Promise<void>;
   logout(): Promise<void>;
+
+  /**
+   * Operator-forced agent restart (clears crash-reconnect cooldown).
+   * Optional — mock bridge may no-op.
+   */
+  forceReconnectAgent?(): Promise<void>;
   getAccountInfo(): Promise<AccountInfo>;
   getBillingInfo(): Promise<BillingInfo>;
   getProviderStatus(): Promise<ProviderStatus>;
@@ -71,8 +77,12 @@ export interface GrokBridge {
   /** Models currently offered by the connected agent. */
   getModelState(): Promise<ModelState>;
 
-  /** Change permission policy for existing and future sessions. */
-  setPermissionMode(mode: PermissionMode): void;
+  /**
+   * Change permission policy.
+   * - No sessionId: product default for new / unbound sessions.
+   * - With sessionId: per-session policy used for that session's tool gates.
+   */
+  setPermissionMode(mode: PermissionMode, sessionId?: string): void;
 
   /** Change the real Grok Build harness mode for an existing session. */
   setSessionMode(sessionId: string, mode: AgentMode): Promise<void>;

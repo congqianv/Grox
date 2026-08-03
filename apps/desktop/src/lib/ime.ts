@@ -14,6 +14,11 @@ type KeyLike = {
   key: string;
   nativeEvent: { isComposing?: boolean };
   keyCode: number;
+  /** Modifier keys — Ctrl/Meta+Enter (interject) must not be swallowed after IME commit. */
+  ctrlKey?: boolean;
+  metaKey?: boolean;
+  altKey?: boolean;
+  shiftKey?: boolean;
 };
 
 /**
@@ -50,8 +55,16 @@ export function useImeGuard() {
     if (event.nativeEvent.isComposing === true || event.keyCode === 229 || composing.current) {
       return true;
     }
-    // Only swallow the spurious post-commit Enter — leave other keys alone.
-    if (justEnded.current && event.key === "Enter") {
+    // Only swallow the spurious bare post-commit Enter (IME confirm).
+    // Ctrl/Meta+Enter (插话) and Shift+Enter (newline) must still work.
+    if (
+      justEnded.current &&
+      event.key === "Enter" &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !event.shiftKey
+    ) {
       justEnded.current = false;
       if (clearTimer.current !== null) {
         window.clearTimeout(clearTimer.current);

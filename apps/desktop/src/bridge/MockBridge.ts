@@ -215,7 +215,7 @@ export class MockBridge implements GrokBridge {
     return { models: MODELS, currentId: "grok-build" };
   }
 
-  setPermissionMode(mode: PermissionMode): void {
+  setPermissionMode(mode: PermissionMode, _sessionId?: string): void {
     this.permissionMode = mode;
   }
 
@@ -295,6 +295,7 @@ export class MockBridge implements GrokBridge {
         type: "user",
         id,
         text: trimmed,
+        interjected: true,
         attachments: (options.attachments ?? []).map(({ id: aid, kind, name, mime, size, data, path }) => ({
           id: aid,
           kind,
@@ -721,6 +722,8 @@ export class MockBridge implements GrokBridge {
           options: ["allow_once", "allow_always", "deny"],
         },
       });
+      // Demo terminal step is execute — only YOLO/bypass silent-allows (allow_once).
+      // Real Auto classification lives in permissionAuto.ts / AcpBridge.
       if (this.autoApprove || this.permissionMode === "bypass") {
         setTimeout(() => this.respondPermission(sessionId, permBlockId, "allow_once"), 300);
       }
