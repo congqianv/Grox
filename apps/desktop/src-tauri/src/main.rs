@@ -2094,6 +2094,8 @@ struct PreflightAgentBootResult {
     auth_lock_age_secs: Option<u64>,
     /// Whether the lock path existed before this call.
     auth_lock_present: bool,
+    /// True when a machine-wide `grok agent leader` process appears to be running.
+    machine_leader_alive: bool,
     /// Current agent leader preference after preflight (unchanged by this call).
     leader_mode: String,
     /// Human-readable notes for diagnostics / UI.
@@ -2172,15 +2174,95 @@ fn clear_stale_auth_lock() -> (bool, Option<u64>, bool, Vec<String>) {
     clear_stale_auth_lock_at(&path, AUTH_LOCK_STALE_SECS)
 }
 
+/// Best-effort: is the machine-wide `grok agent leader` daemon running?
+///
+/// Used to choose cold vs warm shared-init budgets. False negatives only make
+/// the first handshake wait longer (safer than false positives).
+fn machine_leader_alive() -> (bool, Vec<String>) {
+    let mut notes = Vec::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // WMIC is present on Win10+; filter on CommandLine for "agent leader".
+        let mut cmd = std::process::Command::new("wmic");
+        cmd.args([
+            "process",
+            "where",
+            "name='grok.exe'",
+            "get",
+            "CommandLine",
+            "/format:list",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+        match cmd.output() {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+                // Match `agent leader` (daemon), not `agent --leader` (client attach).
+                let alive = text.contains("agent leader")
+                    || text.contains("agent\" leader")
+                    || text.contains("agent' leader");
+                notes.push(if alive {
+                    "检测到 machine leader 进程（agent leader）".into()
+                } else {
+                    "未检测到 machine leader 进程（将使用冷启动预算）".into()
+                });
+                return (alive, notes);
+            }
+            Ok(_) | Err(_) => {
+                // Fallback: leader.lock exists and is young → likely held by a live leader.
+                if let Ok(home) = grok_home() {
+                    let lock = home.join("leader.lock");
+                    if let Ok(meta) = fs::metadata(&lock) {
+                        if let Ok(modified) = meta.modified() {
+                            if let Ok(age) = modified.elapsed() {
+                                if age.as_secs() < 86_400 {
+                                    notes.push(format!(
+                                        "wmic 不可用，leader.lock 存在（age {}s）— 假定 leader 可能在线",
+                                        age.as_secs()
+                                    ));
+                                    return (true, notes);
+                                }
+                            }
+                        }
+                    }
+                }
+                notes.push("无法探测 machine leader，按冷启动处理".into());
+                return (false, notes);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // Unix: default socket path; presence is a weak signal.
+        if let Ok(home) = grok_home() {
+            let sock = home.join("leader.sock");
+            if sock.exists() {
+                notes.push("leader.sock 存在".into());
+                return (true, notes);
+            }
+        }
+        notes.push("未找到 leader.sock — 冷启动".into());
+        (false, notes)
+    }
+}
+
 /// Boot preflight before spawning `grok agent … stdio`.
 /// Clears abandoned auth locks; does not change leader-mode preference.
 #[tauri::command]
 fn preflight_agent_boot() -> Result<PreflightAgentBootResult, String> {
-    let (auth_lock_cleared, auth_lock_age_secs, auth_lock_present, notes) = clear_stale_auth_lock();
+    let (auth_lock_cleared, auth_lock_age_secs, auth_lock_present, mut notes) =
+        clear_stale_auth_lock();
+    let (machine_leader_alive, leader_notes) = machine_leader_alive();
+    notes.extend(leader_notes);
     Ok(PreflightAgentBootResult {
         auth_lock_cleared,
         auth_lock_age_secs,
         auth_lock_present,
+        machine_leader_alive,
         leader_mode: read_agent_leader_mode(),
         notes,
     })
@@ -7659,11 +7741,16 @@ fn open_preview_external(url: String) -> Result<(), String> {
 /// Start a fresh ACP child and stream each stdout JSON-RPC line to the webview.
 /// A repeated call intentionally replaces the old child so a webview reload
 /// cannot initialize the same agent process twice.
+///
+/// `leader_mode` (optional): `"shared"` / `"local"` overrides the on-disk
+/// preference for **this spawn only** — used for soft local fallback without
+/// permanently flipping Settings.
 #[tauri::command]
 async fn acp_spawn(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AcpState>>,
     cwd: String,
+    leader_mode: Option<String>,
 ) -> Result<(), String> {
     // One spawn at a time: terminate → spawn → store must not interleave.
     let _spawn_guard = state.spawn_lock.lock().await;
@@ -7702,7 +7789,15 @@ async fn acp_spawn(
     // Shared (`--leader`) joins the machine-wide leader; process-scoped
     // `--plugin-dir` is ignored there and has been implicated in flaky 403s when
     // mixed with leader attach. Only attach Computer Use plugins in local mode.
-    let leader_mode = read_agent_leader_mode();
+    let preferred_mode = read_agent_leader_mode();
+    let leader_mode = normalize_agent_leader_mode(
+        leader_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or(Some(preferred_mode.as_str())),
+    )
+    .to_owned();
     let leader_flag = agent_leader_cli_flag(&leader_mode);
     if leader_mode == "local" {
         if let Some(plugin) = computer_plugin.as_ref() {

@@ -80,9 +80,9 @@ import { shouldDropSilentInbound } from "../lib/silentAcp";
 import { FIRST_EVENT_STALL_MS } from "../lib/firstEventWatch";
 import {
   LOCAL_INIT_TIMEOUT_MS,
-  SHARED_INIT_TIMEOUT_MS,
   SPAWN_TIMEOUT_MS,
   bootFallbackNoticeText,
+  sharedInitTimeoutMs,
 } from "../lib/bootPhase";
 import type { BootPhase } from "./types";
 
@@ -1568,10 +1568,11 @@ export class AcpBridge implements GrokBridge {
 
   /**
    * Shared-first boot:
-   * 1) preflight (clear stale auth.json.lock)
-   * 2) try preferred mode — shared uses a short handshake budget (12–15s)
-   * 3) on shared failure → sticky write `local` + re-spawn (suppressExitHandling)
-   * Runtime product-gate recovery stays on a separate latch.
+   * 1) preflight (clear stale auth.json.lock, probe machine leader)
+   * 2) try preferred mode — cold/warm shared handshake budget
+   * 3) on shared timeout/busy → soft local for this process only
+   *    (does NOT rewrite Settings; no auth.error / reconnect bait)
+   * Runtime product-gate 403 recovery still sticky-writes local.
    */
   private async initializeAgent(): Promise<void> {
     // Diagnostics belong to one concrete child process. Keeping stderr from a
@@ -1579,13 +1580,16 @@ export class AcpBridge implements GrokBridge {
     this.diagnostics = [];
     this.setBootPhase("preflight");
 
+    let machineLeaderAlive: boolean | undefined;
     try {
       const preflight = await invoke<{
         authLockCleared?: boolean;
         authLockAgeSecs?: number | null;
         notes?: string[];
         leaderMode?: string;
+        machineLeaderAlive?: boolean;
       }>("preflight_agent_boot");
+      machineLeaderAlive = preflight?.machineLeaderAlive;
       if (preflight?.authLockCleared) {
         this.diagnostics.push(
           `preflight: cleared stale auth.json.lock` +
@@ -1608,22 +1612,18 @@ export class AcpBridge implements GrokBridge {
       preferredMode = "shared";
     }
     const wantShared = preferredMode !== "local";
+    const sharedBudget = sharedInitTimeoutMs(machineLeaderAlive);
 
     if (wantShared) {
       try {
-        await this.spawnAndHandshake("shared", SHARED_INIT_TIMEOUT_MS);
+        await this.spawnAndHandshake("shared", sharedBudget);
         this.setBootPhase("ready");
         return;
       } catch (sharedError) {
         const detail = errorText(sharedError);
         this.diagnostics.push(`shared boot failed: ${detail}`);
         this.setBootPhase("fallback_local", detail);
-        // Sticky local so the next cold start does not hang again on a wedged leader.
-        try {
-          await invoke<string>("set_agent_leader_mode", { mode: "local" });
-        } catch (cause) {
-          this.diagnostics.push(`sticky local preference failed: ${errorText(cause)}`);
-        }
+        // Soft only: do NOT rewrite desktop-agent-leader-mode.json.
         // Must NOT bare-acp_kill while suppressExitHandling is false: onExit would
         // permanently reject `this.ready` mid-recovery (PR-A review B1).
         this.suppressExitHandling = true;
@@ -1632,31 +1632,27 @@ export class AcpBridge implements GrokBridge {
         } catch (localError) {
           const localDetail = errorText(localError);
           throw new Error(
-            `Grok Agent 初始化失败：共享 Leader 不可用（${detail}），独立进程亦失败（${localDetail}）。` +
-              `请确认 Grok Build CLI 已安装，或在设置中检查 Agent 进程模式。`,
+            `初始化失败：共享 Leader 不可用（${detail}），独立进程亦失败（${localDetail}）。` +
+              `请确认 Grok Build CLI 已安装，或在设置中检查进程模式。`,
           );
         } finally {
           this.suppressExitHandling = false;
         }
         const notice = bootFallbackNoticeText(true, detail);
         this.setBootPhase("ready", notice);
-        // Surface after shell paints (auth_state is visible on StatusBar / banners).
-        this.setAuthState({
-          ...this.authState,
-          error: notice,
-        });
+        // Banner only — never auth.error (StatusBar would demand reconnect).
         return;
       }
     }
 
-    // Operator (or sticky fallback) already prefers local.
+    // Operator prefers local.
     try {
       await this.spawnAndHandshake("local", LOCAL_INIT_TIMEOUT_MS);
       this.setBootPhase("ready");
     } catch (error) {
       const detail = errorText(error);
       throw new Error(
-        `Grok Agent 初始化失败：${detail}。CLI 已启动但未在 ${Math.round(LOCAL_INIT_TIMEOUT_MS / 1000)} 秒内完成握手。`,
+        `初始化失败：${detail}。CLI 已启动但未在 ${Math.round(LOCAL_INIT_TIMEOUT_MS / 1000)} 秒内完成握手。`,
       );
     }
   }
@@ -1669,13 +1665,14 @@ export class AcpBridge implements GrokBridge {
     this.setBootPhase(mode === "shared" ? "spawning_shared" : "spawning_local");
     try {
       await Promise.race([
-        invoke("acp_spawn", { cwd: this.workspace }),
+        // Pass leaderMode so soft fallback can use --no-leader without sticky pref.
+        invoke("acp_spawn", { cwd: this.workspace, leaderMode: mode }),
         new Promise<never>((_, reject) => {
           window.setTimeout(
             () =>
               reject(
                 new Error(
-                  `启动 Grok Agent 超时（${Math.round(SPAWN_TIMEOUT_MS / 1000)} 秒）`,
+                  `启动进程超时（${Math.round(SPAWN_TIMEOUT_MS / 1000)} 秒）`,
                 ),
               ),
             SPAWN_TIMEOUT_MS,
@@ -1685,7 +1682,7 @@ export class AcpBridge implements GrokBridge {
     } catch (error) {
       const detail = errorText(error);
       throw new Error(
-        `无法启动 Grok Agent：${detail}。请确认 Grok Build CLI 已安装，或通过 GROK_DESKTOP_CLI 指定可执行文件。`,
+        `无法启动 Grok CLI：${detail}。请确认已安装，或通过 GROK_DESKTOP_CLI 指定可执行文件。`,
       );
     }
 
