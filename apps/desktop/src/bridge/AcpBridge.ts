@@ -450,7 +450,7 @@ const TOOL_KINDS = new Set<ToolKind>([
   "plan", "web_search", "web_fetch", "background_task_action", "wait_tasks_action",
   "kill_task_action", "list", "skill", "memory_search", "memory_get", "task", "enter_plan",
   "exit_plan", "ask_user", "image_gen", "video_gen", "image_to_video", "reference_to_video",
-  "deploy_app", "search_tool", "use_tool", "monitor", "goal_update", "terminal", "web",
+  "computer", "deploy_app", "search_tool", "use_tool", "monitor", "goal_update", "terminal", "web",
   "think", "switch_mode", "other",
 ]);
 
@@ -466,9 +466,22 @@ function mapToolKind(kindValue: unknown, titleValue: unknown): ToolKind {
   if (/\b(execute|terminal|shell|bash|command|process)\b/.test(source)) return "execute";
   if (/\b(web|fetch|browser|url)\b/.test(source)) return "web_fetch";
   if (/\b(search|grep|find|glob)\b/.test(source)) return "search";
+  if (
+    /\bcomputer_(screenshot|mouse|click|drag|scroll|key|type|wait)\b/.test(source) ||
+    (/\bcomputer\b/.test(source) &&
+      /\b(desktop|window|screen|mouse|keyboard|uiautomation)\b/.test(source))
+  ) {
+    return "computer";
+  }
   if (/\b(task|agent|todo|plan)\b/.test(source)) return "task";
   if (/\b(think|reason)\b/.test(source)) return "think";
   return "other";
+}
+
+interface ComputerSessionExtensions {
+  mcpServers: unknown[];
+  pluginDirs: string[];
+  leaseId: string;
 }
 
 function mapToolStatus(value: unknown): ToolStatus {
@@ -761,6 +774,43 @@ export class AcpBridge implements GrokBridge {
   private cursors = new Map<string, ContentCursor>();
   private catalogue = new Map<string, SessionMeta>();
   private replaying = new Map<string, Session>();
+  /**
+   * Sessions currently being restored via `session/load`. While set, emit() keeps
+   * a private replay buffer AND periodically flushes it to the UI so the shell
+   * is not stuck on the full-screen "Restoring session…" spinner for long
+   * transcripts (especially under agent --leader).
+   */
+  private progressiveLoad = new Set<string>();
+  private progressiveFlushTimers = new Map<string, number>();
+  /**
+   * Silent agent-bind: session/load still runs in the CLI, but we discard stream
+   * updates (UI already has offline disk history). Prevents first-send freeze.
+   */
+  private silentReplaying = new Set<string>();
+  /** In-flight session/load promises — dedupe open + first-send races. */
+  private loadPromises = new Map<string, Promise<void>>();
+  /**
+   * Exclusive ACP channel queue for heavy ops (session/load + session/prompt).
+   * Prevents concurrent silent binds from globally black-holing another session's
+   * live stream, and avoids stacking multi-minute rehydrates on one stdio child.
+   */
+  private channelTail: Promise<unknown> = Promise.resolve();
+  /**
+   * Scheme C + visit memory:
+   * 1) Always prefer full-load of the active mission if unbound.
+   * 2) After active is complete, full-load other *visited* unbound missions
+   *    (oldest visit first — e.g. opened A then B → while on B load A).
+   * 3) Switching to C: active C wins; abandon not-yet-started secondary (A).
+   * 4) In-flight ACP load cannot be cancelled mid-flight.
+   */
+  private visitedOrder: string[] = [];
+  private backgroundLoadRunning = false;
+  private backgroundLoadInFlight: string | null = null;
+  private activeSessionGetter: (() => string | null) | null = null;
+  /** Avoid tight retry loops after a failed full-load until user re-opens. */
+  private backgroundLoadFailed = new Set<string>();
+  /** Short TTL cache for sessionMeta (system-prompt + permission flags) per cwd. */
+  private sessionMetaCache = new Map<string, { expires: number; value: Record<string, unknown> }>();
   private usage = new Map<string, Usage>();
   private sessionOptions = new Map<string, PromptOptions>();
   private knownSessions = new Set<string>();
@@ -781,6 +831,9 @@ export class AcpBridge implements GrokBridge {
         ? "bypass"
         : "default";
   private workspace = "";
+  private computerLeases = new Map<string, string>();
+  private activeComputerSessions = new Set<string>();
+  private activeComputerToolCalls = new Set<string>();
   private ready: Promise<void>;
 
   constructor() {
@@ -806,13 +859,192 @@ export class AcpBridge implements GrokBridge {
 
   private emit(event: BridgeEvent) {
     if ("sessionId" in event) {
+      if (this.silentReplaying.has(event.sessionId)) {
+        // Silent bind: never touch the UI timeline from load stream.
+        return;
+      }
       const replay = this.replaying.get(event.sessionId);
       if (replay) {
+        // During session/load the agent can stream hundreds of thousands of
+        // updates. Applying every thinking/assistant delta freezes the UI
+        // (scroll works, clicks/switch/send do not). Keep only structured
+        // events for the final snapshot; skip pure stream deltas.
+        if (
+          event.type === "assistant_append" ||
+          event.type === "thinking_append"
+        ) {
+          return;
+        }
         this.replaying.set(event.sessionId, applyToSession(replay, event));
+        // Progressive restore only for intentional foreground loads.
+        if (this.progressiveLoad.has(event.sessionId)) {
+          this.scheduleProgressiveFlush(event.sessionId);
+        }
         return;
       }
     }
     for (const callback of this.listeners) callback(event);
+  }
+
+  /** Push the current replay snapshot to the UI (throttled). */
+  private scheduleProgressiveFlush(sessionId: string) {
+    if (this.progressiveFlushTimers.has(sessionId)) return;
+    const timer = window.setTimeout(() => {
+      this.progressiveFlushTimers.delete(sessionId);
+      if (!this.progressiveLoad.has(sessionId)) return;
+      const snap = this.replaying.get(sessionId);
+      if (!snap) return;
+      const session: Session = {
+        ...snap,
+        status: "idle",
+        blocks: snap.blocks.map((block) =>
+          block.type === "assistant"
+            ? { ...block, streaming: false }
+            : block.type === "thinking"
+              ? { ...block, live: false }
+              : block,
+        ),
+      };
+      for (const callback of this.listeners) {
+        callback({ type: "session_ready", session });
+      }
+    }, 100);
+    this.progressiveFlushTimers.set(sessionId, timer);
+  }
+
+  private clearProgressiveLoad(sessionId: string) {
+    this.progressiveLoad.delete(sessionId);
+    const timer = this.progressiveFlushTimers.get(sessionId);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      this.progressiveFlushTimers.delete(sessionId);
+    }
+  }
+
+  /** Seed catalogue so loadSession skips a full x.ai/session/list round-trip. */
+  rememberSessionMeta(meta: SessionMeta): void {
+    this.catalogue.set(meta.id, meta);
+  }
+
+  isSessionBound(id: string): boolean {
+    return this.knownSessions.has(id);
+  }
+
+  setActiveSessionGetter(getter: () => string | null): void {
+    this.activeSessionGetter = getter;
+  }
+
+  private activeSessionId(): string | null {
+    return this.activeSessionGetter?.() ?? null;
+  }
+
+  private touchVisited(id: string): void {
+    this.visitedOrder = this.visitedOrder.filter((x) => x !== id);
+    this.visitedOrder.push(id);
+    // Cap memory of visits
+    if (this.visitedOrder.length > 40) {
+      this.visitedOrder = this.visitedOrder.slice(-40);
+    }
+  }
+
+  /**
+   * Pick next full-load target:
+   * - Active unbound mission always first (C when user is on C).
+   * - Else oldest visited unbound (A after B is complete).
+   */
+  private nextBackgroundLoadId(): string | null {
+    const active = this.activeSessionId();
+    if (
+      active &&
+      !this.knownSessions.has(active) &&
+      !this.backgroundLoadFailed.has(active)
+    ) {
+      return active;
+    }
+    for (const id of this.visitedOrder) {
+      if (active && id === active) continue;
+      if (this.knownSessions.has(id)) continue;
+      if (this.backgroundLoadFailed.has(id)) continue;
+      return id;
+    }
+    return null;
+  }
+
+  /**
+   * Record a visit and pump the load queue.
+   * Opening a mission marks it visited and prioritizes the active window.
+   */
+  enqueueBackgroundLoad(id: string): void {
+    if (!id) return;
+    this.touchVisited(id);
+    // User re-opened — allow retry after a previous failure.
+    this.backgroundLoadFailed.delete(id);
+    void this.pumpBackgroundLoads();
+  }
+
+  private async pumpBackgroundLoads(): Promise<void> {
+    if (this.backgroundLoadRunning) return;
+    this.backgroundLoadRunning = true;
+    try {
+      for (;;) {
+        const id = this.nextBackgroundLoadId();
+        if (!id) break;
+
+        // If something else is already mid-flight, wait for it via loadPromises
+        // only when it's the same id; otherwise we must finish in-flight first
+        // (ACP single channel) then re-evaluate nextBackgroundLoadId.
+        if (
+          this.backgroundLoadInFlight &&
+          this.backgroundLoadInFlight !== id
+        ) {
+          // Wait for current in-flight to finish by awaiting its promise if any.
+          const inflightId = this.backgroundLoadInFlight;
+          const pending = this.loadPromises.get(inflightId);
+          if (pending) {
+            try {
+              await pending;
+            } catch {
+              /* ignore */
+            }
+          }
+          continue;
+        }
+
+        if (this.knownSessions.has(id)) continue;
+
+        // Re-check priority right before start (user may have switched to C).
+        const preferred = this.nextBackgroundLoadId();
+        if (preferred !== id) {
+          // Abandoned not-yet-started secondary (e.g. was about to load A, now C).
+          continue;
+        }
+
+        // Active window always wins over secondary: if we're about to load a
+        // non-active id but active is unbound, skip to re-pick active.
+        const active = this.activeSessionId();
+        if (active && active !== id && !this.knownSessions.has(active)) {
+          continue;
+        }
+
+        this.backgroundLoadInFlight = id;
+        try {
+          // Silent bind only — offline disk history already covers viewing.
+          // Full ACP UI replay freezes on large sessions and is no longer needed.
+          await this.loadSession(id, { background: true, silent: true });
+          this.backgroundLoadFailed.delete(id);
+        } catch (error) {
+          console.warn("background full-load failed", id, error);
+          this.backgroundLoadFailed.add(id);
+        } finally {
+          this.backgroundLoadInFlight = null;
+        }
+      }
+    } finally {
+      this.backgroundLoadRunning = false;
+      if (this.nextBackgroundLoadId()) {
+        void this.pumpBackgroundLoads();
+      }
+    }
   }
 
   private queueStreamAppend(event: Extract<BridgeEvent, { type: "assistant_append" | "thinking_append" }>) {
@@ -1004,17 +1236,105 @@ export class AcpBridge implements GrokBridge {
     return cursor;
   }
 
+  /** Inbound ACP lines — drained in rAF slices so a huge session/load cannot freeze clicks. */
+  private inboundQueue: string[] = [];
+  private inboundDraining = false;
+
+  private enqueueInbound(line: string) {
+    // Belt-and-braces if Rust silent filter is off or a line slipped through.
+    if (this.silentReplaying.size > 0) {
+      if (
+        line.includes("sessionUpdate") ||
+        line.includes("agent_thought_chunk") ||
+        line.includes('"session/update"') ||
+        line.includes("x.ai/session/update")
+      ) {
+        return;
+      }
+    }
+    this.inboundQueue.push(line);
+    if (this.inboundDraining) return;
+    this.inboundDraining = true;
+    const pump = () => {
+      const start = performance.now();
+      // ~one frame of work; leave headroom for clicks / React.
+      while (this.inboundQueue.length > 0 && performance.now() - start < 6) {
+        const next = this.inboundQueue.shift();
+        if (next !== undefined) this.onLine(next);
+      }
+      if (this.inboundQueue.length > 0) {
+        window.requestAnimationFrame(pump);
+      } else {
+        this.inboundDraining = false;
+      }
+    };
+    window.requestAnimationFrame(pump);
+  }
+
+  private async setSilentStream(silent: boolean): Promise<void> {
+    try {
+      await invoke("acp_set_silent_stream", { silent });
+    } catch {
+      /* older shells without the command — JS drop still applies */
+    }
+  }
+
+  /** Serialize heavy ACP ops so silent bind cannot overlap another session's live stream. */
+  private runOnChannel<T>(op: () => Promise<T>): Promise<T> {
+    const run = this.channelTail.then(op, op);
+    this.channelTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** Drop bind-state that dies with the agent child. */
+  private resetBindStateAfterAgentExit(): void {
+    this.knownSessions.clear();
+    this.loadPromises.clear();
+    this.silentReplaying.clear();
+    this.replaying.clear();
+    this.progressiveLoad.clear();
+    for (const timer of this.progressiveFlushTimers.values()) {
+      window.clearTimeout(timer);
+    }
+    this.progressiveFlushTimers.clear();
+    this.inboundQueue = [];
+    this.inboundDraining = false;
+    this.backgroundLoadInFlight = null;
+    this.backgroundLoadRunning = false;
+    this.backgroundLoadFailed.clear();
+    void this.setSilentStream(false);
+  }
+
   private async connect(): Promise<void> {
     const environment = await invoke<DesktopEnvironment>("desktop_environment");
     this.workspace = localStorage.getItem("grok.workspace") ?? environment.defaultWorkspace;
 
     this.unlisten.push(
-      await listen<string>("acp-event", ({ payload }) => this.onLine(payload)),
+      await listen<string>("acp-event", ({ payload }) => this.enqueueInbound(payload)),
       await listen<string>("acp-stderr", ({ payload }) => {
         this.diagnostics.push(payload);
         this.diagnostics = this.diagnostics.slice(-20);
       }),
       await listen<ExitPayload>("acp-exit", ({ payload }) => this.onExit(payload)),
+      await listen("computer-emergency-shortcut", () => {
+        // Stop every session that has (or had) a Computer lease — not only
+        // mid-tool-call sessions. Between observe→action activeComputerSessions
+        // is empty while the bearer is still live.
+        const leaseSessions = new Set<string>([
+          ...this.activeComputerSessions,
+          ...this.computerLeases.keys(),
+        ]);
+        if (leaseSessions.size === 0) {
+          void invoke("computer_revoke_http_auth").catch(() => {});
+          return;
+        }
+        for (const sessionId of leaseSessions) {
+          void this.emergencyStopComputer(sessionId);
+        }
+      }),
     );
 
     await this.initializeAgent();
@@ -1135,7 +1455,10 @@ export class AcpBridge implements GrokBridge {
       request.reject(new Error(message));
     }
     this.pending.clear();
-    for (const sessionId of this.knownSessions) {
+    const bound = [...this.knownSessions];
+    // Must clear before re-emit so first-send will re-bind after agent death.
+    this.resetBindStateAfterAgentExit();
+    for (const sessionId of bound) {
       this.emit({ type: "error", sessionId, message });
     }
   }
@@ -1222,12 +1545,14 @@ export class AcpBridge implements GrokBridge {
     if (method === "session/update" || method === "x.ai/session/update") {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
+      if (sessionId && this.silentReplaying.has(sessionId)) return;
       if (sessionId) this.handleSessionUpdate(sessionId, params?.update);
       return;
     }
     if (method === "x.ai/session_notification") {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
+      if (sessionId && this.silentReplaying.has(sessionId)) return;
       if (sessionId) this.handleXaiUpdate(sessionId, params?.update);
       return;
     }
@@ -1281,6 +1606,11 @@ export class AcpBridge implements GrokBridge {
     const update = record(updateValue);
     if (!update) return;
     const type = string(update.sessionUpdate);
+    // While replaying session/load, thought tokens are pure noise for the final
+    // UI snapshot and dominate CPU on long sessions — drop them.
+    if (this.replaying.has(sessionId) && type === "agent_thought_chunk") {
+      return;
+    }
     const cursor = this.cursor(sessionId);
 
     switch (type) {
@@ -1462,6 +1792,10 @@ export class AcpBridge implements GrokBridge {
       ),
       locations: extractLocations(update.locations, update.rawInput, update.rawOutput, content),
     };
+    if (kind === "computer" && call.status === "running") {
+      this.activeComputerToolCalls.add(`${sessionId}:${toolCallId}`);
+      this.activeComputerSessions.add(sessionId);
+    }
     this.emit({
       type: "block_add",
       sessionId,
@@ -1489,6 +1823,19 @@ export class AcpBridge implements GrokBridge {
       content,
     );
     const kind = mapToolKind(update.kind, update.title);
+    const computerToolKey = `${sessionId}:${toolCallId}`;
+    const isComputerTool = kind === "computer" || this.activeComputerToolCalls.has(computerToolKey);
+    if (isComputerTool) {
+      if (status === "running") {
+        this.activeComputerToolCalls.add(computerToolKey);
+        this.activeComputerSessions.add(sessionId);
+      } else if (status === "done" || status === "error" || status === "cancelled") {
+        this.activeComputerToolCalls.delete(computerToolKey);
+        if (![...this.activeComputerToolCalls].some((key) => key.startsWith(`${sessionId}:`))) {
+          this.activeComputerSessions.delete(sessionId);
+        }
+      }
+    }
     const locations = extractLocations(update.locations, update.rawInput, update.rawOutput, content);
     this.queueToolPatch({
       type: "tool_patch",
@@ -1692,6 +2039,7 @@ export class AcpBridge implements GrokBridge {
         description: string(tool.kind) ?? "Grok requests permission to continue.",
         payload: jsonText(tool.rawInput),
         options,
+        purpose: "tool",
       },
     });
   }
@@ -1723,6 +2071,7 @@ export class AcpBridge implements GrokBridge {
         description: "Grok has finished planning and is waiting to enter agent mode.",
         payload: string(params.planContent),
         options: ["allow_once", "deny"],
+        purpose: "plan",
       },
     });
   }
@@ -1901,6 +2250,11 @@ export class AcpBridge implements GrokBridge {
   }
 
   private async sessionMeta(cwd: string) {
+    const cached = this.sessionMetaCache.get(cwd);
+    if (cached && cached.expires > Date.now()) {
+      // Permission flags may change from the composer; always merge live flags.
+      return { ...cached.value, ...this.sessionPermissionMeta() };
+    }
     let systemPromptOverride: string | undefined;
     try {
       const documents = await invoke<ConfigDocument[]>("read_config_documents", { cwd });
@@ -1910,9 +2264,13 @@ export class AcpBridge implements GrokBridge {
     } catch {
       // A missing optional prompt document must never block session creation.
     }
-    return {
-      ...this.sessionPermissionMeta(),
+    const base = {
       ...(systemPromptOverride ? { systemPromptOverride } : {}),
+    };
+    this.sessionMetaCache.set(cwd, { expires: Date.now() + 60_000, value: base });
+    return {
+      ...base,
+      ...this.sessionPermissionMeta(),
     };
   }
 
@@ -2105,14 +2463,43 @@ export class AcpBridge implements GrokBridge {
 
   async newSession(cwd: string): Promise<void> {
     const metaRequest = await this.sessionMeta(cwd);
-    const responseValue = await this.request(ACP_METHODS.sessionNew, {
-      cwd,
-      mcpServers: [],
-      _meta: metaRequest,
-    });
+    const preferredModel = localStorage.getItem("grok.model")?.trim();
+    const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+    let responseValue: unknown;
+    let attachedComputer = computer.mcpServers.length > 0 || computer.pluginDirs.length > 0;
+    try {
+      responseValue = await this.request(ACP_METHODS.sessionNew, {
+        cwd,
+        mcpServers: computer.mcpServers,
+        _meta: {
+          ...metaRequest,
+          ...(preferredModel ? { modelId: preferredModel } : {}),
+          pluginDirs: computer.pluginDirs,
+        },
+      });
+    } catch (error) {
+      // Older Grok CLIs reject Computer Use session extensions — fall back only
+      // when we actually tried to attach them (not for unrelated failures).
+      if (!attachedComputer) throw error;
+      const message = errorText(error).toLowerCase();
+      const looksLikeExtensionReject =
+        message.includes("mcp") ||
+        message.includes("plugin") ||
+        message.includes("unknown") ||
+        message.includes("invalid") ||
+        message.includes("unsupported");
+      if (!looksLikeExtensionReject) throw error;
+      attachedComputer = false;
+      responseValue = await this.request(ACP_METHODS.sessionNew, {
+        cwd,
+        mcpServers: [],
+        _meta: metaRequest,
+      });
+    }
     const response = record(responseValue);
     const sessionId = string(response?.sessionId);
     if (!sessionId) throw new Error("session/new 未返回 sessionId");
+    if (attachedComputer) this.computerLeases.set(sessionId, computer.leaseId);
     this.captureModelState(response);
     const detail = record(record(response?._meta)?.["x.ai/sessionDetail"]);
     const now = Date.now();
@@ -2131,29 +2518,136 @@ export class AcpBridge implements GrokBridge {
     this.emit({ type: "session_ready", session: emptySession(meta) });
   }
 
-  async loadSession(id: string): Promise<void> {
+  async loadSession(
+    id: string,
+    options?: { background?: boolean; silent?: boolean },
+  ): Promise<void> {
+    const inflight = this.loadPromises.get(id);
+    if (inflight) return inflight;
+
+    // Channel-serialized: at most one load (and no interleaved prompt) at a time.
+    const run = this.runOnChannel(() => this.loadSessionInner(id, options)).finally(() => {
+      this.loadPromises.delete(id);
+    });
+    this.loadPromises.set(id, run);
+    return run;
+  }
+
+  private async loadSessionInner(
+    id: string,
+    options?: { background?: boolean; silent?: boolean },
+  ): Promise<void> {
+    const background = options?.background === true;
+    // Silent agent-bind: CLI rehydrates context; UI keeps offline disk history.
+    const silentBind = options?.silent === true;
     let meta = this.catalogue.get(id);
     if (!meta) {
+      // Expensive: paginated x.ai/session/list. Prefer rememberSessionMeta() first.
       await this.listSessions();
       meta = this.catalogue.get(id);
     }
     if (!meta) throw new Error(`找不到会话：${id}`);
 
+    // Foreground non-silent: paint empty shell. Background/silent: keep UI.
+    if (!background && !silentBind) {
+      this.emit({ type: "session_ready", session: emptySession(meta) });
+    }
+
     this.cursors.set(id, { toolBlocks: new Map() });
     this.replaying.set(id, emptySession(meta));
+    if (silentBind) {
+      this.silentReplaying.add(id);
+      await this.setSilentStream(true);
+    } else if (!background) {
+      this.progressiveLoad.add(id);
+    }
+
     try {
       const metaRequest = await this.sessionMeta(meta.cwd);
-      const response = await this.request(ACP_METHODS.sessionLoad, {
-        sessionId: id,
-        cwd: meta.cwd,
-        mcpServers: [],
-        _meta: metaRequest,
-      }, 2 * 60_000);
+      // Silent/background loads are for offline history + first-send bind only.
+      // Starting Computer Use MCP there leaks localhost listeners on every visit
+      // and adds bind latency that fights the offline-history path.
+      const attachComputer = !silentBind && !background;
+      let computer: ComputerSessionExtensions | null = null;
+      if (attachComputer) {
+        computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+      }
+      // Large sessions can take several minutes for the agent to rehydrate.
+      let response: unknown;
+      if (computer && (computer.mcpServers.length > 0 || computer.pluginDirs.length > 0)) {
+        try {
+          response = await this.request(
+            ACP_METHODS.sessionLoad,
+            {
+              sessionId: id,
+              cwd: meta.cwd,
+              mcpServers: computer.mcpServers,
+              _meta: { ...metaRequest, pluginDirs: computer.pluginDirs },
+            },
+            2 * 60_000,
+          );
+        } catch (error) {
+          // Older CLIs may reject Computer Use extensions — retry bare load.
+          const message = errorText(error).toLowerCase();
+          const looksLikeExtensionReject =
+            message.includes("mcp") ||
+            message.includes("plugin") ||
+            message.includes("unknown") ||
+            message.includes("invalid") ||
+            message.includes("unsupported");
+          if (!looksLikeExtensionReject) throw error;
+          response = await this.request(
+            ACP_METHODS.sessionLoad,
+            {
+              sessionId: id,
+              cwd: meta.cwd,
+              mcpServers: [],
+              _meta: metaRequest,
+            },
+            2 * 60_000,
+          );
+          computer = null;
+        }
+      } else {
+        response = await this.request(
+          ACP_METHODS.sessionLoad,
+          {
+            sessionId: id,
+            cwd: meta.cwd,
+            mcpServers: [],
+            _meta: metaRequest,
+          },
+          silentBind ? 10 * 60_000 : 2 * 60_000,
+        );
+      }
+      if (computer) {
+        const previousLease = this.computerLeases.get(id);
+        if (previousLease && previousLease !== computer.leaseId) {
+          await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(
+            () => {},
+          );
+        }
+        this.computerLeases.set(id, computer.leaseId);
+      }
       this.flushStreamAppends(id);
       this.flushToolPatches(id);
       this.captureModelState(response);
-      await this.refreshSessionInfo(id);
+      void this.refreshSessionInfo(id).catch(() => {
+        /* non-fatal */
+      });
+
       const replayed = this.replaying.get(id) ?? emptySession(meta);
+      this.clearProgressiveLoad(id);
+      this.replaying.delete(id);
+      this.silentReplaying.delete(id);
+      this.knownSessions.add(id);
+      await this.setSilentStream(this.silentReplaying.size > 0);
+
+      if (silentBind) {
+        // Bound for prompt; do not overwrite offline disk history with empty replay.
+        return;
+      }
+
       const finalized: Session = {
         ...replayed,
         usage: this.usage.get(id) ?? replayed.usage,
@@ -2166,19 +2660,21 @@ export class AcpBridge implements GrokBridge {
               : block,
         ),
       };
-      this.replaying.delete(id);
-      this.knownSessions.add(id);
       this.emit({ type: "session_ready", session: finalized });
     } catch (error) {
+      this.clearProgressiveLoad(id);
       this.replaying.delete(id);
+      this.silentReplaying.delete(id);
+      await this.setSilentStream(this.silentReplaying.size > 0);
       throw error;
     }
   }
 
   async interject(sessionId: string, text: string, options: PromptOptions): Promise<InterjectResult> {
     await this.ready;
-    this.knownSessions.add(sessionId);
+    // Do not optimistically mark bound — only session/new or successful session/load.
     const trimmed = text.trim();
+    await this.ensureComputerAttachedForPrompt(sessionId, trimmed);
     const interjectionId = crypto.randomUUID();
     const content = promptContent(trimmed, options.attachments ?? []);
     try {
@@ -2237,7 +2733,6 @@ export class AcpBridge implements GrokBridge {
     queueOptions: { promptId?: string; sendNow?: boolean } = {},
   ): Promise<QueueOperationReceipt> {
     await this.ready;
-    this.knownSessions.add(sessionId);
     const trimmed = text.trim();
     const promptId = queueOptions.promptId ?? uid();
     const sendNow = queueOptions.sendNow === true;
@@ -2336,7 +2831,11 @@ export class AcpBridge implements GrokBridge {
 
   async prompt(sessionId: string, text: string, options: PromptOptions): Promise<void> {
     await this.ready;
-    this.knownSessions.add(sessionId);
+    // Channel-serialized with session/load so silent bind cannot overlap live turns.
+    return this.runOnChannel(() => this.promptInner(sessionId, text, options));
+  }
+
+  private async promptInner(sessionId: string, text: string, options: PromptOptions): Promise<void> {
     this.closeUser(sessionId);
     // Fresh turn: drop retry/replace state so a prior interrupted stream cannot
     // hijack the next reply into the old bubble.
@@ -2347,6 +2846,9 @@ export class AcpBridge implements GrokBridge {
     this.cursor(sessionId).planId = undefined;
     this.emit({ type: "status", sessionId, status: "running" });
     try {
+      // Silent-bound sessions skip Computer MCP at load time; attach once when
+      // the operator's prompt explicitly needs desktop control.
+      await this.ensureComputerAttachedForPrompt(sessionId, text);
       const previous = this.sessionOptions.get(sessionId);
       if (!previous || previous.model !== options.model || previous.effort !== options.effort) {
         await this.requestRaw(ACP_METHODS.sessionSetModel, {
@@ -2439,6 +2941,7 @@ export class AcpBridge implements GrokBridge {
     sessionId: string,
     blockId: string,
     option: PermissionOption,
+    feedback?: string,
   ): { duplicate: boolean; message?: string } {
     const priorByBlock = this.resolvedPlanByBlock.get(blockId);
     if (priorByBlock) {
@@ -2480,7 +2983,10 @@ export class AcpBridge implements GrokBridge {
     if (pending.kind === "plan") {
       // Answer the original x.ai/exit_plan_mode request only — never invent a
       // synthetic "[Plan approved]" user prompt that would spawn a second turn.
-      result = { outcome: option === "deny" ? "cancelled" : "approved" };
+      result = {
+        outcome: option === "deny" ? "cancelled" : "approved",
+        ...(option === "deny" && feedback?.trim() ? { feedback: feedback.trim() } : {}),
+      };
     } else {
       const optionId = pending.optionIds[option];
       result = optionId
@@ -2546,15 +3052,123 @@ export class AcpBridge implements GrokBridge {
   async deleteSession(id: string): Promise<void> {
     const meta = this.catalogue.get(id);
     this.cancel(id);
+    const computerLease = this.computerLeases.get(id);
+    // Sticky-stop this lease then revoke process-wide bearer. Fail-closed: still
+    // attempt revoke even if mark fails.
+    if (computerLease) {
+      try {
+        await invoke("computer_emergency_stop", { leaseId: computerLease });
+      } catch {
+        await invoke("computer_revoke_http_auth").catch(() => {});
+      }
+    }
     await this.request(ACP_METHODS.sessionDelete, {
       sessionId: id,
       cwd: meta?.cwd ?? this.workspace,
       kind: "build",
     });
     this.catalogue.delete(id);
+    this.computerLeases.delete(id);
+    this.activeComputerSessions.delete(id);
+    for (const key of this.activeComputerToolCalls) {
+      if (key.startsWith(`${id}:`)) this.activeComputerToolCalls.delete(key);
+    }
     this.knownSessions.delete(id);
     this.cursors.delete(id);
     this.usage.delete(id);
+  }
+
+  async emergencyStopComputer(sessionId: string): Promise<void> {
+    const leaseId = this.computerLeases.get(sessionId);
+    if (leaseId) {
+      await invoke("computer_emergency_stop", { leaseId });
+    }
+    this.cancel(sessionId);
+  }
+
+  /**
+   * Explicit Computer Use intent in the operator prompt (slash, @-mention, or
+   * common CN/EN phrases). Silent loads intentionally skip MCP; attach only
+   * when these fire so offline first-send stays cheap.
+   */
+  private promptRequestsComputer(text: string): boolean {
+    const raw = text.trim();
+    if (!raw) return false;
+    if (/^\/computer(?:\s|$)/i.test(raw)) return true;
+    if (/(^|[\s,，])@computer(?:\b|$)/i.test(raw)) return true;
+    if (/\bcomputer\s*use\b/i.test(raw)) return true;
+    if (/电脑控制|桌面控制|屏幕控制|Computer\s*Use/i.test(raw)) return true;
+    return false;
+  }
+
+  /**
+   * Secondary attach for sessions that were silent/background-bound without
+   * Computer MCP. Re-issues session/load with MCP extensions under the silent
+   * stream filter so offline history is not flooded.
+   */
+  private async ensureComputerAttachedForPrompt(
+    sessionId: string,
+    text: string,
+  ): Promise<void> {
+    if (this.computerLeases.has(sessionId)) return;
+    if (!this.promptRequestsComputer(text)) return;
+    if (!this.knownSessions.has(sessionId)) return;
+    await this.attachComputerMcp(sessionId);
+  }
+
+  private async attachComputerMcp(sessionId: string): Promise<void> {
+    const meta = this.catalogue.get(sessionId);
+    if (!meta) {
+      throw new Error(`找不到会话，无法附加 Computer Use：${sessionId}`);
+    }
+    const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+    if (computer.mcpServers.length === 0 && computer.pluginDirs.length === 0) {
+      // Non-Windows or harness unavailable — leave the turn to run without MCP.
+      return;
+    }
+    const metaRequest = await this.sessionMeta(meta.cwd);
+    this.silentReplaying.add(sessionId);
+    await this.setSilentStream(true);
+    try {
+      try {
+        await this.request(
+          ACP_METHODS.sessionLoad,
+          {
+            sessionId,
+            cwd: meta.cwd,
+            mcpServers: computer.mcpServers,
+            _meta: { ...metaRequest, pluginDirs: computer.pluginDirs },
+          },
+          2 * 60_000,
+        );
+      } catch (error) {
+        const message = errorText(error).toLowerCase();
+        const looksLikeExtensionReject =
+          message.includes("mcp") ||
+          message.includes("plugin") ||
+          message.includes("unknown") ||
+          message.includes("invalid") ||
+          message.includes("unsupported");
+        if (!looksLikeExtensionReject) throw error;
+        // CLI rejected extensions — continue without Computer Use.
+        return;
+      }
+      const previousLease = this.computerLeases.get(sessionId);
+      if (previousLease && previousLease !== computer.leaseId) {
+        await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(
+          () => {},
+        );
+      }
+      this.computerLeases.set(sessionId, computer.leaseId);
+      this.emit({
+        type: "status",
+        sessionId,
+        status: "running",
+      });
+    } finally {
+      this.silentReplaying.delete(sessionId);
+      await this.setSilentStream(this.silentReplaying.size > 0);
+    }
   }
 
   private async refreshSessionInfo(sessionId: string): Promise<void> {

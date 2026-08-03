@@ -240,7 +240,12 @@ export class MockBridge implements GrokBridge {
     this.emit({ type: "session_ready", session });
   }
 
-  async loadSession(id: string): Promise<void> {
+  async loadSession(
+    id: string,
+    options?: { background?: boolean; silent?: boolean },
+  ): Promise<void> {
+    // Silent bind: mark ready without replaying (mirrors ACP silent agent-bind).
+    if (options?.silent) return;
     const s = this.sessions.get(id);
     if (s) this.emit({ type: "session_ready", session: structuredClone(s) });
   }
@@ -409,6 +414,7 @@ export class MockBridge implements GrokBridge {
     sessionId: string,
     blockId: string,
     option: PermissionOption,
+    _feedback?: string,
   ): { duplicate: boolean; message?: string } {
     const prior = this.resolvedPermissions.get(blockId);
     if (prior) {

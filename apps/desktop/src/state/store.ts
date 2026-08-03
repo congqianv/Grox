@@ -5,6 +5,7 @@
 
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { bridge } from "../bridge";
 import { MODELS } from "../bridge/types";
 import type {
@@ -38,6 +39,266 @@ import type {
   RewindResult,
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
+import { loadSessionCache, scheduleSaveSessionCache } from "../lib/sessionCache";
+
+/** Missions whose offline disk history scan finished this process lifetime. */
+const offlineHistoryComplete = new Set<string>();
+/** Missions with an in-flight offline scan (avoid re-invoke restart storms). */
+const offlineHistoryScanning = new Set<string>();
+/**
+ * Sessions with an in-flight sendPrompt IIFE (silent bind + prompt).
+ * Prevents openSession from coercing running→idle mid-bind (double-prompt race).
+ */
+const promptInFlightSessions = new Set<string>();
+/** Monotonic token so superseded openSession awaits do not steal focus. */
+let openSessionGeneration = 0;
+/** Poll timer for offline scan progress (atomics in Rust — no event flood). */
+let offlineScanPollTimer: number | null = null;
+
+function stopOfflineScanPoll(): void {
+  if (offlineScanPollTimer != null) {
+    window.clearInterval(offlineScanPollTimer);
+    offlineScanPollTimer = null;
+  }
+}
+
+/**
+ * Poll Rust atomics for scan progress. Independent of Tauri events so a busy
+ * webview cannot freeze the percent bar.
+ */
+function startOfflineScanPoll(sessionId: string): void {
+  stopOfflineScanPoll();
+  let lastBytes = -1;
+  let stuckTicks = 0;
+  /** Do not arm the stuck-watchdog until the worker has actually read ≥1 byte. */
+  let scanStarted = false;
+  offlineScanPollTimer = window.setInterval(() => {
+    void (async () => {
+      try {
+        const p = await invoke<{
+          id?: string;
+          done?: boolean;
+          phase?: string;
+          percent?: number;
+          bytesRead?: number;
+          totalBytes?: number;
+          lines?: number;
+          blocks?: number;
+        }>("get_offline_scan_progress");
+
+        const state = useDesktop.getState();
+        const active = state.activeId;
+        const loading = state.fullHistoryLoadingId;
+        // Strict id match: never treat another session's atomics as ours.
+        if (p.id && p.id !== "" && p.id !== sessionId) {
+          return;
+        }
+        // Only paint for the session we care about.
+        if (active !== sessionId && loading !== sessionId) {
+          return;
+        }
+
+        const bytes = Number(p.bytesRead) || 0;
+        const total = Number(p.totalBytes) || 0;
+        const done = Boolean(p.done);
+        const phase = p.phase || "idle";
+
+        if (!done) {
+          if (bytes > 0) scanStarted = true;
+          useDesktop.setState({
+            diskHistoryProgress: {
+              id: sessionId,
+              percent: Math.min(99, Math.max(0, Number(p.percent) || 0)),
+              bytesRead: bytes,
+              totalBytes: total,
+              lines: Number(p.lines) || 0,
+              blocks: Number(p.blocks) || 0,
+            },
+            fullHistoryLoadingId: sessionId,
+            historyLoadMode: "disk",
+          });
+          // Preparing (find dir / open file / cache check): bytes stay 0 — never
+          // treat that as a dead worker (was firing "扫描中断" in ~2–5s).
+          if (!scanStarted) {
+            stuckTicks = 0;
+            lastBytes = bytes;
+            return;
+          }
+          if (bytes === lastBytes) {
+            stuckTicks += 1;
+            // ~15s with no byte movement after scan actually started.
+            if (stuckTicks >= 60) {
+              offlineHistoryScanning.delete(sessionId);
+              // Soft-cancel only: do NOT mark complete — next open may retry.
+              stopOfflineScanPoll();
+              void invoke("cancel_offline_session_history").catch(() => {});
+              if (
+                useDesktop.getState().fullHistoryLoadingId === sessionId &&
+                useDesktop.getState().historyLoadMode === "disk"
+              ) {
+                useDesktop.setState({
+                  fullHistoryLoadingId: null,
+                  historyLoadMode: null,
+                  diskHistoryProgress: null,
+                });
+              }
+            }
+          } else {
+            stuckTicks = 0;
+            lastBytes = bytes;
+          }
+          return;
+        }
+
+        // Terminal: session body arrives via disk-history-progress event.
+        offlineHistoryScanning.delete(sessionId);
+        // Only stop the global poll when it still belongs to this session.
+        if (
+          useDesktop.getState().fullHistoryLoadingId === sessionId ||
+          useDesktop.getState().diskHistoryProgress?.id === sessionId
+        ) {
+          stopOfflineScanPoll();
+        }
+        // Strict id match only — empty active id after cancel is not "ours".
+        const progressOwned = Boolean(p.id) && p.id === sessionId;
+        if (
+          progressOwned &&
+          (phase === "complete" || phase === "no-updates" || phase === "missing")
+        ) {
+          offlineHistoryComplete.add(sessionId);
+        }
+        // cancelled/error: drop banner only — allow retry on next open.
+        if (
+          progressOwned &&
+          (phase === "error" ||
+            phase === "cancelled" ||
+            phase === "missing" ||
+            phase === "complete" ||
+            phase === "no-updates")
+        ) {
+          // complete keeps banner until session event; clear if still loading after a beat.
+          if (phase !== "complete" && useDesktop.getState().fullHistoryLoadingId === sessionId) {
+            useDesktop.setState({
+              fullHistoryLoadingId: null,
+              historyLoadMode: null,
+              diskHistoryProgress: null,
+            });
+          }
+        }
+      } catch {
+        /* ignore poll errors while agent/shell restarts */
+      }
+    })();
+  }, 250);
+}
+
+export type HistoryLoadMode = "disk" | "agent" | null;
+
+type DiskHistoryProgress = {
+  id: string;
+  gen?: number;
+  done: boolean;
+  phase?: string;
+  session?: Session | null;
+  error?: string;
+  fromCache?: boolean;
+  /** 0–100 scan progress from Rust offline worker. */
+  percent?: number;
+  bytesRead?: number;
+  totalBytes?: number;
+  lines?: number;
+  blocks?: number;
+};
+
+/** Live offline-scan progress shown in Timeline banner. */
+export type DiskHistoryScanProgress = {
+  id: string;
+  percent: number;
+  bytesRead: number;
+  totalBytes: number;
+  lines: number;
+  blocks: number;
+  fromCache?: boolean;
+};
+
+function normalizeOfflineSession(raw: unknown, fallback?: Session | null): Session | null {
+  if (!raw || typeof raw !== "object") return null;
+  const s = raw as Session;
+  if (typeof s.id !== "string" || !Array.isArray(s.blocks)) return null;
+  const now = Date.now();
+  const blocks = s.blocks.map((block, index) => {
+    const ts =
+      typeof (block as { ts?: number }).ts === "number"
+        ? (block as { ts: number }).ts
+        : now + index;
+    if (block.type === "assistant") {
+      return { ...block, streaming: false, ts };
+    }
+    if (block.type === "thinking") {
+      return { ...block, live: false, ts };
+    }
+    if (block.type === "tool") {
+      const rawStatus = String(block.call?.status ?? "done");
+      const status =
+        rawStatus === "running" ||
+        rawStatus === "pending" ||
+        rawStatus === "in_progress"
+          ? ("done" as const)
+          : rawStatus === "cancelled" || rawStatus === "error" || rawStatus === "awaiting_permission"
+            ? (rawStatus as "cancelled" | "error" | "awaiting_permission")
+            : ("done" as const);
+      return {
+        ...block,
+        ts,
+        call: {
+          ...block.call,
+          status,
+          startedAt:
+            typeof block.call?.startedAt === "number" ? block.call.startedAt : ts,
+          title: block.call?.title || block.call?.rawKind || "tool",
+        },
+      } as SessionBlock;
+    }
+    if (block.type === "plan") {
+      return {
+        ...block,
+        ts,
+        steps: Array.isArray(block.steps) ? block.steps : [],
+      } as SessionBlock;
+    }
+    return { ...block, ts } as SessionBlock;
+  });
+  return {
+    id: s.id,
+    title: s.title || fallback?.title || "Untitled mission",
+    cwd: s.cwd || fallback?.cwd || "",
+    createdAt: s.createdAt || fallback?.createdAt || now,
+    updatedAt: s.updatedAt || fallback?.updatedAt || now,
+    model: s.model || fallback?.model || "grok-4.5",
+    blocks,
+    usage: s.usage ??
+      fallback?.usage ?? {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        costUSD: 0,
+        contextUsed: 0,
+        contextMax: 0,
+        turns: 0,
+      },
+    // Never force-running from a disk snapshot.
+    status:
+      fallback?.status === "running" ||
+      fallback?.status === "awaiting_permission" ||
+      fallback?.status === "awaiting_input"
+        ? fallback.status
+        : "idle",
+    demo: s.demo ?? fallback?.demo,
+    pinned: s.pinned ?? fallback?.pinned,
+    archived: s.archived ?? fallback?.archived,
+    parentId: s.parentId ?? fallback?.parentId,
+  };
+}
 
 export type View = "home" | "session";
 export type InspectorTab = "files" | "tasks" | "preview" | "usage";
@@ -129,6 +390,20 @@ interface DesktopState {
   sessionIndex: SessionMeta[];
   sessions: Record<string, Session>;
   activeId: string | null;
+  /**
+   * Mission id whose history is still loading in the background
+   * (disk preview is already shown). Null when idle.
+   */
+  fullHistoryLoadingId: string | null;
+  /** Why fullHistoryLoadingId is set: offline disk scan vs agent session/load. */
+  historyLoadMode: HistoryLoadMode;
+  /**
+   * Wall-clock ms when silent agent bind started (historyLoadMode === "agent").
+   * Used by Timeline for elapsed "binding…" copy. Null when not agent-binding.
+   */
+  agentBindStartedAt: number | null;
+  /** Real-time offline disk scan progress (null when idle). */
+  diskHistoryProgress: DiskHistoryScanProgress | null;
   account: AccountInfo | null;
   billing: BillingInfo | null;
   provider: ProviderStatus;
@@ -161,6 +436,8 @@ interface DesktopState {
   queueNotice: QueueNotice | null;
 
   inspectorOpen: boolean;
+  /** Bottom terminal panel (aggregates shell tool output). */
+  terminalOpen: boolean;
   inspectorTab: InspectorTab;
   paletteOpen: boolean;
   settingsOpen: boolean;
@@ -228,6 +505,9 @@ interface DesktopState {
   setProjectPreviewUrl(url: string): void;
   openPreview(path: string): Promise<void>;
   closePreview(): void;
+  /** Right-side plan review pane (plan mode / exit_plan_mode approval). */
+  planPreviewOpen: boolean;
+  setPlanPreviewOpen(open: boolean): void;
 
   sendPrompt(text: string, attachments?: PromptAttachment[], sessionId?: string): void;
   /**
@@ -256,7 +536,7 @@ interface DesktopState {
    * When no official checkpoint exists (e.g. mid-turn stop), truncates UI only.
    */
   editUserPrompt(promptIndex: number): Promise<void>;
-  resolvePermission(blockId: string, option: PermissionOption): void;
+  resolvePermission(blockId: string, option: PermissionOption, feedback?: string): void;
   resolveQuestion(blockId: string, response: QuestionResponse): void;
 
   setModel(model: string): void;
@@ -267,6 +547,7 @@ interface DesktopState {
   setComposerAttachments(attachments: PromptAttachment[]): void;
   setInspectorTab(tab: InspectorTab): void;
   toggleInspector(): void;
+  toggleTerminal(): void;
   setPaletteOpen(open: boolean): void;
   setSettingsOpen(open: boolean): void;
   refreshHistory(): Promise<void>;
@@ -627,6 +908,9 @@ function patchTool(
 }
 
 export const useDesktop = create<DesktopState>((set, get) => {
+  // Scheme C: load queue consults the live active mission.
+  bridge.setActiveSessionGetter?.(() => get().activeId);
+
   const applyEvent = (e: BridgeEvent) => {
     const { sessions, sessionIndex } = get();
 
@@ -637,6 +921,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const next = { ...fn(s), updatedAt: Date.now() };
       if (!touchCatalogue) {
         set({ sessions: { ...state.sessions, [sessionId]: next } });
+        if (next.blocks.length > 0) scheduleSaveSessionCache(next);
         return;
       }
       const nextIndex = state.sessionIndex.map((m) =>
@@ -647,6 +932,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         sessions: { ...state.sessions, [sessionId]: next },
         sessionIndex: nextIndex,
       });
+      if (next.blocks.length > 0) scheduleSaveSessionCache(next);
     };
 
     switch (e.type) {
@@ -711,12 +997,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
           decorateSessions([meta])[0],
           ...sessionIndex.filter((m) => m.id !== e.session.id),
         ];
-        // Active session implies the project is in use — restore if previously removed.
-        const projects = ensureProject(get().projects, e.session.cwd, { force: true });
         persistSessionCatalog(nextIndex);
         const state = get();
-        const fallbackModel = state.models.some((item) => item.id === e.session.model)
-          ? e.session.model
+        const isActive = state.activeId === e.session.id;
+        // Prefer the fuller of: existing UI snapshot vs newly loaded payload.
+        // Full ACP load usually has more blocks (tools) than chat_history preview.
+        // Always keep the result in memory even if user left (instant return),
+        // but never steal focus — see isActive below.
+        const existing = sessions[e.session.id];
+        const preferExisting =
+          existing && existing.blocks.length > e.session.blocks.length;
+        const sessionToStore = preferExisting ? existing : e.session;
+        const fallbackModel = state.models.some((item) => item.id === sessionToStore.model)
+          ? sessionToStore.model
           : (state.model || state.models[0]?.id || MODELS[0]?.id || "grok-build");
         const composer = normalizeComposer(state.sessionComposers[e.session.id], {
           model: fallbackModel,
@@ -726,25 +1019,60 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
         const sessionComposers = { ...state.sessionComposers, [e.session.id]: composer };
         persistSessionComposers(sessionComposers);
-        bridge.setPermissionMode(composer.permissionMode);
-        set({
-          sessions: { ...sessions, [e.session.id]: e.session },
-          sessionIndex: nextIndex,
-          projects,
-          workspace: e.session.cwd,
-          activeProjectId: projectId(e.session.cwd),
-          activeId: e.session.id,
-          view: "session",
-          model: composer.model,
-          effort: composer.effort,
-          mode: composer.mode,
-          permissionMode: composer.permissionMode,
-          sessionComposers,
-        });
+
+        // Agent session/load finished → clear agent banner only (disk mode is separate).
+        const clearAgentBanner =
+          state.fullHistoryLoadingId === e.session.id && state.historyLoadMode === "agent";
+
+        // Background full-load must NOT steal focus if the user already switched away.
+        if (isActive) {
+          const projects = ensureProject(get().projects, e.session.cwd, { force: true });
+          bridge.setPermissionMode(composer.permissionMode);
+          set({
+            sessions: { ...sessions, [e.session.id]: sessionToStore },
+            sessionIndex: nextIndex,
+            projects,
+            workspace: e.session.cwd,
+            activeProjectId: projectId(e.session.cwd),
+            activeId: e.session.id,
+            view: "session",
+            model: composer.model,
+            effort: composer.effort,
+            mode: composer.mode,
+            permissionMode: composer.permissionMode,
+            sessionComposers,
+            ...(clearAgentBanner
+              ? {
+                  fullHistoryLoadingId: null,
+                  historyLoadMode: null,
+                  agentBindStartedAt: null,
+                }
+              : {}),
+          });
+        } else {
+          set({
+            sessions: { ...sessions, [e.session.id]: sessionToStore },
+            sessionIndex: nextIndex,
+            sessionComposers,
+            ...(clearAgentBanner
+              ? {
+                  fullHistoryLoadingId: null,
+                  historyLoadMode: null,
+                  agentBindStartedAt: null,
+                }
+              : {}),
+          });
+        }
+        if (sessionToStore.blocks.length > 0) {
+          scheduleSaveSessionCache(sessionToStore);
+        }
         break;
       }
       case "block_add":
         withSession(e.sessionId, (s) => ({ ...s, blocks: [...s.blocks, e.block] }));
+        if (e.block.type === "plan" && get().activeId === e.sessionId) {
+          set({ planPreviewOpen: true, previewOpen: false });
+        }
         break;
       case "block_patch":
         withSession(e.sessionId, (s) => ({
@@ -768,14 +1096,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
         break;
       case "assistant_append":
       case "thinking_append":
-        withSession(e.sessionId, (s) => ({
-          ...s,
-          blocks: s.blocks.map((b) =>
-            b.id === e.blockId && (b.type === "assistant" || b.type === "thinking")
-              ? { ...b, text: b.text + e.delta }
-              : b,
-          ),
-        }), false);
+        withSession(e.sessionId, (s) => {
+          // Structural patch: keep prior block refs so MemoTurnGroup can skip history.
+          const index = s.blocks.findIndex((b) => b.id === e.blockId);
+          if (index < 0) return s;
+          const block = s.blocks[index];
+          if (block.type !== "assistant" && block.type !== "thinking") return s;
+          const next = s.blocks.slice();
+          next[index] = { ...block, text: block.text + e.delta };
+          return { ...s, blocks: next };
+        }, false);
         break;
       case "permission_request":
         withSession(e.sessionId, (s) => ({
@@ -786,6 +1116,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
             { type: "permission", id: e.blockId, req: e.req, ts: Date.now() },
           ],
         }));
+        if (
+          (e.req.purpose === "plan" || e.blockId.startsWith("plan-approval-")) &&
+          get().activeId === e.sessionId
+        ) {
+          set({ planPreviewOpen: true, previewOpen: false });
+        }
         break;
       case "permission_resolved":
         withSession(e.sessionId, (s) => ({
@@ -919,6 +1255,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
     sessionIndex: [],
     sessions: {},
     activeId: null,
+    fullHistoryLoadingId: null,
+    historyLoadMode: null,
+    agentBindStartedAt: null,
+    diskHistoryProgress: null,
     account: null,
     billing: null,
     provider: { kind: "oauth", hasApiKey: false },
@@ -938,6 +1278,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     previewFile: null,
     previewLoading: false,
     previewError: null,
+    planPreviewOpen: false,
 
     model: localStorage.getItem("grok.model") ?? "grok-build",
     models: MODELS,
@@ -955,6 +1296,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     queueNotice: null,
 
     inspectorOpen: true,
+    terminalOpen: false,
     inspectorTab: "files",
     paletteOpen: false,
     settingsOpen: false,
@@ -976,6 +1318,67 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (bridgeSubscribed) return;
       bridgeSubscribed = true;
       bridge.subscribe(applyEvent);
+      // Offline full-history worker (Rust thread) → progressive UI upgrade.
+      // Never goes through ACP session/load, so switching stays responsive.
+      if (bridge.kind === "acp") {
+        // Terminal session only (progress is polled — see startOfflineScanPoll).
+        void listen<DiskHistoryProgress>("disk-history-progress", (event) => {
+          const payload = event.payload;
+          if (!payload?.id || !payload.done) return;
+
+          // Always free the scanning slot for this id (including cancelled abandon).
+          offlineHistoryScanning.delete(payload.id);
+
+          const loadingId = get().fullHistoryLoadingId;
+          const progressId = get().diskHistoryProgress?.id ?? null;
+          // Never stop the poll for an unrelated session's terminal event.
+          if (loadingId === payload.id || progressId === payload.id) {
+            stopOfflineScanPoll();
+          } else if (loadingId && loadingId !== payload.id && offlineHistoryScanning.has(loadingId)) {
+            // Keep progress alive for the session that is still scanning.
+            startOfflineScanPoll(loadingId);
+          }
+
+          // cancelled/error are retryable — do not permanent-complete.
+          if (
+            payload.phase === "complete" ||
+            payload.phase === "no-updates" ||
+            payload.phase === "missing"
+          ) {
+            offlineHistoryComplete.add(payload.id);
+          }
+
+          const existing = get().sessions[payload.id];
+          const liveBusy =
+            existing &&
+            (existing.status === "running" ||
+              existing.status === "awaiting_permission" ||
+              existing.status === "awaiting_input");
+          if (!liveBusy && payload.session) {
+            const next = normalizeOfflineSession(payload.session, existing);
+            if (next) {
+              window.setTimeout(() => {
+                set({
+                  sessions: { ...get().sessions, [payload.id]: next },
+                });
+                if (next.blocks.length > 0) scheduleSaveSessionCache(next);
+              }, 0);
+            }
+          }
+
+          if (get().fullHistoryLoadingId === payload.id && get().historyLoadMode === "disk") {
+            set({
+              fullHistoryLoadingId: null,
+              historyLoadMode: null,
+              diskHistoryProgress: null,
+            });
+          } else if (get().diskHistoryProgress?.id === payload.id) {
+            set({ diskHistoryProgress: null });
+          }
+        }).catch((error) => {
+          console.warn("disk-history-progress listen failed", error);
+        });
+      }
       try {
         const runtime = bridge.kind === "acp"
           ? await invoke<GrokRuntimeInfo>("grok_runtime_info")
@@ -1053,7 +1456,32 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
     },
 
-    goHome: () => set({ view: "home", activeId: null }),
+    goHome: () => {
+      if (bridge.kind === "acp") {
+        void invoke("cancel_offline_session_history").catch(() => {});
+      }
+      stopOfflineScanPoll();
+      offlineHistoryScanning.clear();
+      if (get().historyLoadMode === "agent") {
+        // Keep agent-bind chrome if first-send is mid-flight; drop disk banner only.
+        set({
+          view: "home",
+          activeId: null,
+          planPreviewOpen: false,
+          diskHistoryProgress: null,
+        });
+      } else {
+        set({
+          view: "home",
+          activeId: null,
+          planPreviewOpen: false,
+          fullHistoryLoadingId: null,
+          historyLoadMode: null,
+          agentBindStartedAt: null,
+          diskHistoryProgress: null,
+        });
+      }
+    },
 
     async checkAppUpdate(opts) {
       if (bridge.kind !== "acp") return null;
@@ -1200,37 +1628,60 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async openSession(id) {
+      // STABLE + COMPLETE HISTORY:
+      // - Opening NEVER calls ACP session/load (that freezes on 100MB+ updates.jsonl).
+      // - Instant paint from memory / chat_history / UI cache.
+      // - Background Rust thread streams updates.jsonl (skips thoughts, cancelable).
+      // - Agent bind still happens only on first send (model context).
       try {
-        // Fast path: already loaded and in the same workspace — switch UI only.
         const current = get();
         if (current.activeId === id && current.sessions[id] && current.view === "session") {
+          // Still upgrade offline history if we never finished — but never restart
+          // an in-flight scan (that killed the worker and froze the progress bar).
+          if (
+            bridge.kind === "acp" &&
+            !offlineHistoryComplete.has(id) &&
+            !offlineHistoryScanning.has(id) &&
+            current.historyLoadMode !== "disk" &&
+            current.historyLoadMode !== "agent" &&
+            !promptInFlightSessions.has(id)
+          ) {
+            offlineHistoryScanning.add(id);
+            set({ fullHistoryLoadingId: id, historyLoadMode: "disk" });
+            startOfflineScanPoll(id);
+            void invoke("start_offline_session_history", {
+              id,
+              title: current.sessions[id]?.title ?? null,
+              cwd: current.sessions[id]?.cwd ?? null,
+              model: current.sessions[id]?.model ?? null,
+            }).catch((error) => {
+              console.warn("start_offline_session_history failed", error);
+              offlineHistoryScanning.delete(id);
+              if (get().fullHistoryLoadingId === id && get().historyLoadMode === "disk") {
+                set({ fullHistoryLoadingId: null, historyLoadMode: null, diskHistoryProgress: null });
+              }
+            });
+          } else if (offlineHistoryScanning.has(id) || current.historyLoadMode === "disk") {
+            set({ fullHistoryLoadingId: id, historyLoadMode: "disk" });
+            startOfflineScanPoll(id);
+          }
           return;
         }
 
-        const meta = current.sessionIndex.find((entry) => entry.id === id);
-        // Cross-project switch: update workspace without the heavy setWorkspace
-        // home-reset / full file tree refresh that makes session switching feel laggy.
-        if (meta && !samePath(meta.cwd, current.workspace)) {
-          await bridge.setWorkspace(meta.cwd);
-          const workspace = await bridge.getWorkspace();
-          // Opening a session in this folder is intentional — restore if hidden.
-          const projects = ensureProject(get().projects, workspace, { force: true });
-          set({
-            workspace,
-            projects,
-            activeProjectId: projectId(workspace),
-            workspaceDiffs: [],
-            workspaceDiffReady: false,
-            projectPreview: { status: "idle" },
-            previewOpen: false,
-            previewFile: null,
-          });
-          // Defer inspector file work so the transcript paints first.
-          window.setTimeout(() => {
-            void get().refreshWorkspaceFiles();
-            void get().refreshWorkspaceDiffs();
-          }, 0);
+        // Switching missions: free previous scanning slot. Do NOT call
+        // cancel_offline here — it races with start_offline and can mark the
+        // new gen cancelled. start_offline already bumps OFFLINE_HISTORY_GEN.
+        const prevId = current.activeId;
+        if (bridge.kind === "acp" && prevId && prevId !== id) {
+          offlineHistoryScanning.delete(prevId);
+          stopOfflineScanPoll();
         }
+
+        const openGen = ++openSessionGeneration;
+        const stillThisOpen = () => openGen === openSessionGeneration;
+
+        const meta = current.sessionIndex.find((entry) => entry.id === id);
+        if (meta) bridge.rememberSessionMeta?.(meta);
 
         const state = get();
         const has = state.sessions[id];
@@ -1242,24 +1693,207 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
         const sessionComposers = { ...state.sessionComposers, [id]: composer };
         persistSessionComposers(sessionComposers);
-        bridge.setPermissionMode(composer.permissionMode);
-        // Paint session chrome immediately; load transcript after.
-        set({
-          activeId: id,
-          view: "session",
-          model: composer.model,
-          effort: composer.effort,
-          mode: composer.mode,
-          permissionMode: composer.permissionMode,
-          sessionComposers,
-          startupError: null,
-        });
-        if (!has) await bridge.loadSession(id);
+
+        const kickOfflineHistory = (session?: Session | null) => {
+          if (!stillThisOpen()) return;
+          if (bridge.kind !== "acp") return;
+          if (offlineHistoryComplete.has(id)) return;
+          // Already scanning this id — join poll, do not re-invoke.
+          if (offlineHistoryScanning.has(id)) {
+            set({ fullHistoryLoadingId: id, historyLoadMode: "disk" });
+            startOfflineScanPoll(id);
+            return;
+          }
+          offlineHistoryScanning.add(id);
+          set({
+            fullHistoryLoadingId: id,
+            historyLoadMode: "disk",
+            diskHistoryProgress: {
+              id,
+              percent: 0,
+              bytesRead: 0,
+              totalBytes: 0,
+              lines: 0,
+              blocks: 0,
+            },
+          });
+          startOfflineScanPoll(id);
+          void invoke("start_offline_session_history", {
+            id,
+            title: session?.title ?? meta?.title ?? null,
+            cwd: session?.cwd ?? meta?.cwd ?? null,
+            model: session?.model ?? meta?.model ?? null,
+          }).catch((error) => {
+            console.warn("start_offline_session_history failed", error);
+            offlineHistoryScanning.delete(id);
+            stopOfflineScanPoll();
+            if (get().fullHistoryLoadingId === id && get().historyLoadMode === "disk") {
+              set({ fullHistoryLoadingId: null, historyLoadMode: null, diskHistoryProgress: null });
+            }
+          });
+        };
+
+        const applyChrome = (session?: Session | null, opts?: { loadingDisk?: boolean }) => {
+          if (!stillThisOpen()) return;
+          const crossProject = meta && !samePath(meta.cwd, get().workspace);
+          const projects =
+            meta && crossProject
+              ? ensureProject(get().projects, meta.cwd, { force: true })
+              : get().projects;
+          let painted = session ?? null;
+          // Do not force idle while a send/bind is in flight (double-prompt race).
+          if (
+            painted &&
+            !bridge.isSessionBound?.(painted.id) &&
+            painted.status === "running" &&
+            !promptInFlightSessions.has(painted.id)
+          ) {
+            painted = { ...painted, status: "idle" };
+          }
+          const loadingDisk = Boolean(opts?.loadingDisk) && !offlineHistoryComplete.has(id);
+          // Preserve in-flight agent bind chrome for another session.
+          const keepAgent =
+            get().historyLoadMode === "agent" &&
+            get().fullHistoryLoadingId != null &&
+            get().fullHistoryLoadingId !== id;
+          set({
+            activeId: id,
+            view: "session",
+            model: composer.model,
+            effort: composer.effort,
+            mode: composer.mode,
+            permissionMode: composer.permissionMode,
+            sessionComposers,
+            startupError: null,
+            queueNotice: keepAgent ? get().queueNotice : null,
+            fullHistoryLoadingId: loadingDisk
+              ? id
+              : keepAgent
+                ? get().fullHistoryLoadingId
+                : null,
+            historyLoadMode: loadingDisk
+              ? "disk"
+              : keepAgent
+                ? "agent"
+                : null,
+            ...(painted ? { sessions: { ...get().sessions, [id]: painted } } : {}),
+            ...(meta && crossProject
+              ? {
+                  workspace: meta.cwd,
+                  projects,
+                  activeProjectId: projectId(meta.cwd),
+                  workspaceDiffs: [],
+                  workspaceDiffReady: false,
+                  projectPreview: { status: "idle" as const },
+                  previewOpen: false,
+                  previewFile: null,
+                  planPreviewOpen: false,
+                }
+              : meta
+                ? { activeProjectId: projectId(meta.cwd) }
+                : {}),
+          });
+          try {
+            bridge.setPermissionMode(composer.permissionMode);
+          } catch {
+            /* ignore */
+          }
+          if (meta && crossProject) {
+            window.setTimeout(() => {
+              if (get().activeId !== id) return;
+              void bridge.setWorkspace(meta.cwd).catch(() => {});
+              void get().refreshWorkspaceFiles();
+              void get().refreshWorkspaceDiffs();
+            }, 0);
+          }
+        };
+
+        // 1) Memory hit (may already be full if offline scan or send finished earlier)
+        if (has) {
+          applyChrome(has, { loadingDisk: !offlineHistoryComplete.has(id) });
+          kickOfflineHistory(has);
+          return;
+        }
+
+        // 2) Durable offline transcript (fingerprint-matched) — skip 100MB+ rescan
+        if (bridge.kind === "acp") {
+          try {
+            const raw = await invoke<string | null>("get_ui_transcript", { id });
+            if (!stillThisOpen()) return;
+            if (raw) {
+              const transcript = normalizeOfflineSession(JSON.parse(raw) as Session);
+              if (transcript && transcript.id === id && transcript.blocks.length > 0) {
+                offlineHistoryComplete.add(id);
+                applyChrome(transcript, { loadingDisk: false });
+                scheduleSaveSessionCache(transcript);
+                return;
+              }
+            }
+          } catch (error) {
+            console.warn("get_ui_transcript failed", error);
+          }
+        }
+        if (!stillThisOpen()) return;
+
+        // 3) Disk chat_history.jsonl — real conversation text, ~instant
+        try {
+          const raw = await invoke<string | null>("preview_session_from_disk", {
+            id,
+            title: meta?.title ?? null,
+            cwd: meta?.cwd ?? null,
+            model: meta?.model ?? null,
+          });
+          if (!stillThisOpen()) return;
+          if (raw) {
+            const preview = normalizeOfflineSession(JSON.parse(raw) as Session);
+            if (preview && preview.id === id && preview.blocks.length > 0) {
+              applyChrome(preview, { loadingDisk: true });
+              kickOfflineHistory(preview);
+              return;
+            }
+          }
+        } catch (error) {
+          console.warn("preview_session_from_disk failed", error);
+        }
+        if (!stillThisOpen()) return;
+
+        // 4) App UI cache (thin live-stream snapshot)
+        const cached = await loadSessionCache(id);
+        if (!stillThisOpen()) return;
+        if (cached) {
+          applyChrome(cached, { loadingDisk: !offlineHistoryComplete.has(id) });
+          kickOfflineHistory(cached);
+          return;
+        }
+
+        // 5) Empty shell — brand-new mission; still try offline (may only have updates)
+        const shell = meta
+          ? {
+              ...meta,
+              blocks: [] as SessionBlock[],
+              usage: {
+                inputTokens: 0,
+                outputTokens: 0,
+                cacheReadTokens: 0,
+                costUSD: 0,
+                contextUsed: 0,
+                contextMax: 0,
+                turns: 0,
+              },
+              status: "idle" as const,
+            }
+          : null;
+        applyChrome(shell, { loadingDisk: true });
+        kickOfflineHistory(shell);
       } catch (error) {
         set({
           startupError: error instanceof Error ? error.message : String(error),
           view: "home",
           activeId: null,
+          fullHistoryLoadingId: null,
+          historyLoadMode: null,
+          agentBindStartedAt: null,
+          diskHistoryProgress: null,
         });
       }
     },
@@ -1410,6 +2044,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         projectPreview: { status: "idle" },
         previewOpen: false,
         previewFile: null,
+        planPreviewOpen: false,
       });
       void get().refreshWorkspaceFiles();
       void get().refreshWorkspaceDiffs();
@@ -1478,7 +2113,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await bridge.configureProvider(config);
         await get().refreshProviderProfiles();
         await Promise.all([get().refreshAccount(), get().refreshModels()]);
-        if (activeId) await bridge.loadSession(activeId);
+        if (activeId) {
+          await bridge.loadSession(activeId, { background: true, silent: true });
+        }
         set({ providerSwitching: false, startupError: null });
       } catch (error) {
         if (!wasComplete) localStorage.removeItem("grox.accountSetupComplete");
@@ -1515,7 +2152,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await bridge.activateProviderProfile(profile.id);
         await get().refreshProviderProfiles();
         await Promise.all([get().refreshAccount(), get().refreshModels()]);
-        if (activeId) await bridge.loadSession(activeId);
+        if (activeId) {
+          await bridge.loadSession(activeId, { background: true, silent: true });
+        }
         set({ providerSwitching: false, startupError: null });
       } catch (error) {
         set({
@@ -1542,7 +2181,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await bridge.activateProviderProfile(id);
         await get().refreshProviderProfiles();
         await Promise.all([get().refreshAccount(), get().refreshModels()]);
-        if (activeId) await bridge.loadSession(activeId);
+        if (activeId) {
+          await bridge.loadSession(activeId, { background: true, silent: true });
+        }
         set({ providerSwitching: false, startupError: null });
       } catch (error) {
         set({ providerSwitching: false });
@@ -1573,7 +2214,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (wasActive) {
         try {
           await Promise.all([get().refreshAccount(), get().refreshModels()]);
-          if (activeId) await bridge.loadSession(activeId);
+          if (activeId) {
+            await bridge.loadSession(activeId, { background: true, silent: true });
+          }
         } catch (error) {
           set({
             startupError:
@@ -1678,11 +2321,49 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     setProjectPreviewUrl(url) {
-      set({ projectPreview: { ...get().projectPreview, status: "ready", url } });
+      // Project preview iframe only loads loopback — blocks arbitrary https phishing.
+      try {
+        const parsed = new URL(url);
+        if (!/^https?:$/.test(parsed.protocol)) {
+          throw new Error("preview protocol");
+        }
+        const host = parsed.hostname.toLowerCase();
+        const loopback =
+          host === "localhost" ||
+          host === "127.0.0.1" ||
+          host === "[::1]" ||
+          host === "::1";
+        if (!loopback) {
+          set({
+            projectPreview: {
+              ...get().projectPreview,
+              status: "error",
+              error: "项目预览仅允许 localhost / 127.0.0.1",
+              url: undefined,
+            },
+          });
+          return;
+        }
+        set({ projectPreview: { ...get().projectPreview, status: "ready", url: parsed.toString() } });
+      } catch {
+        set({
+          projectPreview: {
+            ...get().projectPreview,
+            status: "error",
+            error: "无效的预览地址",
+            url: undefined,
+          },
+        });
+      }
     },
 
     async openPreview(path) {
-      set({ previewOpen: true, previewLoading: true, previewError: null });
+      set({
+        previewOpen: true,
+        planPreviewOpen: false,
+        previewLoading: true,
+        previewError: null,
+      });
       try {
         const previewFile = await invoke<PreviewFile>("read_preview_file", {
           cwd: get().workspace,
@@ -1905,12 +2586,79 @@ export const useDesktop = create<DesktopState>((set, get) => {
       });
 
       bridge.setPermissionMode(composer.permissionMode);
-      void bridge.prompt(session.id, trimmed, {
-        model: composer.model,
-        effort: composer.effort,
-        mode: composer.mode,
-        attachments,
-      });
+      // Bind agent only when the user actually continues the chat (first send).
+      // Opening/switching never does session/load — that was the freeze source.
+      promptInFlightSessions.add(session.id);
+      void (async () => {
+        const clearAgentBannerIfOurs = () => {
+          const s = get();
+          if (s.fullHistoryLoadingId === session.id && s.historyLoadMode === "agent") {
+            set({
+              fullHistoryLoadingId: null,
+              historyLoadMode: null,
+              agentBindStartedAt: null,
+              queueNotice: null,
+            });
+          }
+        };
+        try {
+          if (!bridge.isSessionBound?.(session.id)) {
+            set({
+              fullHistoryLoadingId: session.id,
+              historyLoadMode: "agent",
+              agentBindStartedAt: Date.now(),
+              queueNotice: {
+                id: uid(),
+                message:
+                  "首次发送：正在静默绑定 Agent 上下文（不回放历史到界面，界面应可操作）…",
+                state: "blocked",
+                at: Date.now(),
+              },
+            });
+            // silent: drop ACP stream replay — UI already has offline history.
+            // Without silent, session/load floods the shell and freezes on send.
+            await bridge.loadSession(session.id, { background: true, silent: true });
+            // Only clear if this session still owns the agent banner (not B's disk scan).
+            clearAgentBannerIfOurs();
+          }
+          // Always prompt the mission that initiated the send — switching the UI
+          // mid-bind must not orphan the already-painted user message.
+          await bridge.prompt(session.id, trimmed, {
+            model: composer.model,
+            effort: composer.effort,
+            mode: composer.mode,
+            attachments,
+          });
+        } catch (error) {
+          const s = get();
+          const clearAgent =
+            s.fullHistoryLoadingId === session.id && s.historyLoadMode === "agent";
+          set({
+            ...(clearAgent
+              ? {
+                  fullHistoryLoadingId: null,
+                  historyLoadMode: null,
+                  agentBindStartedAt: null,
+                }
+              : {}),
+            queueNotice: {
+              id: uid(),
+              message: error instanceof Error ? error.message : String(error),
+              state: "blocked",
+              at: Date.now(),
+            },
+            sessions: {
+              ...get().sessions,
+              [session.id]: {
+                ...(get().sessions[session.id] ?? session),
+                status: "idle",
+              },
+            },
+          });
+        } finally {
+          promptInFlightSessions.delete(session.id);
+        }
+      })();
     },
 
     async interjectPrompt(text, attachments = [], sessionId) {
@@ -2188,7 +2936,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (!result.success) {
         throw new Error(result.error || `回退存在 ${result.conflicts.length} 个文件冲突`);
       }
-      await bridge.loadSession(activeId);
+      await bridge.loadSession(activeId, { background: true, silent: true });
       if (mode !== "files_only") get().setDraft(result.prompt_text ?? point.prompt_preview ?? "");
       return result;
     },
@@ -2285,7 +3033,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }, 50);
     },
 
-    resolvePermission(blockId, option) {
+    resolvePermission(blockId, option, feedback) {
       const { activeId, sessions } = get();
       if (!activeId) return;
       const session = sessions[activeId];
@@ -2301,7 +3049,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
         return;
       }
-      const result = bridge.respondPermission(activeId, blockId, option);
+      const result = bridge.respondPermission(activeId, blockId, option, feedback);
       if (result.duplicate) {
         set({
           queueNotice: {
@@ -2313,13 +3061,22 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
         return;
       }
-      if (blockId.startsWith("plan-approval-")) {
+      const isPlan =
+        block?.type === "permission" &&
+        (block.req.purpose === "plan" || blockId.startsWith("plan-approval-"));
+      // Close the plan pane on approve, or on deny without revision notes.
+      if (isPlan && (option !== "deny" || !feedback?.trim())) {
+        set({ planPreviewOpen: false });
+      }
+      if (blockId.startsWith("plan-approval-") || isPlan) {
         set({
           queueNotice: {
             id: uid(),
             message:
               option === "deny"
-                ? "计划已拒绝，原回合将继续规划"
+                ? feedback?.trim()
+                  ? "已发送计划修改要求，原回合将继续规划"
+                  : "计划已拒绝，原回合将继续规划"
                 : "计划已批准，原回合将继续执行（未额外发送消息）",
             state: "queued",
             at: Date.now(),
@@ -2388,6 +3145,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
     setInspectorTab: (inspectorTab) => set({ inspectorTab, inspectorOpen: true }),
     toggleInspector: () => set((s) => ({ inspectorOpen: !s.inspectorOpen })),
+    toggleTerminal: () => set((s) => ({ terminalOpen: !s.terminalOpen })),
+    setPlanPreviewOpen: (planPreviewOpen) =>
+      set({ planPreviewOpen, ...(planPreviewOpen ? { previewOpen: false } : {}) }),
     setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
     setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
     async refreshHistory() {

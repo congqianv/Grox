@@ -80,8 +80,33 @@ export interface GrokBridge {
   /** ACP: session/new — emits session_ready. */
   newSession(cwd: string): Promise<void>;
 
-  /** ACP: session/load — emits session_ready with the restored transcript. */
-  loadSession(id: string): Promise<void>;
+  /**
+   * ACP: session/load — binds the session in the agent process.
+   * - `background: true` keeps current UI (disk history) until load finishes.
+   * - `silent: true` (with background) only binds agent context: drops stream
+   *   replay for UI. Required for first-send on huge sessions without freeze.
+   */
+  loadSession(id: string, options?: { background?: boolean; silent?: boolean }): Promise<void>;
+
+  /**
+   * Seed the ACP session catalogue so the next loadSession can skip a full
+   * session-list round-trip. Optional on mock bridges.
+   */
+  rememberSessionMeta?(meta: SessionMeta): void;
+
+  /** True once ACP session/load (or new) has bound this id in the agent process. */
+  isSessionBound?(id: string): boolean;
+
+  /**
+   * Visit memory + priority queue:
+   * - Active mission first; then other visited unbound missions (oldest first).
+   * - Switch to C abandons not-yet-started secondary loads (e.g. A).
+   * - In-flight ACP load cannot be cancelled mid-flight.
+   */
+  enqueueBackgroundLoad?(id: string): void;
+
+  /** So the load queue can prefer the live active mission. */
+  setActiveSessionGetter?(getter: () => string | null): void;
 
   /** ACP: session/prompt — streams events until the turn settles. */
   prompt(sessionId: string, text: string, opts: PromptOptions): Promise<void>;
@@ -135,6 +160,7 @@ export interface GrokBridge {
     sessionId: string,
     blockId: string,
     option: PermissionOption,
+    feedback?: string,
   ): { duplicate: boolean; message?: string };
 
   /** Resolve a structured x.ai/ask_user_question interaction. */
@@ -142,4 +168,7 @@ export interface GrokBridge {
 
   renameSession(id: string, title: string): Promise<void>;
   deleteSession(id: string): Promise<void>;
+
+  /** Ctrl+Alt+Esc emergency stop for Windows Computer Use harness. */
+  emergencyStopComputer?(sessionId: string): Promise<void>;
 }

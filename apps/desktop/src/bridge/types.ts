@@ -33,6 +33,7 @@ export type ToolKind =
   | "video_gen"
   | "image_to_video"
   | "reference_to_video"
+  | "computer"
   | "deploy_app"
   | "search_tool"
   | "use_tool"
@@ -107,6 +108,8 @@ export interface PermissionRequest {
   description: string;
   payload?: string;
   options: PermissionOption[];
+  /** Distinguishes the plan review surface from ordinary tool approval. */
+  purpose?: "tool" | "plan";
 }
 
 export interface QuestionOption {

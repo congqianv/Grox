@@ -281,6 +281,58 @@ html[data-reduce-motion="1"] * {
   }
 }
 
+
+
+.summary-row {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 10px;
+  border-radius: 5px;
+  padding: 0 8px;
+  color: var(--color-fg2);
+  font-size: calc(11px + var(--grox-font-increase, 0px));
+}
+button.summary-row:hover {
+  background: var(--color-high);
+  color: var(--color-fg);
+}
+.summary-action {
+  height: 26px;
+  border: 1px solid var(--color-line2);
+  border-radius: 4px;
+  padding: 0 9px;
+  color: var(--color-fg2);
+  font-size: calc(9.5px + var(--grox-font-increase, 0px));
+}
+.summary-action:hover:not(:disabled) {
+  border-color: var(--color-line3);
+  background: var(--color-high);
+  color: var(--color-fg);
+}
+.summary-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+@keyframes planSpin {
+  to { transform: rotate(360deg); }
+}
+
+.plan-spinner {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+  border: 1.5px solid color-mix(in srgb, var(--color-acc) 24%, transparent);
+  border-top-color: var(--color-acc);
+  border-radius: 999px;
+  animation: planSpin 0.75s linear infinite;
+}
+
+html[data-reduce-motion="1"] .plan-spinner {
+  animation-duration: 2s;
+}
+
 @layer base {
   * {
     border-color: var(--color-line);
@@ -963,5 +1015,157 @@ html[data-reduce-motion="1"] * {
   }
   .process-sequence .assistant-prose {
     color: var(--color-mute);
+  }
+
+  /* ── Request rail (upstream dandandujie/Grox): quick jump between turns ── */
+  .request-rail {
+    position: absolute;
+    z-index: 20;
+    top: 18px;
+    bottom: 18px;
+    left: 0;
+    width: 54px;
+    touch-action: none;
+  }
+  .request-rail__spine {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 20px;
+    width: 1px;
+    background: linear-gradient(
+      to bottom,
+      transparent,
+      var(--color-line3) 8%,
+      var(--color-line3) 92%,
+      transparent
+    );
+    opacity: 0.9;
+  }
+  .request-rail__marker {
+    position: absolute;
+    left: 10px;
+    z-index: 1;
+    display: block;
+    width: calc(11px + var(--request-rail-wave, 0) * 13px + var(--request-rail-hovered, 0) * 9px);
+    height: 17px;
+    padding: 0;
+    transform: translateY(-50%);
+    cursor: pointer;
+    outline: none;
+    will-change: width;
+    transition: width 90ms linear;
+  }
+  .request-rail__marker::before {
+    position: absolute;
+    inset: 0 -7px;
+    content: "";
+  }
+  .request-rail__marker:focus-visible .request-rail__bar {
+    outline: 1px solid var(--color-acc);
+    outline-offset: 3px;
+  }
+  .request-rail__bar {
+    position: absolute;
+    top: 50%;
+    right: 0;
+    left: 0;
+    height: 2.5px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--color-mute) 84%, var(--color-fg));
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-void) 42%, transparent);
+    opacity: calc(0.84 + var(--request-rail-wave, 0) * 0.16);
+    transform: translateY(-50%);
+    transition:
+      height 90ms linear,
+      background-color 120ms ease,
+      box-shadow 120ms ease,
+      opacity 90ms linear;
+  }
+  .request-rail__marker.is-hovered {
+    z-index: 3;
+  }
+  .request-rail__marker.is-hovered .request-rail__bar {
+    height: 3px;
+    background: var(--color-acc);
+    box-shadow: 0 0 13px var(--color-glow);
+    opacity: 1;
+  }
+  .request-rail__tooltip {
+    position: absolute;
+    top: 50%;
+    left: 43px;
+    display: grid;
+    width: min(350px, calc(100vw - 150px));
+    gap: 4px;
+    padding: 12px 14px;
+    border: 1px solid color-mix(in srgb, var(--color-line3) 82%, var(--color-acc));
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--color-raise) 94%, transparent);
+    box-shadow:
+      0 15px 40px rgba(0, 0, 0, 0.34),
+      0 0 0 1px color-mix(in srgb, var(--color-void) 30%, transparent);
+    color: var(--color-fg2);
+    pointer-events: none;
+    text-align: left;
+    transform: translateY(-50%);
+    animation: requestRailTooltip 140ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  .request-rail__tooltip-label {
+    color: var(--color-acc-dim, var(--color-acc));
+    font-family: var(--font-mono);
+    font-size: calc(8.5px + var(--grox-font-increase, 0px));
+    letter-spacing: 0.12em;
+  }
+  .request-rail__tooltip-prompt,
+  .request-rail__tooltip-response {
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    color: var(--color-fg);
+    font-size: calc(11px + var(--grox-font-increase, 0px));
+    line-height: 1.45;
+    -webkit-line-clamp: 2;
+  }
+  .request-rail__tooltip-prompt::before {
+    content: "→ ";
+    color: var(--color-acc);
+  }
+  .request-rail__tooltip-response {
+    margin-top: 2px;
+    color: var(--color-dim);
+    font-size: calc(10px + var(--grox-font-increase, 0px));
+    -webkit-line-clamp: 3;
+  }
+  .request-rail__tooltip-response::before {
+    content: "GROK · ";
+    color: var(--color-faint);
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+    letter-spacing: 0.07em;
+  }
+  @media (max-width: 760px) {
+    .request-rail {
+      display: none;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .request-rail__marker,
+    .request-rail__bar,
+    .request-rail__tooltip {
+      transition-duration: 0.01ms;
+      animation: none;
+    }
+  }
+}
+
+@keyframes requestRailTooltip {
+  from {
+    opacity: 0;
+    transform: translate(-5px, -50%);
+  }
+  to {
+    opacity: 1;
+    transform: translate(0, -50%);
   }
 }

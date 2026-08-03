@@ -1,5 +1,7 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import type { Session, SessionBlock } from "../../bridge/types";
+import { useDesktop } from "../../state/store";
 import { useI18n } from "../../lib/i18n";
 import { Icon } from "../fx/Icon";
 import { BlackHole } from "../fx/BlackHole";
@@ -9,11 +11,145 @@ import { ToolCallCard } from "./ToolCallCard";
 import { PlanCard } from "./PlanCard";
 import { PermissionCard } from "./PermissionCard";
 import { QuestionCard } from "./QuestionCard";
+import { TurnChangeCard } from "./TurnChangeCard";
 
 interface Turn {
   id: string;
   blocks: SessionBlock[];
   promptIndex: number;
+}
+
+interface RequestMarker {
+  id: string;
+  index: number;
+  position: number;
+  prompt: string;
+  response: string;
+}
+
+function compactPreview(text: string, limit: number): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= limit) return compact;
+  return `${compact.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
+}
+
+function requestPreview(
+  turn: Turn,
+  language: string,
+): Omit<RequestMarker, "index" | "position"> | undefined {
+  const user = turn.blocks.find(
+    (block): block is Extract<SessionBlock, { type: "user" }> => block.type === "user",
+  );
+  if (!user) return undefined;
+  const assistant = turn.blocks
+    .filter(
+      (block): block is Extract<SessionBlock, { type: "assistant" }> =>
+        block.type === "assistant",
+    )
+    .at(-1);
+  return {
+    id: turn.id,
+    prompt: compactPreview(user.text, 92),
+    response: assistant?.text.trim()
+      ? compactPreview(assistant.text, 128)
+      : language === "zh-CN"
+        ? "正在等待 Grok 的回复…"
+        : "Waiting for Grok's reply…",
+  };
+}
+
+/** Upstream dandandujie/Grox: left rail for quick jump between user requests. */
+function RequestRail({
+  markers,
+  language,
+  onJump,
+}: {
+  markers: RequestMarker[];
+  language: string;
+  onJump(id: string): void;
+}) {
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const markerNodes = useRef(new Map<string, HTMLButtonElement>());
+  const waveFrame = useRef<number | null>(null);
+  const pointerPosition = useRef<number | null>(null);
+
+  const updateWave = (position: number | null) => {
+    pointerPosition.current = position;
+    if (waveFrame.current !== null) return;
+    waveFrame.current = requestAnimationFrame(() => {
+      waveFrame.current = null;
+      const point = pointerPosition.current;
+      for (const marker of markers) {
+        const node = markerNodes.current.get(marker.id);
+        if (!node) continue;
+        const wave =
+          point === null ? 0 : Math.max(0, 1 - Math.abs(marker.position - point) / 17);
+        node.style.setProperty("--request-rail-wave", wave.toFixed(3));
+      }
+    });
+  };
+
+  useEffect(
+    () => () => {
+      if (waveFrame.current !== null) cancelAnimationFrame(waveFrame.current);
+    },
+    [],
+  );
+
+  if (markers.length === 0) return null;
+
+  return (
+    <nav
+      className="request-rail"
+      aria-label={language === "zh-CN" ? "请求导航" : "Request navigation"}
+      onPointerMove={(event) => {
+        const bounds = event.currentTarget.getBoundingClientRect();
+        if (bounds.height <= 0) return;
+        updateWave(Math.max(0, Math.min(100, ((event.clientY - bounds.top) / bounds.height) * 100)));
+      }}
+      onPointerLeave={() => {
+        updateWave(null);
+        setHoveredId(null);
+      }}
+    >
+      <span className="request-rail__spine" aria-hidden="true" />
+      {markers.map((marker) => {
+        const hovering = hoveredId === marker.id;
+        const style = {
+          top: `${marker.position}%`,
+          "--request-rail-hovered": hovering ? "1" : "0",
+        } as CSSProperties;
+        const label =
+          language === "zh-CN" ? `请求 ${marker.index + 1}` : `Request ${marker.index + 1}`;
+        return (
+          <button
+            key={marker.id}
+            type="button"
+            className={`request-rail__marker ${hovering ? "is-hovered" : ""}`}
+            style={style}
+            ref={(node) => {
+              if (node) markerNodes.current.set(marker.id, node);
+              else markerNodes.current.delete(marker.id);
+            }}
+            onPointerEnter={() => setHoveredId(marker.id)}
+            onFocus={() => setHoveredId(marker.id)}
+            onBlur={() => setHoveredId(null)}
+            onClick={() => onJump(marker.id)}
+            aria-label={`${label}: ${marker.prompt}`}
+          >
+            <span className="request-rail__bar" aria-hidden="true" />
+            {hovering && (
+              <span className="request-rail__tooltip" role="tooltip">
+                <span className="request-rail__tooltip-label">{label}</span>
+                <span className="request-rail__tooltip-prompt">{marker.prompt}</span>
+                <span className="request-rail__tooltip-response">{marker.response}</span>
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </nav>
+  );
 }
 
 /** True when `next` is a stream-retry twin of `prev` (same/fuller body, not new content). */
@@ -233,7 +369,7 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
         {processOpen && (
           <div className="process-sequence process-rail ml-[7px] mt-2 border-l border-line2 pb-1 pl-5 pt-2">
             {process.length > 0 ? (
-              <RenderSequence blocks={process} sessionId={sessionId} processing />
+              <RenderSequence blocks={process} sessionId={sessionId} processing={false} />
             ) : (
               <p className="mb-3 text-[10.5px] leading-relaxed text-dim">{language === "zh-CN" ? "本轮 API 只返回了最终答复；无法据此判断服务商内部是否调用了工具。" : "The API returned only a final answer; provider-internal tool usage cannot be determined from this response."}</p>
             )}
@@ -243,98 +379,185 @@ function TurnGroup({ turn, sessionId, status, active }: TurnGroupProps) {
       </div>
       {unresolved.map((block) => renderBlock(block, sessionId))}
       {answerBlock && <AssistantMsg block={answerBlock} />}
+      {/* Upstream: summarize file diffs for this turn + review/rewind */}
+      <TurnChangeCard blocks={turn.blocks} promptIndex={turn.promptIndex} />
     </section>
   );
 }
 
 const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
   if (previous.active !== next.active || previous.sessionId !== next.sessionId) return false;
-  // status gates canEdit / process chrome on every turn, not only the live one
-  if (previous.status !== next.status) return false;
+  // Only the live turn needs session status (canEdit / process chrome).
+  if ((previous.active || next.active) && previous.status !== next.status) return false;
   if (previous.turn.blocks.length !== next.turn.blocks.length) return false;
   if (previous.turn.promptIndex !== next.turn.promptIndex) return false;
   return previous.turn.blocks.every((block, index) => block === next.turn.blocks[index]);
 });
 
-/** Cap initial paint for very long restored transcripts; user can load older turns. */
-const INITIAL_TURN_WINDOW = 24;
+/**
+ * Optional window for *live* ultra-long sessions only.
+ * Restored / offline history always shows in full — users should not have to
+ * click "show earlier turns" just to read what was already loaded from disk.
+ */
+const LIVE_TURN_WINDOW = 40;
 const STICK_BOTTOM_PX = 120;
 
 export function Timeline({ session }: { session: Session }) {
   const { language } = useI18n();
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const contentRef = useRef<HTMLDivElement>(null);
+  const fullHistoryLoadingId = useDesktop((s) => s.fullHistoryLoadingId);
+  const historyLoadMode = useDesktop((s) => s.historyLoadMode);
+  const diskHistoryProgress = useDesktop((s) => s.diskHistoryProgress);
+  const agentBindStartedAt = useDesktop((s) => s.agentBindStartedAt);
+  const loadingFullHistory = fullHistoryLoadingId === session.id;
+  const scanProgress =
+    diskHistoryProgress?.id === session.id ? diskHistoryProgress : null;
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
   const followRef = useRef(true);
-  /** Suppress onScroll while we programmatically pin to bottom. */
-  const pinningRef = useRef(false);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
-  const [showAll, setShowAll] = useState(false);
-  const lastBlock = session.blocks.at(-1);
-  const signature = `${session.id}:${session.blocks.length}:${lastBlock?.type === "assistant" || lastBlock?.type === "thinking" ? lastBlock.text.length : lastBlock?.id ?? ""}:${session.status}`;
+  /** true = show entire transcript (default for restored history). */
+  const [showAll, setShowAll] = useState(true);
+  const [bindElapsedSec, setBindElapsedSec] = useState(0);
+  // Streaming text length intentionally omitted — Virtuoso followOutput covers growth.
   const hasBlocks = session.blocks.length > 0;
   // Latest turn id — only this row uses live process chrome while the session runs.
   const lastTurnId = turns.at(-1)?.id;
+  const isLive = session.status === "running";
 
-  // Reset window when switching sessions so we don't keep a previous "show all".
+  const markers = useMemo<RequestMarker[]>(() => {
+    const requests = turns
+      .map((turn) => requestPreview(turn, language))
+      .filter((marker): marker is Omit<RequestMarker, "index" | "position"> => Boolean(marker));
+    if (requests.length === 0) return [];
+    return requests.map((marker, index) => ({
+      ...marker,
+      index,
+      // Evenly spaced navigation index (table of contents), not a pixel map.
+      position: ((index + 0.5) / requests.length) * 100,
+    }));
+  }, [language, turns]);
+
+  // Opening / switching: always show full history (scroll sticks to bottom).
   useEffect(() => {
-    setShowAll(false);
+    setShowAll(true);
     followRef.current = true;
   }, [session.id]);
 
+  // Offline scan / cache upgrade may add many older turns — keep them visible.
+  useEffect(() => {
+    if (!isLive) setShowAll(true);
+  }, [session.blocks.length, isLive]);
+
+  // Agent silent-bind elapsed clock (Wave 3 bind timing copy).
+  useEffect(() => {
+    if (
+      !loadingFullHistory ||
+      historyLoadMode !== "agent" ||
+      !agentBindStartedAt ||
+      fullHistoryLoadingId !== session.id
+    ) {
+      setBindElapsedSec(0);
+      return;
+    }
+    const tick = () =>
+      setBindElapsedSec(Math.max(0, Math.floor((Date.now() - agentBindStartedAt) / 1000)));
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [
+    loadingFullHistory,
+    historyLoadMode,
+    agentBindStartedAt,
+    fullHistoryLoadingId,
+    session.id,
+  ]);
+
   const visibleTurns = useMemo(() => {
-    if (showAll || turns.length <= INITIAL_TURN_WINDOW) return turns;
-    return turns.slice(turns.length - INITIAL_TURN_WINDOW);
-  }, [showAll, turns]);
+    // Restored idle sessions: always full. Live stream with huge history: optional window.
+    if (showAll || !isLive || turns.length <= LIVE_TURN_WINDOW) return turns;
+    return turns.slice(turns.length - LIVE_TURN_WINDOW);
+  }, [showAll, turns, isLive]);
   const hiddenCount = turns.length - visibleTurns.length;
 
-  const scrollToBottom = (force = false) => {
-    const element = scrollRef.current;
-    if (!element) return false;
-    if (!force && !followRef.current) return false;
-    pinningRef.current = true;
-    element.scrollTop = element.scrollHeight;
-    // Release pin after the browser has applied scroll and fired any scroll events.
-    requestAnimationFrame(() => {
-      if (!scrollRef.current) {
-        pinningRef.current = false;
-        return;
-      }
-      if (force || followRef.current) {
-        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-      }
-      requestAnimationFrame(() => {
-        pinningRef.current = false;
+  const jumpToTurn = (id: string) => {
+    // Expand live window if the target is outside the visible slice.
+    if (!showAll && !visibleTurns.some((turn) => turn.id === id)) {
+      setShowAll(true);
+    }
+    followRef.current = false;
+    const run = () => {
+      // Prefer full turns so expand-after-setShowAll lands correctly.
+      const target = turns.findIndex((turn) => turn.id === id);
+      if (target < 0) return;
+      virtuosoRef.current?.scrollToIndex({
+        index: target,
+        align: "start",
+        behavior: "auto",
+        offset: -48,
       });
+    };
+    run();
+    window.setTimeout(run, 40);
+    window.setTimeout(run, 160);
+  };
+
+  const scrollToBottom = (force = false) => {
+    if (!force && !followRef.current) return false;
+    if (visibleTurns.length === 0) return false;
+    virtuosoRef.current?.scrollToIndex({
+      index: "LAST",
+      align: "end",
+      behavior: force ? "auto" : "smooth",
     });
     return true;
   };
 
-  // Stick to bottom when the transcript grows / session opens / window expands.
+  // Stick to bottom only on open/switch — never yank on every block_add (user reading up).
   useEffect(() => {
     if (!hasBlocks) return;
     followRef.current = true;
     scrollToBottom(true);
-    const t1 = window.setTimeout(() => scrollToBottom(true), 32);
-    const t2 = window.setTimeout(() => scrollToBottom(true), 120);
+    // Delayed remeasure must honor unfollow if the user scrolled/jumped early.
+    const t1 = window.setTimeout(() => {
+      if (followRef.current) scrollToBottom(true);
+    }, 40);
+    const t2 = window.setTimeout(() => {
+      if (followRef.current) scrollToBottom(true);
+    }, 160);
     return () => {
       window.clearTimeout(t1);
       window.clearTimeout(t2);
     };
-  }, [session.id, signature, showAll, hiddenCount, hasBlocks]);
-
-  // Content height can change without signature updates (markdown, images, tool expand).
-  useEffect(() => {
-    if (!hasBlocks) return;
-    const content = contentRef.current;
-    if (!content || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => {
-      if (followRef.current) scrollToBottom(true);
-    });
-    observer.observe(content);
-    return () => observer.disconnect();
-  }, [session.id, hasBlocks]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: session open only
+  }, [session.id]);
 
   if (!hasBlocks) {
+    if (loadingFullHistory && historyLoadMode === "disk") {
+      const pct = scanProgress?.percent ?? 0;
+      return (
+        <div className="flex flex-1 flex-col items-center justify-center gap-4 px-8 pb-24">
+          <BlackHole size={40} spin />
+          <div className="w-full max-w-sm text-center">
+            <p className="text-[14px] text-mute">
+              {language === "zh-CN"
+                ? `正在从磁盘加载历史… ${pct}%`
+                : `Loading history from disk… ${pct}%`}
+            </p>
+            <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-line/60">
+              <div
+                className="h-full rounded-full bg-acc/80 transition-[width] duration-200 ease-out"
+                style={{ width: `${Math.min(100, Math.max(2, pct))}%` }}
+              />
+            </div>
+            {scanProgress && scanProgress.totalBytes > 0 && (
+              <p className="mt-2 text-[11px] text-faint">
+                {(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)} /{" "}
+                {(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB
+              </p>
+            )}
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-4 pb-24">
         <BlackHole size={40} spin="slow" />
@@ -348,42 +571,118 @@ export function Timeline({ session }: { session: Session }) {
     );
   }
 
+  const agentBindLabel =
+    language === "zh-CN"
+      ? bindElapsedSec > 0
+        ? `首次发送：静默绑定 Agent 上下文中… 已等待 ${bindElapsedSec}s（不卡界面）`
+        : "首次发送：静默绑定 Agent 上下文中（不卡界面）…"
+      : bindElapsedSec > 0
+        ? `First send: binding agent context… ${bindElapsedSec}s elapsed`
+        : "First send: silently binding agent context…";
+
   return (
-    <div
-      ref={scrollRef}
-      onScroll={() => {
-        if (pinningRef.current) return;
-        const element = scrollRef.current;
-        if (!element) return;
-        followRef.current =
-          element.scrollHeight - element.scrollTop - element.clientHeight < STICK_BOTTOM_PX;
-      }}
-      className="flex-1 overflow-y-auto"
-    >
-      <div ref={contentRef} className="mx-auto max-w-[860px] px-8 py-8">
-        {hiddenCount > 0 && (
-          <button
-            type="button"
-            onClick={() => {
-              followRef.current = false;
-              setShowAll(true);
-            }}
-            className="mb-6 flex w-full items-center justify-center gap-2 rounded-md border border-line bg-raise/60 py-2 text-[12px] text-mute transition-colors hover:bg-high hover:text-fg2"
-          >
-            {language === "zh-CN" ? `显示更早的 ${hiddenCount} 轮对话` : `Show ${hiddenCount} earlier turns`}
-          </button>
-        )}
-        {visibleTurns.map((turn) => (
-          <MemoTurnGroup
-            key={turn.id}
-            turn={turn}
-            sessionId={session.id}
-            status={session.status}
-            active={turn.id === lastTurnId}
-          />
-        ))}
-        <div className="h-2" />
-      </div>
+    <div className="relative flex min-h-0 flex-1">
+      <Virtuoso
+        ref={virtuosoRef}
+        className="h-full min-w-0 flex-1"
+        data={visibleTurns}
+        defaultItemHeight={180}
+        increaseViewportBy={{ top: 600, bottom: 800 }}
+        atBottomThreshold={STICK_BOTTOM_PX}
+        atBottomStateChange={(atBottom) => {
+          followRef.current = atBottom;
+        }}
+        followOutput={() => {
+          // Only the follow flag — atBottom alone must not re-stick after RequestRail jump.
+          if (!followRef.current) return false;
+          return isLive ? "smooth" : "auto";
+        }}
+        computeItemKey={(_index, turn) => turn.id}
+        components={{
+          Header: () => (
+            <div className="mx-auto max-w-[860px] px-8 pt-8">
+              {loadingFullHistory && (
+                <div className="mb-4 rounded-md border border-line/80 bg-raise/50 px-3 py-2.5">
+                  <div className="flex items-center justify-center gap-2 text-[11.5px] text-mute">
+                    <BlackHole size={14} spin />
+                    <span className="min-w-0 text-center">
+                      {historyLoadMode === "disk"
+                        ? language === "zh-CN"
+                          ? scanProgress
+                            ? `正在从磁盘补全历史… ${scanProgress.percent}%` +
+                              (scanProgress.totalBytes > 0
+                                ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
+                                : "") +
+                              (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} 条` : "")
+                            : "正在从磁盘补全完整历史（工具调用等）… 可切换其他对话"
+                          : scanProgress
+                            ? `Loading history from disk… ${scanProgress.percent}%` +
+                              (scanProgress.totalBytes > 0
+                                ? ` · ${(scanProgress.bytesRead / (1024 * 1024)).toFixed(1)}/${(scanProgress.totalBytes / (1024 * 1024)).toFixed(1)} MB`
+                                : "") +
+                              (scanProgress.blocks > 0 ? ` · ${scanProgress.blocks} blocks` : "")
+                            : "Loading full history from disk… switching chats is fine"
+                        : agentBindLabel}
+                    </span>
+                  </div>
+                  {historyLoadMode === "disk" && scanProgress && (
+                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-line/60">
+                      <div
+                        className="h-full rounded-full bg-acc/80 transition-[width] duration-200 ease-out"
+                        style={{ width: `${Math.min(100, Math.max(2, scanProgress.percent))}%` }}
+                      />
+                    </div>
+                  )}
+                  {historyLoadMode === "agent" && bindElapsedSec >= 3 && (
+                    <p className="mt-1.5 text-center text-[10.5px] text-faint">
+                      {language === "zh-CN"
+                        ? "大会话绑定可能较久 · 界面仍可滚动与切换对话"
+                        : "Large sessions can take a while · UI stays interactive"}
+                    </p>
+                  )}
+                  {historyLoadMode === "disk" && (
+                    <p className="mt-1.5 text-center text-[10.5px] text-faint">
+                      {language === "zh-CN"
+                        ? "可切换其他对话，不会卡住 · 完成后下次打开会更快"
+                        : "You can switch chats · next open will be faster"}
+                    </p>
+                  )}
+                </div>
+              )}
+              {hiddenCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    followRef.current = false;
+                    setShowAll(true);
+                  }}
+                  className="mb-6 flex w-full items-center justify-center gap-2 rounded-md border border-line bg-raise/60 py-2 text-[12px] text-mute transition-colors hover:bg-high hover:text-fg2"
+                >
+                  {language === "zh-CN"
+                    ? `显示更早的 ${hiddenCount} 轮对话`
+                    : `Show ${hiddenCount} earlier turns`}
+                </button>
+              )}
+            </div>
+          ),
+          Footer: () => <div className="h-8" />,
+        }}
+        itemContent={(_index, turn) => {
+          const active = turn.id === lastTurnId;
+          return (
+            <div className="mx-auto max-w-[860px] px-8">
+              <MemoTurnGroup
+                turn={turn}
+                sessionId={session.id}
+                // Historical turns always "idle" for memo — live status only on active.
+                status={active ? session.status : "idle"}
+                active={active}
+              />
+            </div>
+          );
+        }}
+      />
+      <RequestRail markers={markers} language={language} onJump={jumpToTurn} />
     </div>
   );
 }
