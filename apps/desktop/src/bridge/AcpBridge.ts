@@ -1587,7 +1587,7 @@ export class AcpBridge implements GrokBridge {
       // permanently reject `this.ready` mid-recovery (PR-A review B1).
       if (!this.productGateFallbackDone && /timeout|超时|handshake/i.test(detail)) {
         try {
-          const mode = await invoke<string>("get_agent_leader_mode").catch(() => "local");
+          const mode = await invoke<string>("get_agent_leader_mode").catch(() => "shared");
           if (mode !== "local") {
             await invoke<string>("set_agent_leader_mode", { mode: "local" });
             this.suppressExitHandling = true;

@@ -197,12 +197,12 @@ function General() {
   </div>;
 }
 
-/** local = dedicated agent (`--no-leader`, default); shared = machine leader (`--leader`). */
+/** shared = machine leader (`--leader`, default); local = dedicated agent (`--no-leader`). */
 type AgentLeaderMode = "local" | "shared";
 
 function AgentLeaderModeRow({ zh, bridgeKind }: { zh: boolean; bridgeKind: string }) {
   const forceReconnectAgent = useDesktop((state) => state.forceReconnectAgent);
-  const [mode, setMode] = useState<AgentLeaderMode>("local");
+  const [mode, setMode] = useState<AgentLeaderMode>("shared");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -211,7 +211,7 @@ function AgentLeaderModeRow({ zh, bridgeKind }: { zh: boolean; bridgeKind: strin
     if (bridgeKind !== "acp") return;
     void invoke<string>("get_agent_leader_mode")
       .then((value) => {
-        setMode(value === "shared" ? "shared" : "local");
+        setMode(value === "local" ? "local" : "shared");
       })
       .catch(() => {
         /* mock / older shell */
@@ -229,7 +229,7 @@ function AgentLeaderModeRow({ zh, bridgeKind }: { zh: boolean; bridgeKind: strin
     setNotice("");
     void invoke<string>("set_agent_leader_mode", { mode: next })
       .then(async (saved) => {
-        const resolved: AgentLeaderMode = saved === "shared" ? "shared" : "local";
+        const resolved: AgentLeaderMode = saved === "local" ? "local" : "shared";
         setMode(resolved);
         try {
           await forceReconnectAgent();
@@ -264,15 +264,15 @@ function AgentLeaderModeRow({ zh, bridgeKind }: { zh: boolean; bridgeKind: strin
         label={zh ? "Agent 进程模式" : "Agent process mode"}
         hint={
           zh
-            ? "默认「独立进程」：专用 agent，握手更稳，Computer Use（--plugin-dir）可用。可选「共享 Leader」与本机 CLI / 其他 ACP 共用进程以省资源；若共享出现 403「coming soon」或握手超时，会自动切回独立。"
-            : "Default Local process: dedicated agent (stable handshake; Computer Use --plugin-dir works). Optional Shared leader reuses the machine-wide agent with CLI/other ACP. On product-gate 403 or handshake timeout, auto-falls back to Local."
+            ? "默认「共享 Leader」：与本机 CLI / 其他 ACP 共用 agent，更省资源、使用更常见。可选「独立进程」适合 Computer Use（--plugin-dir）或要与 CLI 完全隔离时。若共享出现 403「coming soon」或握手超时，会自动切回独立。"
+            : "Default Shared leader: reuses the machine-wide agent with CLI/other ACP (common, fewer processes). Optional Local process for Computer Use (--plugin-dir) or isolation. On product-gate 403 or handshake timeout, auto-falls back to Local."
         }
       >
         <div className="flex gap-1">
           {(
             [
-              { id: "local" as const, label: zh ? "独立（默认）" : "Local (default)" },
-              { id: "shared" as const, label: zh ? "共享 Leader" : "Shared leader" },
+              { id: "shared" as const, label: zh ? "共享（默认）" : "Shared (default)" },
+              { id: "local" as const, label: zh ? "独立进程" : "Local process" },
             ] as const
           ).map((item) => (
             <button

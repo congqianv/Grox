@@ -2021,36 +2021,36 @@ fn write_runtime_preference(app: &tauri::AppHandle, preference: &str) -> Result<
 
 /// ACP process topology preference for `grok agent … stdio`.
 ///
-/// - `local` (default) → `--no-leader` — dedicated agent process so `--plugin-dir`
-///   (Computer Use) works and handshake is not blocked by a busy machine leader.
-/// - `shared` → `--leader` — join the machine-wide Grok leader (lower process
-///   count when CLI / other ACP clients also use leader).
+/// - `shared` (default) → `--leader` — join the machine-wide Grok leader (lower
+///   process count when CLI / other ACP clients also use leader; most common).
+/// - `local` → `--no-leader` — dedicated agent so `--plugin-dir` (Computer Use)
+///   works and the shell is isolated from a busy shared leader.
 fn agent_leader_mode_path() -> Result<PathBuf, String> {
     Ok(grok_home()?.join("desktop-agent-leader-mode.json"))
 }
 
 fn normalize_agent_leader_mode(raw: Option<&str>) -> &'static str {
     match raw.map(str::trim) {
-        Some("shared") | Some("leader") => "shared",
         Some("local") | Some("no-leader") => "local",
-        // Default and all unknown / legacy values: dedicated local agent.
-        _ => "local",
+        Some("shared") | Some("leader") => "shared",
+        // Default and all unknown / legacy values: shared machine leader.
+        _ => "shared",
     }
 }
 
 fn agent_leader_cli_flag(mode: &str) -> &'static str {
     match normalize_agent_leader_mode(Some(mode)) {
-        "shared" => "--leader",
-        _ => "--no-leader",
+        "local" => "--no-leader",
+        _ => "--leader",
     }
 }
 
 fn read_agent_leader_mode() -> String {
     let Ok(path) = agent_leader_mode_path() else {
-        return "local".into();
+        return "shared".into();
     };
     let Ok(content) = read_bounded_text(&path, 16 * 1024) else {
-        return "local".into();
+        return "shared".into();
     };
     let mode = serde_json::from_str::<serde_json::Value>(&content)
         .ok()
@@ -2529,11 +2529,11 @@ async fn terminate_process(mut process: AgentProcess) {
     {
         use std::os::windows::process::CommandExt as _;
         if let Some(pid) = process.child.id() {
-            let _ = tokio::process::Command::new("taskkill")
+            // std::process::Command — CommandExt::creation_flags applies cleanly.
+            let _ = std::process::Command::new("taskkill")
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-                .status()
-                .await;
+                .status();
         }
         // Fallback if taskkill is unavailable / failed — still reap the direct child.
         let _ = process.child.kill().await;
@@ -7065,7 +7065,7 @@ fn export_support_diagnostics() -> Result<String, String> {
         "notes": [
             "API keys are redacted or marked [dpapi-sealed]; never paste unredacted dumps.",
             "Managed ~/.grok/.env secrets are not included in this export.",
-            "agentLeaderMode: local=--no-leader (default), shared=--leader.",
+            "agentLeaderMode: shared=--leader (default), local=--no-leader.",
         ],
     });
     serde_json::to_string_pretty(&dump).map_err(|error| format!("无法序列化诊断信息：{error}"))
@@ -7603,9 +7603,9 @@ async fn acp_spawn(
             command.arg("--plugin-dir").arg(plugin);
         }
     }
-    // Default local (`--no-leader`): dedicated agent + Computer Use plugin-dir.
-    // Operators can switch to shared (`--leader`) in Settings → Agent to reuse
-    // the machine-wide leader with CLI / other ACP clients.
+    // Default shared (`--leader`): reuse machine-wide leader with CLI / other ACP.
+    // Operators can switch to local (`--no-leader`) in Settings → Agent when they
+    // need process-scoped `--plugin-dir` (Computer Use) or isolation.
     command
         .args([leader_flag, "--reasoning-effort", "high", "stdio"])
         .current_dir(&cwd)
@@ -8460,18 +8460,18 @@ api_key = "local-key"
     }
 
     #[test]
-    fn agent_leader_mode_defaults_to_local_no_leader() {
-        assert_eq!(normalize_agent_leader_mode(None), "local");
-        assert_eq!(normalize_agent_leader_mode(Some("")), "local");
+    fn agent_leader_mode_defaults_to_shared_leader() {
+        assert_eq!(normalize_agent_leader_mode(None), "shared");
+        assert_eq!(normalize_agent_leader_mode(Some("")), "shared");
         assert_eq!(normalize_agent_leader_mode(Some("local")), "local");
         assert_eq!(normalize_agent_leader_mode(Some("no-leader")), "local");
         assert_eq!(normalize_agent_leader_mode(Some("shared")), "shared");
         assert_eq!(normalize_agent_leader_mode(Some("leader")), "shared");
-        assert_eq!(normalize_agent_leader_mode(Some("weird")), "local");
+        assert_eq!(normalize_agent_leader_mode(Some("weird")), "shared");
         assert_eq!(agent_leader_cli_flag("local"), "--no-leader");
         assert_eq!(agent_leader_cli_flag("shared"), "--leader");
         assert_eq!(agent_leader_cli_flag("leader"), "--leader");
-        assert_eq!(agent_leader_cli_flag("garbage"), "--no-leader");
+        assert_eq!(agent_leader_cli_flag("garbage"), "--leader");
     }
 
     #[test]
