@@ -57,6 +57,16 @@ import {
   pickSilentAllowOptionId,
   shouldAutoApproveToolPermission,
 } from "../lib/permissionAuto";
+import {
+  pickRejectOption,
+  shouldRejectPermission,
+} from "../lib/planGate";
+import {
+  collectToolImages,
+  extractGeneratedMediaPaths,
+  isMediaGenToolCall,
+  type MediaRef,
+} from "../lib/toolMedia";
 import { shouldDropSilentInbound } from "../lib/silentAcp";
 import { FIRST_EVENT_STALL_MS } from "../lib/firstEventWatch";
 
@@ -615,19 +625,55 @@ function extractDiffs(value: unknown): DiffHunk[] | undefined {
   return diffs.length > 0 ? diffs : undefined;
 }
 
-function extractImages(value: unknown): ToolCall["images"] {
+function mediaRefToToolImage(ref: MediaRef): NonNullable<ToolCall["images"]>[number] | null {
+  if (ref.kind === "data") {
+    return { data: ref.data, mime: ref.mimeType };
+  }
+  if (ref.kind === "path") {
+    // ToolCallCard accepts data-URL-like src; file paths are shown as locations + optional convert.
+    return { data: "", mime: ref.mimeType ?? (ref.media === "video" ? "video/mp4" : "image/png"), path: ref.path, mediaKind: ref.media };
+  }
+  if (ref.kind === "uri") {
+    return { data: "", mime: ref.mimeType ?? "image/png", uri: ref.uri, mediaKind: ref.media };
+  }
+  return null;
+}
+
+function extractImages(value: unknown, toolPayload?: JsonObject): ToolCall["images"] {
   const images: NonNullable<ToolCall["images"]> = [];
   const seen = new Set<string>();
+  const push = (img: NonNullable<ToolCall["images"]>[number]) => {
+    const signature =
+      img.data && img.mime
+        ? `${img.mime}:${img.data.slice(0, 96)}:${img.data.length}`
+        : img.path
+          ? `path:${img.path}`
+          : img.uri
+            ? `uri:${img.uri}`
+            : undefined;
+    if (!signature || seen.has(signature)) return;
+    // Skip empty data-only entries without path/uri.
+    if (!img.data && !img.path && !img.uri) return;
+    seen.add(signature);
+    images.push(img);
+  };
   walkJson(value, (object) => {
     if (string(object.type) !== "image") return;
     const data = string(object.data);
     const mime = string(object.mimeType) ?? string(object.mime_type);
-    const signature = data && mime ? `${mime}:${data.slice(0, 96)}:${data.length}` : undefined;
-    if (data && mime && signature && !seen.has(signature)) {
-      seen.add(signature);
-      images.push({ data, mime });
-    }
+    if (data && mime) push({ data, mime });
   });
+  // SuperGrok-style path/uri/video harvest from tool content (imagine / image_gen / …).
+  if (toolPayload) {
+    const refs = [
+      ...collectToolImages(toolPayload),
+      ...(isMediaGenToolCall(toolPayload) ? extractGeneratedMediaPaths(toolPayload) : []),
+    ];
+    for (const ref of refs) {
+      const img = mediaRefToToolImage(ref);
+      if (img) push(img);
+    }
+  }
   return images.length > 0 ? images : undefined;
 }
 
@@ -2307,7 +2353,7 @@ export class AcpBridge implements GrokBridge {
       input: jsonText(update.rawInput),
       output: toolOutputText(update.rawOutput, content),
       diff: extractDiffs([content, update.rawInput, update.rawOutput]),
-      images: extractImages([content, update.rawOutput]),
+      images: extractImages([content, update.rawOutput], update),
       terminal: extractTerminal(
         kind,
         update.title,
@@ -2378,7 +2424,9 @@ export class AcpBridge implements GrokBridge {
         ...(content.length > 0 || update.rawInput !== undefined || update.rawOutput !== undefined
           ? { diff: extractDiffs([content, update.rawInput, update.rawOutput]) }
           : {}),
-        ...(content.length > 0 || update.rawOutput !== undefined ? { images: extractImages([content, update.rawOutput]) } : {}),
+        ...(content.length > 0 || update.rawOutput !== undefined
+          ? { images: extractImages([content, update.rawOutput], update) }
+          : {}),
         ...(terminal ? { terminal } : {}),
         ...(locations ? { locations } : {}),
       },
@@ -2779,6 +2827,52 @@ export class AcpBridge implements GrokBridge {
         },
       });
     };
+    // Plan mode host gate (vscode-supergrok): auto-reject mutating tools until plan approved.
+    const sessionMode = this.sessionOptions.get(sessionId)?.mode ?? "agent";
+    if (sessionMode === "plan") {
+      const toolKind = string(tool.kind) ?? string(tool.name) ?? toolLabel;
+      if (
+        shouldRejectPermission(toolKind, {
+          active: true,
+          workspaceRoot: this.workspace,
+        })
+      ) {
+        const rejectId =
+          optionIds.deny ??
+          pickRejectOption(
+            array(params.options).map((raw) => {
+              const o = record(raw) ?? {};
+              return {
+                optionId: string(o.optionId) ?? "",
+                kind: string(o.kind) ?? string(o.name) ?? "",
+                name: string(o.name),
+              };
+            }).filter((o) => o.optionId),
+          );
+        if (rejectId) {
+          void this.sendRaw({
+            jsonrpc: "2.0",
+            id: rpcId,
+            result: { outcome: { outcome: "selected", optionId: rejectId } },
+          }).catch((error) => {
+            this.emitSoftError(sessionId, `Plan 模式自动拒绝失败：${errorText(error)}`);
+          });
+          this.emit({
+            type: "block_add",
+            sessionId,
+            block: {
+              type: "system",
+              id: uid(),
+              text:
+                "Plan 模式已拦截会修改工作区的工具。请先批准计划，或切换到 Agent 模式。",
+              ts: Date.now(),
+              kind: "info",
+            },
+          });
+          return;
+        }
+      }
+    }
     if (
       shouldAutoApproveToolPermission({
         permissionMode: this.permissionModeFor(sessionId),

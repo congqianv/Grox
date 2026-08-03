@@ -2523,7 +2523,23 @@ async fn start_project_preview(
 
 async fn terminate_process(mut process: AgentProcess) {
     drop(process.stdin);
-    let _ = process.child.kill().await;
+    // Prefer process-tree kill on Windows so agent grandchildren (tool shells)
+    // do not orphan after the stdio child dies (ported idea from vscode-supergrok).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        if let Some(pid) = process.child.id() {
+            let _ = tokio::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .status()
+                .await;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = process.child.kill().await;
+    }
     let _ = process.child.wait().await;
 }
 

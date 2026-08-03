@@ -38,6 +38,7 @@ import {
 import { useImeGuard } from "../../lib/ime";
 import { Markdown } from "../../lib/markdown";
 import { looksLikeMarkdown } from "../../lib/markdownInput";
+import { getSlashQuery } from "../../lib/slashFilter";
 import { ActiveProcessBar } from "./ActiveProcessBar";
 import { RewindMenu } from "./RewindMenu";
 
@@ -191,9 +192,13 @@ export function Composer() {
     },
   ];
 
-  const slashOpen = text.startsWith("/") && !text.includes(" ");
-  const slashQuery = slashOpen ? text.slice(1).toLowerCase() : "";
-  const slashMatches = slashOpen ? slashCommands.filter((c) => c.id.slice(1).startsWith(slashQuery)) : [];
+  // Line-start / multiline slash query (vscode-supergrok slashFilter); product cmds stay local.
+  const slashQueryRaw = getSlashQuery(text, cursor);
+  const slashOpen = slashQueryRaw !== null;
+  const slashQuery = slashOpen ? slashQueryRaw.toLowerCase() : "";
+  const slashMatches = slashOpen
+    ? slashCommands.filter((c) => c.id.slice(1).toLowerCase().startsWith(slashQuery))
+    : [];
 
   const atMention = useMemo(() => activeAtQuery(text, cursor), [text, cursor]);
   const atOpen = Boolean(atMention) && !slashOpen;

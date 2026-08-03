@@ -88,7 +88,14 @@ export interface ToolCall {
   diff?: DiffHunk[];
   terminal?: TerminalIO;
   locations?: string[];
-  images?: { mime: string; data: string }[];
+  /** Inline tool media: base64 data and/or disk path / URI (from tool harvest). */
+  images?: Array<{
+    mime: string;
+    data: string;
+    path?: string;
+    uri?: string;
+    mediaKind?: "image" | "video";
+  }>;
 }
 
 export type PlanStepStatus = "pending" | "in_progress" | "completed";

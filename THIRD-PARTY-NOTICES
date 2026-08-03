@@ -34,6 +34,19 @@ Notable direct dependencies include (non-exhaustive):
 For authoritative license texts of each package, consult the package metadata in
 the lockfiles above or the upstream project repositories.
 
+## Adapted open-source (MIT)
+
+Portions of pure-logic helpers under `apps/desktop/src/lib/` were adapted from:
+
+- **vscode-supergrok / Grok CLI Copilot**  
+  https://github.com/JacobTheJacobs/vscode-supergrok  
+  Copyright (c) 2026 Jacob The Jacobs  
+  License: MIT  
+
+  Specifically: plan host gate, tool media path extractors, plan primer/restore
+  helpers, and slash-filter utilities. Product UI and ACP bridge remain Grox
+  first-party code.
+
 ## First-party license
 
 First-party Grox Desktop code in this repository is licensed under the Apache
