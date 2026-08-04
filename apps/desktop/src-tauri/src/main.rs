@@ -7600,6 +7600,19 @@ async fn grok_worktree_create(
     }))
 }
 
+/// Validate explicit sandbox profile and return global CLI args that must be
+/// placed **before** the `agent` subcommand (`grok --sandbox X agent …`).
+/// Empty/None → no args (follow CLI).
+fn sandbox_global_cli_args(sandbox: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(raw) = sandbox.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    if !matches!(raw, "workspace" | "read-only" | "off") {
+        return Err(format!("不支持的沙箱配置：{raw}"));
+    }
+    Ok(vec!["--sandbox".into(), raw.to_string()])
+}
+
 /// Start a fresh ACP child and stream each stdout JSON-RPC line to the webview.
 /// A repeated call intentionally replaces the old child so a webview reload
 /// cannot initialize the same agent process twice.
@@ -7646,19 +7659,11 @@ async fn acp_spawn(
     };
     let command_path = PathBuf::from(&runtime.path);
     let mut command = Command::new(&command_path);
-    // A1: explicit sandbox only (never implicit).
-    // CLI shape: `grok --sandbox <profile> agent …` (global flag BEFORE subcommand).
-    // `grok agent --sandbox …` is rejected: unexpected argument '--sandbox'.
-    let sandbox_profile = sandbox
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(profile) = sandbox_profile {
-        let allowed = matches!(profile, "workspace" | "read-only" | "off");
-        if !allowed {
-            return Err(format!("不支持的沙箱配置：{profile}"));
-        }
-        command.arg("--sandbox").arg(profile);
+    // A1: explicit sandbox only — global args BEFORE `agent` (see sandbox_global_cli_args).
+    let sandbox_args = sandbox_global_cli_args(sandbox.as_deref())?;
+    let sandbox_profile = sandbox_args.get(1).cloned();
+    for arg in &sandbox_args {
+        command.arg(arg);
     }
     command.arg("agent");
     if let Some(plugin) = computer_plugin.as_ref() {
@@ -7673,7 +7678,7 @@ async fn acp_spawn(
         .kill_on_drop(true);
     apply_cli_provider_environment(&mut command);
     // Re-apply after provider/.env so UI explicit choice wins over GROK_* from file.
-    if let Some(profile) = sandbox_profile {
+    if let Some(profile) = sandbox_profile.as_deref() {
         command.env("GROK_SANDBOX", profile);
     }
     // Keep config.toml in lockstep with the active profile so a restart after
@@ -8269,6 +8274,27 @@ mod tests {
     fn accepts_existing_workspace() {
         let workspace = checked_workspace(env!("CARGO_MANIFEST_DIR")).unwrap();
         assert!(workspace.is_dir());
+    }
+
+    #[test]
+    fn sandbox_global_cli_args_precede_agent_and_follow_cli_is_empty() {
+        assert!(sandbox_global_cli_args(None).unwrap().is_empty());
+        assert!(sandbox_global_cli_args(Some("")).unwrap().is_empty());
+        assert!(sandbox_global_cli_args(Some("  ")).unwrap().is_empty());
+        assert_eq!(
+            sandbox_global_cli_args(Some("workspace")).unwrap(),
+            vec!["--sandbox".to_string(), "workspace".to_string()]
+        );
+        assert_eq!(
+            sandbox_global_cli_args(Some("read-only")).unwrap(),
+            vec!["--sandbox".to_string(), "read-only".to_string()]
+        );
+        assert!(sandbox_global_cli_args(Some("danger-full-access")).is_err());
+        // Regression: never emit a form that becomes `grok agent --sandbox …`
+        // (CLI rejects that with unexpected argument '--sandbox').
+        let args = sandbox_global_cli_args(Some("off")).unwrap();
+        assert_eq!(args.first().map(String::as_str), Some("--sandbox"));
+        assert!(!args.iter().any(|a| a == "agent"));
     }
 
     #[test]
