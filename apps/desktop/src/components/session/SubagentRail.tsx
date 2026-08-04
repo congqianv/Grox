@@ -3,8 +3,8 @@
    Replaces the cramped bottom strip above the composer.
    ───────────────────────────────────────────────────────────────────────── */
 
-import { useEffect, useMemo, useState } from "react";
-import type { Session } from "../../bridge/types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { Session, Usage } from "../../bridge/types";
 import {
   extractActiveSubagents,
   extractRecentSubagents,
@@ -16,10 +16,31 @@ import {
   concurrentHintText,
   concurrentSoftHint,
 } from "../../lib/concurrentSessions";
-import { fmtDuration } from "../../lib/format";
+import { fmtCost, fmtDuration, fmtTokens } from "../../lib/format";
 import { useIsFeatureEnabled } from "../../lib/useFeatureFlags";
 import { useDesktop } from "../../state/store";
 import { Icon } from "../fx/Icon";
+
+type UsageSnap = { in: number; out: number; cache: number; cost: number };
+
+function snapUsage(u: Usage): UsageSnap {
+  return {
+    in: u.inputTokens || 0,
+    out: u.outputTokens || 0,
+    cache: u.cacheReadTokens || 0,
+    cost: u.costUSD || 0,
+  };
+}
+
+/** Best-effort attribution: session usage delta while agent was live (shared across concurrent agents). */
+function formatDelta(start: UsageSnap | undefined, end: UsageSnap, zh: boolean): string {
+  if (!start) return zh ? "token —" : "tok —";
+  const dIn = Math.max(0, end.in - start.in);
+  const dOut = Math.max(0, end.out - start.out);
+  const dTotal = dIn + dOut;
+  if (dTotal <= 0) return zh ? "token ~0" : "tok ~0";
+  return `↑${fmtTokens(dIn)} ↓${fmtTokens(dOut)}`;
+}
 
 const RAIL_W = 280;
 
@@ -59,11 +80,13 @@ function AgentCard({
   index,
   zh,
   dimmed,
+  tokenLine,
 }: {
   agent: ActiveSubagent;
   index: number;
   zh: boolean;
   dimmed?: boolean;
+  tokenLine: string;
 }) {
   const tone = subagentTone(agent, index);
   const [now, setNow] = useState(Date.now());
@@ -78,7 +101,10 @@ function AgentCard({
     return () => window.clearInterval(id);
   }, [live]);
 
-  const elapsed = Math.max(0, now - agent.startedAt);
+  const elapsed = Math.max(
+    0,
+    (agent.endedAtHint ?? now) - agent.startedAt,
+  );
 
   return (
     <button
@@ -106,9 +132,19 @@ function AgentCard({
       {agent.detail && agent.detail !== agent.title && (
         <p className="mt-0.5 line-clamp-1 font-mono text-[10px] text-faint">{agent.detail}</p>
       )}
-      <div className="mt-1.5 flex items-center justify-between">
+      <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
         <span className="tnum text-[10px] text-faint">{fmtDuration(elapsed)}</span>
-        <Icon name="chevronRight" size={9} className="text-faint opacity-0 group-hover:opacity-100" />
+        <span
+          className="tnum text-[10px] text-mute"
+          title={
+            zh
+              ? "会话用量增量估算（多子代理并行时共享，非精确分账）"
+              : "Approx. session usage delta (shared if concurrent; not exact per-agent)"
+          }
+        >
+          {tokenLine}
+        </span>
+        <Icon name="chevronRight" size={9} className="ml-auto text-faint opacity-0 group-hover:opacity-100" />
       </div>
     </button>
   );
@@ -128,6 +164,27 @@ export function SubagentRail({ session, zh }: { session: Session; zh: boolean })
 
   const live = useMemo(() => extractActiveSubagents(session), [session]);
   const recent = useMemo(() => extractRecentSubagents(session, 12), [session]);
+  const usage = session.usage;
+  const usageNow = useMemo(() => snapUsage(usage), [usage]);
+
+  // Snapshot session usage when each agent first appears / finishes (best-effort).
+  const startSnap = useRef(new Map<string, UsageSnap>());
+  const endSnap = useRef(new Map<string, UsageSnap>());
+  useEffect(() => {
+    for (const a of live) {
+      if (!startSnap.current.has(a.id)) startSnap.current.set(a.id, usageNow);
+    }
+    for (const a of recent) {
+      if (!startSnap.current.has(a.id)) startSnap.current.set(a.id, usageNow);
+      if (!endSnap.current.has(a.id)) endSnap.current.set(a.id, usageNow);
+    }
+  }, [live, recent, usageNow]);
+
+  const tokenLineFor = (id: string, finished: boolean) => {
+    const start = startSnap.current.get(id);
+    const end = finished ? endSnap.current.get(id) ?? usageNow : usageNow;
+    return formatDelta(start, end, zh);
+  };
 
   const hint = useMemo(() => {
     if (!enabled) return null;
@@ -205,6 +262,21 @@ export function SubagentRail({ session, zh }: { session: Session; zh: boolean })
       </div>
 
       <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-2.5">
+        <div className="rounded-md border border-line bg-raise/80 px-2 py-1.5 font-mono text-[10px] text-mute">
+          <div className="text-faint">{zh ? "会话用量（合计）" : "Session usage"}</div>
+          <div className="mt-0.5 tnum text-fg2">
+            ↑{fmtTokens(usageNow.in)} ↓{fmtTokens(usageNow.out)}
+            {usageNow.cache > 0 ? ` · cache ${fmtTokens(usageNow.cache)}` : ""}
+            {" · "}
+            {fmtCost(usageNow.cost)}
+          </div>
+          <div className="mt-0.5 text-[9px] leading-snug text-faint">
+            {zh
+              ? "单卡 token 为运行期间会话增量估算；并行时共享，非上游精确分账。"
+              : "Per-card tokens ≈ session delta while live; shared if concurrent."}
+          </div>
+        </div>
+
         {hint?.show && (
           <div className="rounded-md border border-gold/25 bg-gold/5 px-2 py-1.5 font-mono text-[10px] leading-snug text-gold">
             {concurrentHintText(hint, zh)}
@@ -244,7 +316,13 @@ export function SubagentRail({ session, zh }: { session: Session; zh: boolean })
           ) : (
             <div className="flex flex-col gap-1.5">
               {live.map((agent, index) => (
-                <AgentCard key={agent.id} agent={agent} index={index} zh={zh} />
+                <AgentCard
+                  key={agent.id}
+                  agent={agent}
+                  index={index}
+                  zh={zh}
+                  tokenLine={tokenLineFor(agent.id, false)}
+                />
               ))}
             </div>
           )}
@@ -270,8 +348,8 @@ export function SubagentRail({ session, zh }: { session: Session; zh: boolean })
             (recent.length === 0 ? (
               <p className="px-0.5 py-2 text-[11px] leading-relaxed text-faint">
                 {zh
-                  ? "尚无已完成的子代理。普通 Task/shell 不会出现在这里。"
-                  : "No finished subagents. Plain Task/shell tools are omitted."}
+                  ? "尚无已完成的子代理。普通 Task/shell 不会出现在这里。只有 spawn_subagent 等真子代理会列出。"
+                  : "No finished subagents. Plain Task/shell tools are omitted — only real spawns appear."}
               </p>
             ) : (
               <div className="flex flex-col gap-1.5">
@@ -282,6 +360,7 @@ export function SubagentRail({ session, zh }: { session: Session; zh: boolean })
                     index={index}
                     zh={zh}
                     dimmed
+                    tokenLine={tokenLineFor(agent.id, true)}
                   />
                 ))}
               </div>

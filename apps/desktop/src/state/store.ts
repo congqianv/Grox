@@ -4298,15 +4298,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
         preference,
       );
       if (action === "defer_busy") {
+        // Preference is UI + future wiring only — ACP leader does not inject
+        // --sandbox (see sandboxSpawnArg). No reconnect required; clear pending.
         set({
           sandboxPreference: preference,
-          sandboxPendingApply: true,
+          sandboxPendingApply: false,
           queueNotice: {
             id: uid(),
             message:
               preference === "follow_cli"
-                ? "沙箱已保存为「跟随 CLI」— 请点「重连 Agent」后生效（不自动重连）"
-                : `沙箱已保存为「${preference}」— 请点「重连 Agent」后生效（不自动重连）`,
+                ? "沙箱：跟随 CLI（桌面 Agent 不注入 sandbox）"
+                : `沙箱偏好已保存为「${preference}」— 桌面 Agent 主进程暂不注入（避免阻断模型 API）；工具隔离仍由 CLI 处理`,
             state: "queued",
             at: Date.now(),
           },

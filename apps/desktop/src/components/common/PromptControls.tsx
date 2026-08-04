@@ -73,7 +73,6 @@ export function PromptOptionsMenu({
   const sandboxPendingApply = useDesktop((s) => s.sandboxPendingApply);
   const setSandboxPreference = useDesktop((s) => s.setSandboxPreference);
   const applyReviewPreset = useDesktop((s) => s.applyReviewPreset);
-  const forceReconnectAgent = useDesktop((s) => s.forceReconnectAgent);
   const showSandbox = useIsFeatureEnabled("sandboxUi");
   const showReview = useIsFeatureEnabled("reviewMode");
 
@@ -157,30 +156,18 @@ export function PromptOptionsMenu({
             onSelect={(value) => setSandboxPreference(value as SandboxPreference)}
           />
         )}
-        {showSandbox && sandboxPendingApply && (
-          <div className="mb-2 space-y-1.5">
-            <p className="text-[10.5px] text-gold">
-              {zh
-                ? "新沙箱已保存，不会自动重连。请点下方「重连 Agent」后才注入（避免半生效 / 误杀对话）。"
-                : "Sandbox saved; no auto-reconnect. Click below to apply on a fresh agent spawn."}
-            </p>
-            <button
-              type="button"
-              className="h-7 w-full rounded-[3px] border border-gold/35 bg-gold/10 px-2 font-mono text-[9.5px] text-gold hover:bg-gold/15"
-              onClick={() => {
-                void forceReconnectAgent().catch(() => {});
-                setOpen(false);
-              }}
-            >
-              {zh ? "重连 Agent 以应用沙箱" : "Reconnect agent to apply sandbox"}
-            </button>
-          </div>
+        {showSandbox && sandboxPreference !== "follow_cli" && (
+          <p className="mb-2 text-[10.5px] leading-snug text-gold">
+            {zh
+              ? "说明：工作区/只读/Off 偏好仅记录在壳内。桌面 Agent 主进程不注入 --sandbox（注入会导致模型 API 403）。请保持「跟随 CLI」以稳定对话；工具级隔离由 CLI 内部策略处理。"
+              : "Note: workspace/read-only/off is stored in the shell only. Desktop does not inject --sandbox into the agent leader (that caused model API 403). Prefer Follow CLI for stable chat; tool isolation stays CLI-internal."}
+          </p>
         )}
         {showSandbox && sandboxPreference === "off" && (
           <p className="mb-2 text-[10.5px] text-gold">
             {zh
-              ? "沙箱关闭有风险，允许继续（不会二次拦截）"
-              : "Sandbox off is risky but allowed (no second gate)"}
+              ? "Off 表示希望关闭沙箱；当前桌面不会改 Agent 启动参数。"
+              : "Off means you want no sandbox; desktop does not change agent argv yet."}
           </p>
         )}
         {showReview && (

@@ -101,12 +101,27 @@ export function shouldRestartAgentForSandbox(
   return "defer_busy";
 }
 
-/** Spawn profile string for Tauri, or null when shell must not override CLI. */
+/**
+ * Spawn profile for Tauri `acp_spawn`.
+ *
+ * Desktop ACP leader must **not** receive `--sandbox` / `GROK_SANDBOX` today:
+ * injecting workspace/read-only onto the long-lived `grok agent … stdio` child
+ * has been observed to break model API (403 "Grok Build is coming soon") while
+ * follow-CLI works. Headless `-p` can still use sandbox; tool isolation remains
+ * CLI-internal. Preference is still stored for UI + future session wiring (U-01).
+ *
+ * Always returns null so flag off/on does not change spawn argv (I-08 for agent).
+ */
 export function sandboxSpawnArg(
-  featureEnabled: boolean,
-  preference: SandboxPreference = readStoredSandboxPreference(),
+  _featureEnabled: boolean,
+  _preference: SandboxPreference = readStoredSandboxPreference(),
 ): string | null {
-  if (!featureEnabled) return null;
-  const plan = resolveSandboxSpawn(preference);
-  return plan.explicit ? plan.profile : null;
+  return null;
+}
+
+/** True when UI preference is explicit but desktop will not inject into agent. */
+export function sandboxInjectDeferredToCli(
+  preference: SandboxPreference = readStoredSandboxPreference(),
+): boolean {
+  return preference !== "follow_cli";
 }

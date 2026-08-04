@@ -13,6 +13,8 @@ export interface ActiveSubagent {
   agentType: string;
   status: ToolStatus;
   startedAt: number;
+  /** Tool end time when finished (for duration). */
+  endedAtHint?: number;
   kind: ToolKind;
 }
 
@@ -173,6 +175,7 @@ function toActive(blockId: string, call: ToolCall): ActiveSubagent {
     agentType: parseAgentType(call),
     status: call.status,
     startedAt: call.startedAt,
+    endedAtHint: call.endedAt,
     kind: call.kind,
   };
 }

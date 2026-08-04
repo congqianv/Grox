@@ -255,8 +255,8 @@ function SandboxPreferenceRow({ zh }: { zh: boolean }) {
       label={zh ? "沙箱配置" : "Sandbox"}
       hint={
         zh
-          ? "默认跟随 CLI，不强制隔离。仅在此显式选择时才会注入 GROK_SANDBOX。忙碌时延后到下次会话。"
-          : "Default follows CLI — no forced isolation. GROK_SANDBOX is injected only on explicit choice. Busy turns defer until next session."
+          ? "默认跟随 CLI。工作区/只读偏好会保存，但桌面 Agent 主进程暂不注入 --sandbox（避免模型 API 403）。工具隔离仍由 CLI 处理。"
+          : "Default follows CLI. Workspace/read-only is stored but not injected into the desktop agent leader (avoids model API 403). Tool isolation stays CLI-internal."
       }
     >
       <div className="flex flex-col items-end gap-1">

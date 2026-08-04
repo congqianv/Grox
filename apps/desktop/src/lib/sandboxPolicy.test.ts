@@ -40,10 +40,12 @@ describe("readStoredSandboxPreference", () => {
 });
 
 describe("sandboxSpawnArg + busy defer (I-03 / I-08)", () => {
-  it("flag off never injects sandbox even if preference is workspace", () => {
+  it("desktop agent spawn never injects sandbox (avoids model API 403)", () => {
     expect(sandboxSpawnArg(false, "workspace")).toBeNull();
     expect(sandboxSpawnArg(true, "follow_cli")).toBeNull();
-    expect(sandboxSpawnArg(true, "workspace")).toBe("workspace");
+    // Explicit workspace is UI-only until upstream supports agent-safe isolation
+    expect(sandboxSpawnArg(true, "workspace")).toBeNull();
+    expect(sandboxSpawnArg(true, "read_only")).toBeNull();
   });
 
   it("never auto-restarts — always defer so spawn/reconnect applies cleanly", () => {
