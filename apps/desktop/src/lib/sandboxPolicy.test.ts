@@ -46,13 +46,13 @@ describe("sandboxSpawnArg + busy defer (I-03 / I-08)", () => {
     expect(sandboxSpawnArg(true, "workspace")).toBe("workspace");
   });
 
-  it("defers restart while busy; restarts when idle", () => {
+  it("never auto-restarts — always defer so spawn/reconnect applies cleanly", () => {
     expect(
       shouldRestartAgentForSandbox(true, true, "follow_cli", "workspace"),
     ).toBe("defer_busy");
     expect(
       shouldRestartAgentForSandbox(false, true, "follow_cli", "workspace"),
-    ).toBe("restart_now");
+    ).toBe("defer_busy");
     expect(
       shouldRestartAgentForSandbox(false, false, "follow_cli", "workspace"),
     ).toBe("noop");

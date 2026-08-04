@@ -161,8 +161,8 @@ export function PromptOptionsMenu({
           <div className="mb-2 space-y-1.5">
             <p className="text-[10.5px] text-gold">
               {zh
-                ? "新沙箱已保存，尚未注入当前 Agent（避免半生效）。空闲时可点下方重连应用。"
-                : "Sandbox saved but not injected into the live agent (no half-apply). Reconnect when idle to apply."}
+                ? "新沙箱已保存，不会自动重连。请点下方「重连 Agent」后才注入（避免半生效 / 误杀对话）。"
+                : "Sandbox saved; no auto-reconnect. Click below to apply on a fresh agent spawn."}
             </p>
             <button
               type="button"

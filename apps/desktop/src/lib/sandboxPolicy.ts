@@ -82,19 +82,23 @@ export function writeStoredSandboxPreference(
 }
 
 /**
- * I-03: do not half-apply sandbox mid-turn.
- * When any session is busy, preference is stored but spawn applies on next restart.
+ * I-03: never half-apply sandbox mid-turn.
+ *
+ * Open default: **do not auto-restart** the agent on preference change.
+ * Preference is always stored; it applies on the next ACP spawn / manual reconnect.
+ * Auto-restart caused confusing reconnect storms and looked like "sandbox breaks API"
+ * when the child failed to start (e.g. bad `--sandbox` argv order on old builds).
  */
 export function shouldRestartAgentForSandbox(
-  anySessionBusy: boolean,
+  _anySessionBusy: boolean,
   featureEnabled: boolean,
   previous: SandboxPreference,
   next: SandboxPreference,
 ): "restart_now" | "defer_busy" | "noop" {
   if (!featureEnabled) return "noop";
   if (previous === next) return "noop";
-  if (anySessionBusy) return "defer_busy";
-  return "restart_now";
+  // Always defer: UI offers "Reconnect to apply" when pending.
+  return "defer_busy";
 }
 
 /** Spawn profile string for Tauri, or null when shell must not override CLI. */

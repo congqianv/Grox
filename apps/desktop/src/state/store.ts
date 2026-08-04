@@ -4269,21 +4269,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
           sandboxPendingApply: true,
           queueNotice: {
             id: uid(),
-            message: "沙箱将在当前回合结束后 / 下次 Agent 重启时生效",
+            message:
+              preference === "follow_cli"
+                ? "沙箱已保存为「跟随 CLI」— 请点「重连 Agent」后生效（不自动重连）"
+                : `沙箱已保存为「${preference}」— 请点「重连 Agent」后生效（不自动重连）`,
             state: "queued",
             at: Date.now(),
           },
         });
         return;
       }
+      // noop (same value or flag off)
       set({ sandboxPreference: preference, sandboxPendingApply: false });
-      if (action === "restart_now" && bridge.forceReconnectAgent) {
-        void bridge.forceReconnectAgent().catch((error) => {
-          set({
-            startupError: error instanceof Error ? error.message : String(error),
-          });
-        });
-      }
     },
 
     async listWorktrees() {
