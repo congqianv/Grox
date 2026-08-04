@@ -1,0 +1,47 @@
+# Grox / Grok Build — headless CI example (Phase C)
+# Zero runtime impact on the desktop app. Copy into your repo CI as needed.
+#
+# Prerequisites:
+#   - GROK_API_KEY (or your provider env) in CI secrets
+#   - grok CLI on PATH (or install via your preferred package path)
+#   - Do NOT pipe remote install scripts in production CI without pinning digests
+
+name: grok-headless-check
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  headless:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure grok CLI
+        run: |
+          if ! command -v grok >/dev/null 2>&1; then
+            echo "Install/pin grok CLI for your org before enabling this job."
+            exit 1
+          fi
+          grok --version
+
+      # Open defaults: follow CLI sandbox; do not force enterprise locks.
+      # Prefer explicit --sandbox only when the job intentionally needs isolation.
+      - name: Headless agent prompt (print mode)
+        env:
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+        run: |
+          grok -p "Summarize the top-level README in 5 bullets. Do not edit files." \
+            --permission-mode default
+
+      # Optional: stricter sandbox for untrusted PR bodies
+      # - name: Sandboxed read-only check
+      #   env:
+      #     GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+      #   run: |
+      #     grok -p "List changed files only." --sandbox read-only --permission-mode default
+
+      - name: Inspect project discovery (optional)
+        run: grok inspect --json | head -c 4000

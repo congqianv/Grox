@@ -2019,6 +2019,67 @@ fn write_runtime_preference(app: &tauri::AppHandle, preference: &str) -> Result<
     atomic_write(&runtime_preference_path(app)?, &content)
 }
 
+/// ACP process topology preference for `grok agent … stdio`.
+///
+/// - `local` (default) → `--no-leader` — dedicated agent process so `--plugin-dir`
+///   (Computer Use) works and handshake is not blocked by a busy machine leader.
+/// - `shared` → `--leader` — join the machine-wide Grok leader (lower process
+///   count when CLI / other ACP clients also use leader).
+fn agent_leader_mode_path() -> Result<PathBuf, String> {
+    Ok(grok_home()?.join("desktop-agent-leader-mode.json"))
+}
+
+fn normalize_agent_leader_mode(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim) {
+        Some("shared") | Some("leader") => "shared",
+        Some("local") | Some("no-leader") => "local",
+        // Default and all unknown / legacy values: dedicated local agent.
+        _ => "local",
+    }
+}
+
+fn agent_leader_cli_flag(mode: &str) -> &'static str {
+    match normalize_agent_leader_mode(Some(mode)) {
+        "shared" => "--leader",
+        _ => "--no-leader",
+    }
+}
+
+fn read_agent_leader_mode() -> String {
+    let Ok(path) = agent_leader_mode_path() else {
+        return "local".into();
+    };
+    let Ok(content) = read_bounded_text(&path, 16 * 1024) else {
+        return "local".into();
+    };
+    let mode = serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|value| value.get("mode")?.as_str().map(str::to_owned));
+    normalize_agent_leader_mode(mode.as_deref()).to_owned()
+}
+
+fn write_agent_leader_mode(mode: &str) -> Result<String, String> {
+    let trimmed = mode.trim();
+    // Accept canonical names plus CLI-flag aliases; reject anything else.
+    if !matches!(trimmed, "local" | "shared" | "leader" | "no-leader") {
+        return Err("未知 Agent 进程模式（请使用 local 或 shared）".into());
+    }
+    let normalized = normalize_agent_leader_mode(Some(trimmed)).to_owned();
+    let content = serde_json::json!({ "mode": normalized }).to_string();
+    atomic_write(&agent_leader_mode_path()?, &content)?;
+    Ok(normalized)
+}
+
+#[tauri::command]
+fn get_agent_leader_mode() -> String {
+    read_agent_leader_mode()
+}
+
+#[tauri::command]
+fn set_agent_leader_mode(mode: String) -> Result<String, String> {
+    write_agent_leader_mode(&mode)
+}
+
 fn grok_binary_version(path: &str) -> Option<String> {
     let mut command = std::process::Command::new(path);
     command
@@ -4757,8 +4818,8 @@ async fn generate_media(
 ) -> Result<MediaGenerationResult, String> {
     let cwd = checked_workspace(&request.cwd)?;
     let prompt = checked_media_prompt(&request, &cwd)?;
-    let runtime = configured_grok_command(&app);
-    let mut command = Command::new(&runtime.path);
+    let command_path = require_absolute_grok_cli(&app)?;
+    let mut command = Command::new(&command_path);
     // Headless media child: tool allowlist is a hard constant (never from request).
     // `--always-approve` only covers these four media tools — not full agent yolo.
     // Chat `permissionMode` does not apply to this child process.
@@ -6977,6 +7038,8 @@ fn export_support_diagnostics() -> Result<String, String> {
         "buildCommit": GROX_BUILD_COMMIT,
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
+        "agentLeaderMode": read_agent_leader_mode(),
+        "agentLeaderCliFlag": agent_leader_cli_flag(&read_agent_leader_mode()),
         "activeProviderId": profiles.active_id,
         "providers": profiles_redacted,
         "providerStatus": env_status,
@@ -6984,6 +7047,7 @@ fn export_support_diagnostics() -> Result<String, String> {
         "notes": [
             "API keys are redacted or marked [dpapi-sealed]; never paste unredacted dumps.",
             "Managed ~/.grok/.env secrets are not included in this export.",
+            "agentLeaderMode: local=--no-leader (default), shared=--leader.",
         ],
     });
     serde_json::to_string_pretty(&dump).map_err(|error| format!("无法序列化诊断信息：{error}"))
@@ -7468,15 +7532,188 @@ fn open_preview_external(url: String) -> Result<(), String> {
     spawn_system_browser(&parsed)
 }
 
+/// Absolute existing Grok CLI path — never bare PATH names (`grok` / `grok.exe`).
+fn require_absolute_grok_cli(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let runtime = configured_grok_command(app);
+    if runtime.source == "missing" || runtime.path.trim().is_empty() {
+        return Err(
+            "未找到可用的 Grok CLI（需系统安装、内置或 GROK_DESKTOP_CLI 绝对路径）".into(),
+        );
+    }
+    let command_path = PathBuf::from(&runtime.path);
+    if !command_path.is_absolute() {
+        return Err(format!(
+            "Grok CLI 路径必须为绝对路径，拒绝相对/PATH 名称：{}",
+            command_path.display()
+        ));
+    }
+    if !command_path.exists() {
+        return Err(format!(
+            "Grok CLI 不存在：{}。可通过 GROK_DESKTOP_CLI 指定可执行文件。",
+            command_path.display()
+        ));
+    }
+    Ok(command_path)
+}
+
+/// Shared helper: run a short-lived `grok <args>` with timeout (inspect / worktree).
+async fn run_grok_cli_json(
+    app: &tauri::AppHandle,
+    cwd: &Path,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Result<serde_json::Value, String> {
+    let command_path = require_absolute_grok_cli(app)?;
+    let mut command = Command::new(&command_path);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    apply_cli_provider_environment(&mut command);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), command.output())
+        .await
+        .map_err(|_| format!("grok {} 超时（{timeout_secs} 秒）", args.join(" ")))?
+        .map_err(|error| format!("无法启动 grok {}：{error}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.as_ref()
+        } else {
+            stdout.as_ref()
+        };
+        return Err(format!(
+            "grok {} 失败：{}",
+            args.join(" "),
+            detail.trim().chars().take(2_000).collect::<String>()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        // list may legitimately be empty JSON array — callers parse "[]"
+        return Ok(serde_json::json!([]));
+    }
+    serde_json::from_str(trimmed).map_err(|error| {
+        format!(
+            "无法解析 grok {} JSON：{error} · {}",
+            args.join(" "),
+            trimmed.chars().take(240).collect::<String>()
+        )
+    })
+}
+
+/// Run `grok inspect --json` for the workspace (A0 Effective panel).
+/// Read-only discovery — does not change agent spawn, sandbox, or permissions.
+/// Hard timeout so a hung CLI never blocks the shell UI.
+#[tauri::command]
+async fn grok_inspect(app: tauri::AppHandle, cwd: String) -> Result<serde_json::Value, String> {
+    let root = checked_workspace(&cwd)?;
+    run_grok_cli_json(&app, &root, &["inspect", "--json"], 12).await
+}
+
+/// List tracked worktrees via `grok worktree list --json` (A2). Never uses raw git worktree.
+#[tauri::command]
+async fn grok_worktree_list(app: tauri::AppHandle, cwd: String) -> Result<serde_json::Value, String> {
+    let root = checked_workspace(&cwd)?;
+    run_grok_cli_json(&app, &root, &["worktree", "list", "--json", "--all"], 20).await
+}
+
+/// Create a worktree through Grok CLI (`--worktree`), not raw `git worktree` (A2).
+/// Returns JSON `{ "path": "...", "name": "..." }` when path can be resolved.
+#[tauri::command]
+async fn grok_worktree_create(
+    app: tauri::AppHandle,
+    cwd: String,
+    name: String,
+    worktree_ref: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let root = checked_workspace(&cwd)?;
+    let name = name.trim();
+    if name.is_empty() || name.len() > 80 {
+        return Err("worktree 名称需为 1–80 个字符".into());
+    }
+    if name.contains("..")
+        || name.chars().any(|c| c.is_control() || c == '/' || c == '\\' || c == ':')
+    {
+        return Err("worktree 名称包含非法字符".into());
+    }
+    let command_path = require_absolute_grok_cli(&app)?;
+    let mut command = Command::new(&command_path);
+    // Create via Grok CLI only (no raw git worktree). Prefer headless print mode.
+    // Failure degrades to error JSON for the shell — never fabricates a session cwd.
+    command.arg("--worktree").arg(name);
+    if let Some(reference) = worktree_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.arg("--worktree-ref").arg(reference);
+    }
+    command
+        .args(["-p", "true"])
+        .current_dir(&root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    apply_cli_provider_environment(&mut command);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .map_err(|_| "创建 worktree 超时（90 秒）".to_string())?
+        .map_err(|error| format!("无法启动 grok --worktree：{error}"))?;
+    // Re-list so we return a concrete path (I-06: caller must validate before session).
+    let listed = run_grok_cli_json(&app, &root, &["worktree", "list", "--json", "--all"], 20)
+        .await
+        .unwrap_or_else(|_| serde_json::json!([]));
+    Ok(serde_json::json!({
+        "name": name,
+        "ok": output.status.success(),
+        "stderr": String::from_utf8_lossy(&output.stderr).trim().chars().take(800).collect::<String>(),
+        "stdout": String::from_utf8_lossy(&output.stdout).trim().chars().take(800).collect::<String>(),
+        "list": listed,
+    }))
+}
+
+/// Validate explicit sandbox profile and return global CLI args that must be
+/// placed **before** the `agent` subcommand (`grok --sandbox X agent …`).
+/// Empty/None → no args (follow CLI).
+fn sandbox_global_cli_args(sandbox: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(raw) = sandbox.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    if !matches!(raw, "workspace" | "read-only" | "off") {
+        return Err(format!("不支持的沙箱配置：{raw}"));
+    }
+    Ok(vec!["--sandbox".into(), raw.to_string()])
+}
+
 /// Start a fresh ACP child and stream each stdout JSON-RPC line to the webview.
 /// A repeated call intentionally replaces the old child so a webview reload
 /// cannot initialize the same agent process twice.
+///
+/// `sandbox`: optional profile. Only set when the user explicitly chose one
+/// (A1). `None` / empty → follow CLI (do not inject GROK_SANDBOX).
 #[tauri::command]
 async fn acp_spawn(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AcpState>>,
     cwd: String,
-) -> Result<(), String> {
+    sandbox: Option<String>,
+) -> Result<u64, String> {
     // One spawn at a time: terminate → spawn → store must not interleave.
     let _spawn_guard = state.spawn_lock.lock().await;
 
@@ -7496,7 +7733,7 @@ async fn acp_spawn(
         terminate_process(old).await;
     }
 
-    let runtime = configured_grok_command(&app);
+    let command_path = require_absolute_grok_cli(&app)?;
     let computer_plugin = if cfg!(target_os = "windows") {
         match ensure_computer_plugin() {
             Ok(path) => Some(path),
@@ -7508,20 +7745,39 @@ async fn acp_spawn(
     } else {
         None
     };
-    let command_path = PathBuf::from(&runtime.path);
     let mut command = Command::new(&command_path);
-    command.arg("agent");
-    if let Some(plugin) = computer_plugin.as_ref() {
-        command.arg("--plugin-dir").arg(plugin);
+    // A1: explicit sandbox only — global args BEFORE `agent` (see sandbox_global_cli_args).
+    let sandbox_args = sandbox_global_cli_args(sandbox.as_deref())?;
+    let sandbox_profile = sandbox_args.get(1).cloned();
+    for arg in &sandbox_args {
+        command.arg(arg);
     }
+    command.arg("agent");
+    // Shared (`--leader`) joins the machine-wide leader; process-scoped
+    // `--plugin-dir` is ignored there and has been implicated in flaky 403s when
+    // mixed with leader attach. Only attach Computer Use plugins in local mode.
+    let leader_mode = read_agent_leader_mode();
+    let leader_flag = agent_leader_cli_flag(&leader_mode);
+    if leader_mode == "local" {
+        if let Some(plugin) = computer_plugin.as_ref() {
+            command.arg("--plugin-dir").arg(plugin);
+        }
+    }
+    // Default local (`--no-leader`): dedicated agent + Computer Use plugin-dir.
+    // Operators can switch to shared (`--leader`) in Settings → Agent to reuse
+    // the machine-wide leader with CLI / other ACP clients.
     command
-        .args(["--leader", "--reasoning-effort", "high", "stdio"])
+        .args([leader_flag, "--reasoning-effort", "high", "stdio"])
         .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     apply_cli_provider_environment(&mut command);
+    // Re-apply after provider/.env so UI explicit choice wins over GROK_* from file.
+    if let Some(profile) = sandbox_profile.as_deref() {
+        command.env("GROK_SANDBOX", profile);
+    }
     // Keep config.toml in lockstep with the active profile so a restart after
     // editing resident models still routes away from stale local [model.*]
     // base_url overrides without requiring a manual re-activate.
@@ -7647,7 +7903,8 @@ async fn acp_spawn(
         }
     });
 
-    Ok(())
+    // FE must pass this generation on acp_send so stale writes after respawn fail.
+    Ok(generation)
 }
 
 /// Enable/disable silent history filtering for a session (or clear all).
@@ -7684,7 +7941,11 @@ fn acp_set_silent_stream(
 }
 
 #[tauri::command]
-async fn acp_send(state: tauri::State<'_, Arc<AcpState>>, line: String) -> Result<(), String> {
+async fn acp_send(
+    state: tauri::State<'_, Arc<AcpState>>,
+    line: String,
+    generation: Option<u64>,
+) -> Result<(), String> {
     if line.contains('\n') || line.contains('\r') {
         return Err("ACP 消息必须是单行 JSON".into());
     }
@@ -7701,6 +7962,12 @@ async fn acp_send(state: tauri::State<'_, Arc<AcpState>>, line: String) -> Resul
     let process = guard
         .as_mut()
         .ok_or_else(|| "Grok Agent 尚未启动".to_string())?;
+    // Reject writes aimed at a previous child after reconnect/spawn (FE passes generation).
+    if let Some(expected) = generation {
+        if process.generation != expected {
+            return Err("ACP 连接已更换，请重试当前操作".into());
+        }
+    }
     process
         .stdin
         .write_all(line.as_bytes())
@@ -8044,6 +8311,8 @@ fn main() {
             activate_provider_profile,
             delete_provider_profile,
             export_support_diagnostics,
+            get_agent_leader_mode,
+            set_agent_leader_mode,
             grok_runtime_info,
             set_grok_runtime_preference,
             install_official_grok_cli,
@@ -8061,6 +8330,9 @@ fn main() {
             check_app_update,
             install_app_update,
             start_project_preview,
+            grok_inspect,
+            grok_worktree_list,
+            grok_worktree_create,
             acp_spawn,
             acp_send,
             acp_kill,
@@ -8112,6 +8384,27 @@ mod tests {
     fn accepts_existing_workspace() {
         let workspace = checked_workspace(env!("CARGO_MANIFEST_DIR")).unwrap();
         assert!(workspace.is_dir());
+    }
+
+    #[test]
+    fn sandbox_global_cli_args_precede_agent_and_follow_cli_is_empty() {
+        assert!(sandbox_global_cli_args(None).unwrap().is_empty());
+        assert!(sandbox_global_cli_args(Some("")).unwrap().is_empty());
+        assert!(sandbox_global_cli_args(Some("  ")).unwrap().is_empty());
+        assert_eq!(
+            sandbox_global_cli_args(Some("workspace")).unwrap(),
+            vec!["--sandbox".to_string(), "workspace".to_string()]
+        );
+        assert_eq!(
+            sandbox_global_cli_args(Some("read-only")).unwrap(),
+            vec!["--sandbox".to_string(), "read-only".to_string()]
+        );
+        assert!(sandbox_global_cli_args(Some("danger-full-access")).is_err());
+        // Regression: never emit a form that becomes `grok agent --sandbox …`
+        // (CLI rejects that with unexpected argument '--sandbox').
+        let args = sandbox_global_cli_args(Some("off")).unwrap();
+        assert_eq!(args.first().map(String::as_str), Some("--sandbox"));
+        assert!(!args.iter().any(|a| a == "agent"));
     }
 
     #[test]
@@ -8363,6 +8656,21 @@ api_key = "local-key"
         assert!(should_drop_silent_history_line(&state, flood_a));
         assert!(!should_drop_silent_history_line(&state, flood_b));
         assert!(!should_drop_silent_history_line(&state, rpc_ok));
+    }
+
+    #[test]
+    fn agent_leader_mode_defaults_to_local_no_leader() {
+        assert_eq!(normalize_agent_leader_mode(None), "local");
+        assert_eq!(normalize_agent_leader_mode(Some("")), "local");
+        assert_eq!(normalize_agent_leader_mode(Some("local")), "local");
+        assert_eq!(normalize_agent_leader_mode(Some("no-leader")), "local");
+        assert_eq!(normalize_agent_leader_mode(Some("shared")), "shared");
+        assert_eq!(normalize_agent_leader_mode(Some("leader")), "shared");
+        assert_eq!(normalize_agent_leader_mode(Some("weird")), "local");
+        assert_eq!(agent_leader_cli_flag("local"), "--no-leader");
+        assert_eq!(agent_leader_cli_flag("shared"), "--leader");
+        assert_eq!(agent_leader_cli_flag("leader"), "--leader");
+        assert_eq!(agent_leader_cli_flag("garbage"), "--no-leader");
     }
 
     #[test]

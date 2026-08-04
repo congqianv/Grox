@@ -1,12 +1,13 @@
 /* ─────────────────────────────────────────────────────────────────────────
    PermissionCard — the moment the agent asks the operator.
-   Bright-bordered, gold-headed, keyboard-first (1 / 2 / 3). Resolves in
-   place and quiets down into the transcript.
+   Keyboard-first: Enter = allow once, Esc = deny, 1 / 2 / 3 for options.
+   Composer also routes Enter/Esc while focus stays in the input (scheme A).
    Plan decisions are locked on first click (sessionId + requestId).
    ───────────────────────────────────────────────────────────────────────── */
 
 import { useEffect, useRef, useState } from "react";
 import type { PermissionOption, SessionBlock } from "../../bridge/types";
+import { topPendingPermissionId } from "../../lib/sessionGate";
 import { useDesktop } from "../../state/store";
 import { Icon } from "../fx/Icon";
 import { useI18n } from "../../lib/i18n";
@@ -17,9 +18,13 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
   const { language } = useI18n();
   const zh = language === "zh-CN";
   const resolvePermission = useDesktop((s) => s.resolvePermission);
-  const isActive = useDesktop(
-    (s) => s.activeId === sessionId && s.sessions[sessionId]?.status === "awaiting_permission",
-  );
+  // Only the *top* unresolved card owns 1/2/3 — stacked permissions must not all fire.
+  const isActive = useDesktop((s) => {
+    if (s.activeId !== sessionId) return false;
+    const session = s.sessions[sessionId];
+    if (!session || session.status !== "awaiting_permission") return false;
+    return topPendingPermissionId(session) === block.id;
+  });
   const resolved = block.resolved;
   const isPlan = block.id.startsWith("plan-approval-");
   const [submitting, setSubmitting] = useState(false);
@@ -49,20 +54,30 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
   useEffect(() => {
     if (resolved || !isActive) return;
     const onKey = (e: KeyboardEvent) => {
-      // Do not steal 1/2/3 while the operator is typing in the composer.
-      const t = e.target;
-      if (t instanceof HTMLElement) {
-        const tag = t.tagName;
-        if (
-          tag === "TEXTAREA" ||
-          tag === "INPUT" ||
-          tag === "SELECT" ||
-          t.isContentEditable
-        ) {
-          return;
-        }
-      }
       if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const t = e.target;
+      const inField =
+        t instanceof HTMLElement &&
+        (t.tagName === "TEXTAREA" ||
+          t.tagName === "INPUT" ||
+          t.tagName === "SELECT" ||
+          t.isContentEditable);
+
+      // Enter / Esc: approve once or deny. Composer handles the same when the
+      // textarea is focused; handle here when focus is elsewhere (timeline, etc.).
+      if (!inField && e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        decide("allow_once");
+        return;
+      }
+      if (!inField && e.key === "Escape") {
+        e.preventDefault();
+        decide("deny");
+        return;
+      }
+
+      // Do not steal 1/2/3 while the operator is typing in the composer.
+      if (inField) return;
       const idx = ["1", "2", "3"].indexOf(e.key);
       if (idx >= 0 && options[idx]) {
         e.preventDefault();
@@ -74,9 +89,14 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
     // optionKey is a stable string form of `options` (rebuilt each render).
   }, [resolved, isActive, optionKey, block.id, resolvePermission, submitting]);
 
+  // Wire-fail restore clears resolved — unlock so the operator can retry from
+  // either the timeline card or the plan side pane.
   useEffect(() => {
     if (resolved) {
       locked.current = true;
+      setSubmitting(false);
+    } else {
+      locked.current = false;
       setSubmitting(false);
     }
   }, [resolved]);
@@ -140,6 +160,9 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
                 : opt === "allow_always"
                   ? "border border-line3 text-fg2 hover:bg-high"
                   : "border border-line2 text-mute hover:border-red hover:text-red";
+            // Primary affordance: Enter for allow once, Esc for deny; keep 1/2/3.
+            const kbd =
+              opt === "allow_once" ? "↵" : opt === "deny" ? "Esc" : String(i + 1);
             return (
               <button
                 key={opt}
@@ -151,7 +174,7 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
                 <kbd
                   className={`text-[11px] ${opt === "allow_once" ? "text-base/70" : "text-faint"}`}
                 >
-                  {i + 1}
+                  {kbd}
                 </kbd>
               </button>
             );

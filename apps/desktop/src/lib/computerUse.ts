@@ -1,3 +1,5 @@
+import { tOp } from "./operatorLocale";
+
 /** localStorage key for operator opt-in to Computer Use (desktop control). */
 export const COMPUTER_USE_STORAGE_KEY = "grox.computerUseEnabled";
 
@@ -126,6 +128,17 @@ export function decideComputerAttachForPrompt(input: {
 }
 
 /** Operator-facing copy when Computer Use is refused (Settings General). */
+export function computerUseOptInRefuseMessage(): string {
+  return tOp(
+    "Computer Use 未启用。请在 设置 中打开「允许 Computer Use」后再试。",
+    "Computer Use is not enabled. Turn on “Allow Computer Use” in Settings and try again.",
+  );
+}
+
+/**
+ * @deprecated Prefer computerUseOptInRefuseMessage() for locale-aware copy.
+ * Kept as a stable substring for equality checks against older bridge soft-errors.
+ */
 export const COMPUTER_USE_OPT_IN_REFUSE_MESSAGE =
   "Computer Use 未启用。请在 设置 中打开「允许 Computer Use」后再试。";
 

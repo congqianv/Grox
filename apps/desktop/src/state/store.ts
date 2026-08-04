@@ -8,8 +8,18 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { bridge } from "../bridge";
 import { DEFAULT_PERMISSION_MODE, MODELS, readStoredPermissionMode } from "../bridge/types";
-import { COMPUTER_USE_OPT_IN_REFUSE_MESSAGE } from "../lib/computerUse";
+import { computerUseOptInRefuseMessage } from "../lib/computerUse";
+import { isFeatureEnabled } from "../lib/featureFlags";
+import { tOp } from "../lib/operatorLocale";
 import { isSafeMarkdownOpenUrl } from "../lib/openUrlSafety";
+import { reviewPreset } from "../lib/reviewPreset";
+import {
+  type SandboxPreference,
+  readStoredSandboxPreference,
+  shouldRestartAgentForSandbox,
+  writeStoredSandboxPreference,
+} from "../lib/sandboxPolicy";
+import { parseWorktreeList, type WorktreeEntry } from "../lib/worktreePolicy";
 import type {
   AgentMode,
   AccountInfo,
@@ -42,7 +52,18 @@ import type {
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
 import { mergeOfflineWithLive } from "../lib/offlineMerge";
-import { mergeCliQueueWithLocal, nextLocalDrainIndex } from "../lib/promptQueue";
+import {
+  filterBusyTurnQueueEntries,
+  filterConsumedQueueEntries,
+  filterQueueGhostsByLiveTexts,
+  mergeCliQueueWithLocal,
+  normalizeQueueText,
+  queueHasSameText,
+  stripCliOwnedEntries,
+  rehomeHeldQueueForRecovery as rehomeHeldQueueEntries,
+  settleQueueOnIdle,
+} from "../lib/promptQueue";
+import { reconcileIncomingStatus, statusAfterGateResolve } from "../lib/sessionGate";
 import {
   cancelSaveSessionCache,
   loadSessionCache,
@@ -61,8 +82,114 @@ const offlineHistoryDeleted = new Set<string>();
 /**
  * Sessions with an in-flight sendPrompt IIFE (silent bind + prompt).
  * Prevents openSession from coercing running→idle mid-bind (double-prompt race).
+ *
+ * IMPORTANT: UI `status: idle` (就绪) can arrive via `prompt_complete` / finishTurn
+ * *before* the JSON-RPC `session/prompt` promise settles. While that gap exists the
+ * set still holds the id — treating it as "busy" forever queues new sends and
+ * blocks drainPromptQueue (operator sees 就绪 + 队列卡住). Ready must win.
  */
 const promptInFlightSessions = new Set<string>();
+/** Per-session flight generation — stale finally must not clear a newer send. */
+const promptFlightGen = new Map<string, number>();
+/**
+ * Queue entry ids already submitted via concurrent `session/prompt` (busy-path
+ * enqueue). Drain must not start a second sendPrompt for these — that produced
+ * "Grok 正在处理" + the same row still 已入队.
+ */
+const submittedEnqueueIds = new Set<string>();
+/**
+ * Per-session epoch for concurrent enqueue IIFEs. Bumped on agent reconnect /
+ * Stop so a late `await enqueuePrompt` success cannot dual-send or re-hold a row
+ * the reconnect drain already re-homed.
+ */
+const concurrentEnqueueEpoch = new Map<string, number>();
+function bumpConcurrentEnqueueEpoch(sessionId: string): number {
+  const next = (concurrentEnqueueEpoch.get(sessionId) ?? 0) + 1;
+  concurrentEnqueueEpoch.set(sessionId, next);
+  return next;
+}
+function currentConcurrentEnqueueEpoch(sessionId: string): number {
+  return concurrentEnqueueEpoch.get(sessionId) ?? 0;
+}
+/**
+ * Ids whose concurrent session/prompt wire write already succeeded. CLI may
+ * still echo them in x.ai/queue/changed — re-showing those as 已入队 is a ghost
+ * (operator sees an old follow-up while Grok is already processing it / while
+ * a newer interject is live). Cleared when the session returns to idle.
+ */
+const consumedConcurrentIdsBySession = new Map<string, Set<string>>();
+/**
+ * Normalized texts of concurrent writes (CLI often re-echoes with a *new* id).
+ */
+const consumedConcurrentTextsBySession = new Map<string, Set<string>>();
+/**
+ * After operator Stop, do not auto-drain the follow-up queue (surprising:
+ * "I stopped but it kept going"). Stays set until the operator explicitly
+ * continues (new primary send / clear queue / agent reconnect), not just the
+ * next idle tick — otherwise sendPrompt `finally` / late idle races re-fire.
+ */
+const suppressNextIdleDrain = new Set<string>();
+
+/** True when this send IIFE was superseded by Stop / a newer primary. */
+function isPromptFlightCancelled(sessionId: string, flightGen: number): boolean {
+  return promptFlightGen.get(sessionId) !== flightGen;
+}
+
+function markConsumedConcurrent(sessionId: string, entryId: string, text?: string): void {
+  let ids = consumedConcurrentIdsBySession.get(sessionId);
+  if (!ids) {
+    ids = new Set();
+    consumedConcurrentIdsBySession.set(sessionId, ids);
+  }
+  ids.add(entryId);
+  const norm = normalizeQueueText(text);
+  if (!norm) return;
+  let texts = consumedConcurrentTextsBySession.get(sessionId);
+  if (!texts) {
+    texts = new Set();
+    consumedConcurrentTextsBySession.set(sessionId, texts);
+  }
+  texts.add(norm);
+}
+
+function clearConsumedConcurrent(sessionId: string): void {
+  consumedConcurrentIdsBySession.delete(sessionId);
+  consumedConcurrentTextsBySession.delete(sessionId);
+}
+
+function consumedSets(sessionId: string): {
+  ids: Set<string> | undefined;
+  texts: Set<string> | undefined;
+} {
+  return {
+    ids: consumedConcurrentIdsBySession.get(sessionId),
+    texts: consumedConcurrentTextsBySession.get(sessionId),
+  };
+}
+
+function beginPromptFlight(sessionId: string): number {
+  const gen = (promptFlightGen.get(sessionId) ?? 0) + 1;
+  promptFlightGen.set(sessionId, gen);
+  promptInFlightSessions.add(sessionId);
+  return gen;
+}
+
+/** Only the flight that still owns `gen` may clear the in-flight bit. */
+function endPromptFlight(sessionId: string, gen: number): void {
+  if (promptFlightGen.get(sessionId) !== gen) return;
+  promptInFlightSessions.delete(sessionId);
+}
+
+/**
+ * Drop any in-flight lock (e.g. status→idle while RPC still open).
+ * Bumps generation so a late `finally` cannot delete a newer send's lock.
+ */
+function releasePromptFlight(sessionId: string): void {
+  const gen = (promptFlightGen.get(sessionId) ?? 0) + 1;
+  promptFlightGen.set(sessionId, gen);
+  promptInFlightSessions.delete(sessionId);
+}
+
 /** Monotonic token so superseded openSession awaits do not steal focus. */
 let openSessionGeneration = 0;
 /** Target of the latest openSession — applyChrome only if still this id. */
@@ -392,6 +519,12 @@ export interface QueuedPrompt {
   state: "queued" | "interjected" | "sending";
   version?: number;
   source?: "local" | "cli";
+  /**
+   * Concurrent session/prompt was accepted by the CLI; shell keeps a visible
+   * "waiting for current turn" row so the operator does not think the item vanished.
+   * Drain must never re-send these (CLI owns execution).
+   */
+  heldByCli?: boolean;
 }
 
 /** Ephemeral operator-facing receipt for queue / interject / gate actions. */
@@ -456,6 +589,13 @@ interface DesktopState {
   effort: Effort;
   mode: AgentMode;
   permissionMode: PermissionMode;
+  /** A1: requested sandbox preference (follow_cli by default). */
+  sandboxPreference: SandboxPreference;
+  /**
+   * A1: user changed sandbox while a turn was busy — apply on next agent restart.
+   * Never half-applies mid-turn (I-03).
+   */
+  sandboxPendingApply: boolean;
   sessionComposers: Record<string, SessionComposerState>;
   promptQueues: Record<string, QueuedPrompt[]>;
   /** Last queue/interject/gate receipt shown above the composer. */
@@ -514,6 +654,11 @@ interface DesktopState {
   setWorkspace(cwd: string): Promise<void>;
   authenticate(): Promise<void>;
   logout(): Promise<void>;
+  /**
+   * Force-restart the Grok agent child (clears crash-reconnect cooldown).
+   * Use when auto-reconnect is paused after repeated crashes.
+   */
+  forceReconnectAgent(): Promise<void>;
   refreshAccount(): Promise<void>;
   refreshModels(): Promise<void>;
   configureProvider(config: ProviderConfig): Promise<void>;
@@ -540,7 +685,11 @@ interface DesktopState {
   planPreviewOpen: boolean;
   setPlanPreviewOpen(open: boolean): void;
 
-  sendPrompt(text: string, attachments?: PromptAttachment[], sessionId?: string): void;
+  /**
+   * Send or queue a prompt. Returns true when the draft was accepted
+   * (caller should clear the composer); false when blocked/duplicate.
+   */
+  sendPrompt(text: string, attachments?: PromptAttachment[], sessionId?: string): boolean;
   /**
    * Same-turn interjection (Ctrl+Enter while busy).
    * Tries `x.ai/interject`; on older CLIs pins the message at the queue head.
@@ -579,6 +728,22 @@ interface DesktopState {
   setEffort(effort: Effort): void;
   setMode(mode: AgentMode): void;
   setPermissionMode(mode: PermissionMode): void;
+  /** A1: sandbox preference (UI-only; ACP leader never injects). */
+  setSandboxPreference(preference: SandboxPreference): void;
+  /**
+   * A2: list worktrees via grok CLI.
+   * Throws on invoke/CLI failure so UI can show error (not empty).
+   */
+  listWorktrees(): Promise<WorktreeEntry[]>;
+  /** A2: create worktree via grok --worktree; does not open session on failure (I-06). */
+  createWorktree(name: string, worktreeRef?: string): Promise<WorktreeEntry | null>;
+  /**
+   * A2: bind workspace to an existing worktree path then open home.
+   * Rejects invalid paths without creating a session (I-06).
+   */
+  openWorktree(entry: WorktreeEntry): Promise<boolean>;
+  /** D: apply review preset (optional; flag-gated). Mode/permission real; sandbox pref-only. */
+  applyReviewPreset(allowEdits: boolean): void;
   setDraft(text: string): void;
   setComposerAttachments(attachments: PromptAttachment[]): void;
   setInspectorTab(tab: InspectorTab): void;
@@ -1043,12 +1208,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
         const fallbackModel = state.models.some((item) => item.id === sessionToStore.model)
           ? sessionToStore.model
           : (state.model || state.models[0]?.id || MODELS[0]?.id || "grok-build");
-        const composer = normalizeComposer(state.sessionComposers[e.session.id], {
-          model: fallbackModel,
-          effort: state.effort || "high",
-          mode: state.mode || "agent",
-          permissionMode: state.permissionMode || DEFAULT_PERMISSION_MODE,
-        });
+        // Product permission mode is global — do not restore a stale per-session mode.
+        const globalPermission = state.permissionMode || DEFAULT_PERMISSION_MODE;
+        const composer = {
+          ...normalizeComposer(state.sessionComposers[e.session.id], {
+            model: fallbackModel,
+            effort: state.effort || "high",
+            mode: state.mode || "agent",
+            permissionMode: globalPermission,
+          }),
+          permissionMode: globalPermission,
+        };
         const sessionComposers = { ...state.sessionComposers, [e.session.id]: composer };
         persistSessionComposers(sessionComposers);
 
@@ -1059,7 +1229,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         // Background full-load must NOT steal focus if the user already switched away.
         if (isActive) {
           const projects = ensureProject(get().projects, e.session.cwd, { force: true });
-          bridge.setPermissionMode(composer.permissionMode);
+          bridge.setPermissionMode(composer.permissionMode, e.session.id);
           set({
             sessions: { ...sessions, [e.session.id]: sessionToStore },
             sessionIndex: nextIndex,
@@ -1071,7 +1241,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             model: composer.model,
             effort: composer.effort,
             mode: composer.mode,
-            permissionMode: composer.permissionMode,
+            permissionMode: globalPermission,
             sessionComposers,
             ...(clearAgentBanner
               ? {
@@ -1104,6 +1274,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         withSession(e.sessionId, (s) => ({ ...s, blocks: [...s.blocks, e.block] }));
         if (e.block.type === "plan" && get().activeId === e.sessionId) {
           set({ planPreviewOpen: true, previewOpen: false });
+        }
+        // User bubble just painted (or interject) — never keep the same text in 队列.
+        if (e.block.type === "user") {
+          window.setTimeout(() => pruneQueueGhosts(e.sessionId), 0);
         }
         break;
       case "block_patch":
@@ -1140,14 +1314,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
         }, false);
         break;
       case "permission_request":
-        withSession(e.sessionId, (s) => ({
-          ...s,
-          status: "awaiting_permission",
-          blocks: [
+        withSession(e.sessionId, (s) => {
+          const blocks: SessionBlock[] = [
             ...s.blocks,
             { type: "permission", id: e.blockId, req: e.req, ts: Date.now() },
-          ],
-        }));
+          ];
+          // Do not clobber awaiting_input if a question card is still open.
+          return {
+            ...s,
+            status: statusAfterGateResolve(blocks, s.status),
+            blocks,
+          };
+        });
         if (
           (e.req.purpose === "plan" || e.blockId.startsWith("plan-approval-")) &&
           get().activeId === e.sessionId
@@ -1156,86 +1334,203 @@ export const useDesktop = create<DesktopState>((set, get) => {
         }
         break;
       case "permission_resolved":
-        withSession(e.sessionId, (s) => ({
-          ...s,
-          // Do not resurrect running after idle/error.
-          status: s.status === "awaiting_permission" ? "running" : s.status,
-          blocks: s.blocks.map((b) =>
+        withSession(e.sessionId, (s) => {
+          const blocks = s.blocks.map((b) =>
             b.id === e.blockId && b.type === "permission"
               ? { ...b, resolved: e.option }
               : b,
-          ),
-        }));
+          );
+          // Multi-tool approvals stack — only leave gate status when none remain.
+          return {
+            ...s,
+            status: statusAfterGateResolve(blocks, s.status),
+            blocks,
+          };
+        });
+        break;
+      case "permission_restored":
+        // Wire write failed after optimistic resolve — re-open the card.
+        withSession(e.sessionId, (s) => {
+          const blocks = s.blocks.map((b) =>
+            b.id === e.blockId && b.type === "permission"
+              ? { ...b, resolved: undefined }
+              : b,
+          );
+          return {
+            ...s,
+            status: statusAfterGateResolve(blocks, "awaiting_permission"),
+            blocks,
+          };
+        });
         break;
       case "question_request":
-        withSession(e.sessionId, (s) => ({
-          ...s,
-          status: "awaiting_input",
-          blocks: [
+        withSession(e.sessionId, (s) => {
+          const blocks: SessionBlock[] = [
             ...s.blocks,
             { type: "question", id: e.blockId, req: e.req, ts: Date.now() },
-          ],
-        }));
+          ];
+          return {
+            ...s,
+            status: statusAfterGateResolve(blocks, s.status),
+            blocks,
+          };
+        });
         break;
       case "question_resolved":
-        withSession(e.sessionId, (s) => ({
-          ...s,
-          status: s.status === "awaiting_input" ? "running" : s.status,
-          blocks: s.blocks.map((b) =>
+        withSession(e.sessionId, (s) => {
+          const blocks = s.blocks.map((b) =>
             b.id === e.blockId && b.type === "question"
               ? { ...b, response: e.response }
               : b,
-          ),
-        }));
+          );
+          return {
+            ...s,
+            status: statusAfterGateResolve(blocks, s.status),
+            blocks,
+          };
+        });
         break;
-      case "status":
-        withSession(e.sessionId, (s) => ({ ...s, status: e.status }));
-        if (e.status === "idle") {
-          // Drain CLI-style follow-up queue once the active turn settles.
+      case "question_restored":
+        withSession(e.sessionId, (s) => {
+          const blocks = s.blocks.map((b) =>
+            b.id === e.blockId && b.type === "question"
+              ? { ...b, response: undefined }
+              : b,
+          );
+          return {
+            ...s,
+            status: statusAfterGateResolve(blocks, "awaiting_input"),
+            blocks,
+          };
+        });
+        break;
+      case "status": {
+        // Concurrent finishTurn/enqueue may emit `running` over open gates —
+        // keep awaiting_* so Permission/Question cards stay active.
+        // `idle` still wins (Stop / turn end); side-effects use applied status.
+        let appliedStatus = e.status;
+        withSession(e.sessionId, (s) => {
+          appliedStatus = reconcileIncomingStatus(s.blocks, s.status, e.status);
+          return appliedStatus === s.status ? s : { ...s, status: appliedStatus };
+        });
+        if (appliedStatus === "idle") {
+          // Ready is authoritative: release stale sendPrompt lock so 就绪 can
+          // send/drain even while the prior session/prompt RPC is still open.
+          releasePromptFlight(e.sessionId);
           window.setTimeout(() => {
+            // Idle ⇒ CLI concurrent queue should be empty; drop server ghosts.
+            stripStaleCliQueue(e.sessionId);
             flushPendingOfflineMerge(e.sessionId);
+            // Stop-suppress is checked inside drainPromptQueue (must not only
+            // gate this path — sendPrompt finally / error also call drain).
+            if (suppressNextIdleDrain.has(e.sessionId)) {
+              const n = (get().promptQueues[e.sessionId] ?? []).length;
+              if (n > 0) {
+                set({
+                  queueNotice: {
+                    id: uid(),
+                    message: tOp(
+                      `已停止；队列仍保留 ${n} 条（不会自动发送，可清空或继续输入后发送）`,
+                      `Stopped; ${n} queue item(s) kept (will not auto-send — clear or send again)`,
+                    ),
+                    state: "blocked",
+                    at: Date.now(),
+                  },
+                });
+              }
+              return;
+            }
+            drainPromptQueue(e.sessionId);
+          }, 0);
+        } else if (
+          appliedStatus === "running" ||
+          appliedStatus === "awaiting_permission" ||
+          appliedStatus === "awaiting_input"
+        ) {
+          // Live turn — drop queue rows that duplicate the active user bubble.
+          window.setTimeout(() => pruneQueueGhosts(e.sessionId), 0);
+        }
+        break;
+      }
+      case "usage":
+        withSession(e.sessionId, (s) => ({ ...s, usage: e.usage }), false);
+        break;
+      case "error": {
+        // Defense: queue soft-fails must not force idle over a live turn.
+        // (Bridge now prefers emitSoftError for concurrent queue failures.)
+        const softQueueFail = e.message.startsWith("队列消息失败");
+        withSession(e.sessionId, (s) => {
+          const live =
+            softQueueFail &&
+            (s.status === "running" ||
+              s.status === "awaiting_permission" ||
+              s.status === "awaiting_input");
+          return {
+            ...s,
+            ...(live ? {} : { status: "idle" as const }),
+            blocks: [
+              ...s.blocks,
+              { type: "system", id: uid(), text: e.message, ts: Date.now(), kind: "error" },
+            ],
+          };
+        });
+        if (!softQueueFail) {
+          releasePromptFlight(e.sessionId);
+          // Invalidate concurrent IIFEs for this mission (agent may be dead/restarting).
+          bumpConcurrentEnqueueEpoch(e.sessionId);
+          window.setTimeout(() => {
+            // Crash/hard error: do NOT strip held (would delete follow-ups before
+            // agent_reconnected can re-home them). Re-home held → local queued so
+            // drain/reconnect can re-send; drop pure CLI ghosts only.
+            rehomeHeldQueueForRecovery(e.sessionId);
+            flushPendingOfflineMerge(e.sessionId);
+            // Respect Stop-suppress (same as status→idle).
             drainPromptQueue(e.sessionId);
           }, 0);
         }
         break;
-      case "usage":
-        withSession(e.sessionId, (s) => ({ ...s, usage: e.usage }), false);
-        break;
-      case "error":
-        withSession(e.sessionId, (s) => ({
-          ...s,
-          status: "idle",
-          blocks: [
-            ...s.blocks,
-            { type: "system", id: uid(), text: e.message, ts: Date.now(), kind: "error" },
-          ],
-        }));
-        window.setTimeout(() => {
-          flushPendingOfflineMerge(e.sessionId);
-          drainPromptQueue(e.sessionId);
-        }, 0);
-        break;
+      }
       case "agent_reconnected": {
-        // Crash recovery finished. Re-home CLI queue rows (new agent has empty
-        // server queue) and only force-idle sessions that are not mid sendPrompt
-        // IIFE — clearing in-flight while an await-ready turn is live causes dual-send.
+        // Crash recovery finished. New agent has empty server queue; old permission
+        // RPCs and in-flight IIFEs cannot complete cleanly — force-idle everything
+        // and re-home queues as local so drain can resume on the live child.
+        submittedEnqueueIds.clear();
+        consumedConcurrentIdsBySession.clear();
+        consumedConcurrentTextsBySession.clear();
+        // Reconnect is a clean slate — allow queue drain again.
+        suppressNextIdleDrain.clear();
+        // Invalidate in-flight concurrent enqueue IIFEs (pre-reconnect awaits).
+        for (const id of Object.keys(get().sessions)) {
+          bumpConcurrentEnqueueEpoch(id);
+        }
+        for (const id of Object.keys(get().promptQueues)) {
+          bumpConcurrentEnqueueEpoch(id);
+        }
+        // Sandbox is preference-only (never injected); clear any stale pending bit.
+        set({ sandboxPendingApply: false });
+        for (const id of Object.keys(get().sessions)) {
+          releasePromptFlight(id);
+        }
         const queues = get().promptQueues;
         const nextQueues: typeof queues = {};
         for (const [id, entries] of Object.entries(queues)) {
           nextQueues[id] = entries.map((entry) => ({
             ...entry,
             source: "local" as const,
-            state: entry.state === "sending" ? ("queued" as const) : entry.state,
+            // New agent never ran concurrent holds — clear heldByCli so idle drain
+            // can re-send operator text (otherwise rows stick undrainable forever).
+            heldByCli: false,
+            state:
+              entry.state === "sending" ||
+              entry.state === "interjected" ||
+              entry.heldByCli
+                ? ("queued" as const)
+                : entry.state,
           }));
         }
         const live = get().sessions;
         const next: typeof live = {};
         for (const [id, session] of Object.entries(live)) {
-          if (promptInFlightSessions.has(id)) {
-            // Live IIFE owns this session — leave status; its finally will clear.
-            next[id] = session;
-            continue;
-          }
           next[id] =
             session.status === "running" ||
             session.status === "awaiting_permission" ||
@@ -1249,7 +1544,23 @@ export const useDesktop = create<DesktopState>((set, get) => {
                       ? { ...block, resolved: "deny" as const }
                       : block.type === "question" && !block.response
                         ? { ...block, response: { outcome: "cancelled" as const } }
-                        : block,
+                        : block.type === "assistant" && block.streaming
+                          ? { ...block, streaming: false }
+                          : block.type === "thinking" && block.live
+                            ? { ...block, live: false }
+                            : block.type === "tool" &&
+                                (block.call.status === "running" ||
+                                  block.call.status === "pending" ||
+                                  block.call.status === "awaiting_permission")
+                              ? {
+                                  ...block,
+                                  call: {
+                                    ...block.call,
+                                    status: "cancelled" as const,
+                                    endedAt: Date.now(),
+                                  },
+                                }
+                              : block,
                   ),
                 }
               : session;
@@ -1257,7 +1568,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({ sessions: next, promptQueues: nextQueues });
         window.setTimeout(() => {
           for (const id of Object.keys(get().sessions)) {
-            if (promptInFlightSessions.has(id)) continue;
             flushPendingOfflineMerge(id);
             drainPromptQueue(id);
           }
@@ -1267,20 +1577,31 @@ export const useDesktop = create<DesktopState>((set, get) => {
       case "prompt_queue": {
         // CLI is authoritative for known ids, but must not wipe local-only rows
         // that have not been acknowledged yet (enqueue race with queue/changed).
+        // heldByCli wait rows must survive same-id CLI echoes (sticky receipt).
         const previous = get().promptQueues[e.sessionId] ?? [];
         const fromCli: QueuedPrompt[] = e.entries.map((entry) => {
           const prior = previous.find((item) => item.id === entry.id);
+          const held = prior?.heldByCli === true;
           return {
             id: entry.id,
             text: entry.text || prior?.text || "",
             attachments: prior?.attachments ?? entry.attachments ?? [],
             createdAt: entry.createdAt || prior?.createdAt || Date.now(),
-            state: entry.state,
+            state: held ? (prior?.state === "sending" ? "sending" : entry.state) : entry.state,
             version: entry.version ?? prior?.version ?? 0,
-            source: "cli" as const,
+            source: held ? ("local" as const) : ("cli" as const),
+            heldByCli: held || undefined,
           };
         });
-        const nextQueue = mergeCliQueueWithLocal(fromCli, previous);
+        let nextQueue = mergeCliQueueWithLocal(fromCli, previous);
+        // Drop ghosts (consumed concurrent + live user bubbles). While busy,
+        // also hide pure CLI echoes — they are not operator-pending follow-ups.
+        nextQueue = filterQueueGhosts(e.sessionId, nextQueue);
+        // Idle: never re-admit CLI-owned rows (late queue/changed after strip
+        // used to resurrect concurrent ghosts as 已入队).
+        if (!sessionIsBusy(e.sessionId)) {
+          nextQueue = stripCliOwnedEntries(nextQueue);
+        }
         set({
           promptQueues: {
             ...get().promptQueues,
@@ -1292,32 +1613,245 @@ export const useDesktop = create<DesktopState>((set, get) => {
     }
   };
 
+  /**
+   * Active-turn primary user bubble text (not mid-turn 插话).
+   * Used for duplicate-send guards when Enter-queueing the same text again.
+   */
+  const activeUserPromptText = (sessionId: string): string | null => {
+    const texts = activeTurnUserTexts(sessionId);
+    return texts[0] ?? null;
+  };
+
+  /**
+   * All user-bubble texts in the live turn (primary + interjections), oldest first.
+   * Concurrent enqueue does not always paint a user bubble — combined with
+   * consumed concurrent id/text sets this still hides text-matched ghosts.
+   */
+  const activeTurnUserTexts = (sessionId: string): string[] => {
+    const session = get().sessions[sessionId];
+    if (!session) return [];
+    if (
+      session.status !== "running" &&
+      session.status !== "awaiting_permission" &&
+      session.status !== "awaiting_input"
+    ) {
+      return [];
+    }
+    let start = -1;
+    for (let i = session.blocks.length - 1; i >= 0; i -= 1) {
+      const block = session.blocks[i];
+      if (block.type === "user" && !block.interjected) {
+        start = i;
+        break;
+      }
+    }
+    if (start < 0) return [];
+    const texts: string[] = [];
+    for (let i = start; i < session.blocks.length; i += 1) {
+      const block = session.blocks[i];
+      if (block.type === "user") {
+        const t = normalizeQueueText(block.text);
+        if (t) texts.push(t);
+      }
+    }
+    return texts;
+  };
+
+  const sessionIsBusy = (sessionId: string): boolean => {
+    const status = get().sessions[sessionId]?.status;
+    return (
+      status === "running" ||
+      status === "awaiting_permission" ||
+      status === "awaiting_input"
+    );
+  };
+
+  /** Drop ghosts: consumed concurrent (id+text), live bubbles; hide CLI while busy. */
+  const filterQueueGhosts = <T extends { id: string; text: string; source?: "local" | "cli"; state?: "queued" | "interjected" | "sending" }>(
+    sessionId: string,
+    queue: T[],
+  ): T[] => {
+    const { ids, texts } = consumedSets(sessionId);
+    if (sessionIsBusy(sessionId)) {
+      const busy = filterBusyTurnQueueEntries(queue as Array<T & { state: "queued" | "interjected" | "sending" }>, {
+        consumedIds: ids,
+        consumedTexts: texts,
+      }) as T[];
+      return filterQueueGhostsByLiveTexts(busy, activeTurnUserTexts(sessionId));
+    }
+    const afterConsumed = filterConsumedQueueEntries(queue, ids, texts);
+    return filterQueueGhostsByLiveTexts(afterConsumed, activeTurnUserTexts(sessionId));
+  };
+
+  /** Remove queue ghosts from state if any match live bubbles / consumed ids. */
+  const pruneQueueGhosts = (sessionId: string) => {
+    const queue = get().promptQueues[sessionId] ?? [];
+    const next = filterQueueGhosts(sessionId, queue);
+    if (next.length === queue.length) return;
+    for (const item of queue) {
+      if (!next.some((row) => row.id === item.id)) {
+        submittedEnqueueIds.delete(item.id);
+      }
+    }
+    set({
+      promptQueues: {
+        ...get().promptQueues,
+        [sessionId]: next,
+      },
+    });
+  };
+
+  /** Remove queue rows by id and/or normalized text (CLI may re-id the same prompt). */
+  const dropQueueRows = (sessionId: string, match: { id?: string; text?: string }) => {
+    const queue = get().promptQueues[sessionId] ?? [];
+    if (queue.length === 0) return;
+    const norm = normalizeQueueText(match.text);
+    const next = queue.filter((item) => {
+      if (match.id && item.id === match.id) return false;
+      if (norm && normalizeQueueText(item.text) === norm) return false;
+      return true;
+    });
+    if (next.length === queue.length) return;
+    for (const item of queue) {
+      if (!next.some((row) => row.id === item.id)) {
+        submittedEnqueueIds.delete(item.id);
+      }
+    }
+    set({
+      promptQueues: {
+        ...get().promptQueues,
+        [sessionId]: next,
+      },
+    });
+  };
+
+  const patchQueueEntryState = (
+    sessionId: string,
+    entryId: string,
+    state: "queued" | "interjected" | "sending",
+  ) => {
+    const queue = get().promptQueues[sessionId] ?? [];
+    if (!queue.some((item) => item.id === entryId)) return;
+    set({
+      promptQueues: {
+        ...get().promptQueues,
+        [sessionId]: queue.map((item) =>
+          item.id === entryId ? { ...item, state } : item,
+        ),
+      },
+    });
+  };
+
+  /**
+   * On healthy idle: pure CLI ghosts drop; held whose text is already a user
+   * bubble drop; held **missing** from transcript rehome → local queued so
+   * drain can send (matches "等待当前回合结束后发送"). Blind strip lost
+   * follow-ups when concurrent wire accept never painted a user bubble.
+   */
+  const stripStaleCliQueue = (sessionId: string) => {
+    const queue = get().promptQueues[sessionId] ?? [];
+    if (queue.length === 0) return;
+    const session = get().sessions[sessionId];
+    const userTexts =
+      session?.blocks
+        .filter((b): b is Extract<typeof b, { type: "user" }> => b.type === "user")
+        .map((b) => b.text) ?? [];
+    const next = settleQueueOnIdle(queue, userTexts);
+    // Rehomed held must not stay in "submitted/consumed" so drain can send.
+    for (const item of queue) {
+      if (item.source === "cli" || item.heldByCli) {
+        submittedEnqueueIds.delete(item.id);
+        const texts = consumedConcurrentTextsBySession.get(sessionId);
+        const t = normalizeQueueText(item.text);
+        if (t && texts) texts.delete(t);
+        const ids = consumedConcurrentIdsBySession.get(sessionId);
+        if (ids) ids.delete(item.id);
+      }
+    }
+    const same =
+      next.length === queue.length &&
+      next.every(
+        (row, i) =>
+          row.id === queue[i]?.id &&
+          row.heldByCli === queue[i]?.heldByCli &&
+          row.state === queue[i]?.state &&
+          row.source === queue[i]?.source,
+      );
+    if (same) return;
+    set({
+      promptQueues: {
+        ...get().promptQueues,
+        [sessionId]: next,
+      },
+    });
+  };
+
+  /**
+   * Agent fault / hard error: keep operator text, clear heldByCli so drain can
+   * re-send. Do not delete held rows (unlike stripStaleCliQueue on healthy idle —
+   * concurrent work may never have run on a dead child). Drops pure CLI ghosts.
+   */
+  const rehomeHeldQueueForRecovery = (sessionId: string) => {
+    const queue = get().promptQueues[sessionId] ?? [];
+    if (queue.length === 0) return;
+    const next = rehomeHeldQueueEntries(queue);
+    for (const item of queue) {
+      submittedEnqueueIds.delete(item.id);
+    }
+    const same =
+      next.length === queue.length &&
+      next.every(
+        (row, i) =>
+          row.id === queue[i]?.id &&
+          row.heldByCli === queue[i]?.heldByCli &&
+          row.state === queue[i]?.state &&
+          row.source === queue[i]?.source,
+      );
+    if (same) return;
+    set({
+      promptQueues: {
+        ...get().promptQueues,
+        [sessionId]: next,
+      },
+    });
+  };
+
   /** Pop and send the next *local* queued follow-up when the session is idle.
    * CLI-owned entries are executed by the agent via concurrent session/prompt. */
   const drainPromptQueue = (sessionId: string) => {
     const state = get();
     const session = state.sessions[sessionId];
     const queue = state.promptQueues[sessionId] ?? [];
-    // Idle + not mid first-send bind (status can still be idle briefly while in-flight).
+    // Ready (idle) is enough — do not wait on promptInFlightSessions. That set
+    // can lag after finishTurn while session/prompt is still awaiting; blocking
+    // drain here left 队列 stuck under a 就绪 status bar.
+    // Skip deleted missions (tombstone) and missing sessions.
     if (
       !session ||
+      offlineHistoryDeleted.has(sessionId) ||
       session.status !== "idle" ||
-      queue.length === 0 ||
-      promptInFlightSessions.has(sessionId)
+      queue.length === 0
     ) {
       return;
     }
 
-    // Prefer interjected, then first local-owned entry (see nextLocalDrainIndex).
-    const localIndex = nextLocalDrainIndex(queue);
+    // Operator Stop: park queue until they re-send or clear (all drain callers).
+    if (suppressNextIdleDrain.has(sessionId)) {
+      return;
+    }
+
+    // Prefer interjected, then first local-owned entry that is not mid concurrent
+    // write. Do NOT delete submitted/sending rows — a failed write restores them
+    // to `queued`; dropping here made follow-ups vanish permanently.
+    const localIndex = queue.findIndex(
+      (item) =>
+        item.source !== "cli" &&
+        item.state !== "sending" &&
+        !item.heldByCli &&
+        !submittedEnqueueIds.has(item.id),
+    );
     if (localIndex < 0) {
-      // Only CLI entries remain — clear sending ones the server already took.
-      const remaining = queue.filter((item) => item.state !== "sending");
-      if (remaining.length !== queue.length) {
-        set({
-          promptQueues: { ...state.promptQueues, [sessionId]: remaining },
-        });
-      }
+      // Only CLI / in-flight concurrent rows remain — leave them alone.
       return;
     }
 
@@ -1325,18 +1859,147 @@ export const useDesktop = create<DesktopState>((set, get) => {
     const rest = queue.filter((_, index) => index !== localIndex);
     set({
       promptQueues: {
-        ...state.promptQueues,
+        ...get().promptQueues,
         [sessionId]: rest,
       },
       queueNotice: {
         id: uid(),
         entryId: next.id,
-        message: next.state === "interjected" ? "正在发送插话优先消息…" : "正在发送队首消息…",
+        message:
+          next.state === "interjected"
+            ? tOp("正在发送插话优先消息…", "Sending interject-first message…")
+            : tOp("正在发送队首消息…", "Sending queue head…"),
         state: "queued",
         at: Date.now(),
       },
     });
     get().sendPrompt(next.text, next.attachments, sessionId);
+  };
+
+  /**
+   * Interject fallback when `x.ai/interject` is missing or fails:
+   * pin local queue head (state=interjected) and best-effort push to the CLI
+   * concurrent queue with sendNow so priority is not worse than plain Enter-queue.
+   */
+  const pinInterjectQueueHead = (
+    sessionId: string,
+    entry: QueuedPrompt,
+    noticeMessage: string,
+    composerBase: SessionComposerState,
+    promptOpts: { model: string; effort: Effort; mode: AgentMode },
+    attachments: PromptAttachment[],
+    trimmed: string,
+  ) => {
+    const nextComposers = {
+      ...get().sessionComposers,
+      [sessionId]: { ...composerBase, text: "", attachments: [] },
+    };
+    persistSessionComposers(nextComposers);
+    const prior = get().promptQueues[sessionId] ?? [];
+    const norm = normalizeQueueText(trimmed);
+    // Drop same id and same text so pin does not stack a duplicate follow-up.
+    set({
+      promptQueues: {
+        ...get().promptQueues,
+        [sessionId]: [
+          entry,
+          ...prior.filter(
+            (item) =>
+              item.id !== entry.id &&
+              (!norm || normalizeQueueText(item.text) !== norm),
+          ),
+        ],
+      },
+      sessionComposers: nextComposers,
+      queueNotice: {
+        id: uid(),
+        entryId: entry.id,
+        message: noticeMessage,
+        state: "interjected",
+        at: Date.now(),
+      },
+    });
+
+    // Fire-and-forget: do not block Composer "插话中…" on concurrent session/prompt.
+    // Mark before any await so idle-drain cannot dual-send this id.
+    submittedEnqueueIds.add(entry.id);
+    patchQueueEntryState(sessionId, entry.id, "sending");
+    const enqueueEpoch = currentConcurrentEnqueueEpoch(sessionId);
+    void (async () => {
+      const stale = () => currentConcurrentEnqueueEpoch(sessionId) !== enqueueEpoch;
+      try {
+        if (bridge.prepareComputerForPrompt) {
+          const cu = await bridge.prepareComputerForPrompt(sessionId, trimmed);
+          if (stale()) {
+            submittedEnqueueIds.delete(entry.id);
+            return;
+          }
+          if (cu === "refused") {
+            submittedEnqueueIds.delete(entry.id);
+            const q = get().promptQueues[sessionId] ?? [];
+            const comps = get().sessionComposers;
+            const cur = comps[sessionId] ?? composerBase;
+            const restored = {
+              ...comps,
+              [sessionId]: {
+                ...cur,
+                text: trimmed || cur.text,
+                attachments: attachments.length > 0 ? [...attachments] : cur.attachments,
+              },
+            };
+            persistSessionComposers(restored);
+            set({
+              promptQueues: {
+                ...get().promptQueues,
+                [sessionId]: q.filter((item) => item.id !== entry.id),
+              },
+              sessionComposers: restored,
+              queueNotice: {
+                id: uid(),
+                message: computerUseOptInRefuseMessage(),
+                state: "blocked",
+                at: Date.now(),
+              },
+            });
+            return;
+          }
+        }
+        if (stale()) {
+          submittedEnqueueIds.delete(entry.id);
+          return;
+        }
+        await bridge.enqueuePrompt(
+          sessionId,
+          trimmed,
+          {
+            model: promptOpts.model,
+            effort: promptOpts.effort,
+            mode: promptOpts.mode,
+            attachments,
+          },
+          { promptId: entry.id, sendNow: true },
+        );
+        if (stale()) {
+          submittedEnqueueIds.delete(entry.id);
+          return;
+        }
+        // Wire write ok — drop by id+text; mark consumed so CLI cannot resurrect.
+        submittedEnqueueIds.delete(entry.id);
+        markConsumedConcurrent(sessionId, entry.id, trimmed);
+        dropQueueRows(sessionId, { id: entry.id, text: trimmed });
+      } catch {
+        if (stale()) {
+          submittedEnqueueIds.delete(entry.id);
+          return;
+        }
+        // CLI rejected concurrency — keep local ownership; drain if already idle.
+        submittedEnqueueIds.delete(entry.id);
+        patchQueueEntryState(sessionId, entry.id, "interjected");
+        if (!sessionIsBusy(sessionId)) {
+          window.setTimeout(() => drainPromptQueue(sessionId), 0);
+        }
+      }
+    })();
   };
 
   /** Apply offline transcript deferred because a turn was in flight. */
@@ -1407,6 +2070,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
     effort: (localStorage.getItem("grok.effort") as Effort) ?? "high",
     mode: "agent",
     permissionMode: readStoredPermissionMode(),
+    sandboxPreference: readStoredSandboxPreference(),
+    sandboxPendingApply: false,
     sessionComposers: loadSessionComposers(),
     promptQueues: {},
     queueNotice: null,
@@ -1876,12 +2541,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
         const state = get();
         const has = state.sessions[id];
-        const composer = normalizeComposer(state.sessionComposers[id], {
-          model: state.model || state.models[0]?.id || MODELS[0]?.id || "grok-build",
-          effort: state.effort || "high",
-          mode: state.mode || "agent",
-          permissionMode: state.permissionMode || DEFAULT_PERMISSION_MODE,
-        });
+        const globalPermission = state.permissionMode || DEFAULT_PERMISSION_MODE;
+        const composer = {
+          ...normalizeComposer(state.sessionComposers[id], {
+            model: state.model || state.models[0]?.id || MODELS[0]?.id || "grok-build",
+            effort: state.effort || "high",
+            mode: state.mode || "agent",
+            permissionMode: globalPermission,
+          }),
+          permissionMode: globalPermission,
+        };
         const sessionComposers = { ...state.sessionComposers, [id]: composer };
         persistSessionComposers(sessionComposers);
 
@@ -1989,7 +2658,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
                 : {}),
           });
           try {
-            bridge.setPermissionMode(composer.permissionMode);
+            bridge.setPermissionMode(composer.permissionMode, id);
           } catch {
             /* ignore */
           }
@@ -2113,7 +2782,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
         const sessionComposers = { ...get().sessionComposers, [id]: composer };
         persistSessionComposers(sessionComposers);
-        bridge.setPermissionMode(composer.permissionMode);
+        bridge.setPermissionMode(composer.permissionMode, id);
         set({
           startupError: null,
           activeId: id,
@@ -2299,6 +2968,25 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     async logout() {
       await bridge.logout();
+    },
+
+    async forceReconnectAgent() {
+      if (!bridge.forceReconnectAgent) {
+        throw new Error("当前桥接不支持手动重连 Agent");
+      }
+      try {
+        await bridge.forceReconnectAgent();
+        set({
+          auth: await bridge.getAuthState(),
+          startupError: null,
+        });
+      } catch (error) {
+        set({
+          auth: await bridge.getAuthState().catch(() => get().auth),
+          startupError: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
     },
 
     async refreshAccount() {
@@ -2674,7 +3362,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
       // Tombstone first so late offline scan / in-flight openSession cannot resurrect.
       offlineHistoryDeleted.add(id);
       pendingOfflineMerge.delete(id);
-      promptInFlightSessions.delete(id);
+      releasePromptFlight(id);
+      suppressNextIdleDrain.add(id);
+      clearConsumedConcurrent(id);
+      for (const entry of get().promptQueues[id] ?? []) {
+        submittedEnqueueIds.delete(entry.id);
+      }
       cancelSaveSessionCache(id);
       // Only abort openSession if it targets this id (do not cancel opening B when deleting A).
       if (openSessionTargetId === id || get().activeId === id) {
@@ -2689,7 +3382,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           void invoke("cancel_offline_session_history").catch(() => {});
         }
       }
-      await bridge.deleteSession(id);
+      // Drop local queue *before* cancel — cancel→idle must not drain a dying mission.
       const { sessionIndex, sessions, activeId, sessionComposers, promptQueues } = get();
       const rest = { ...sessions };
       delete rest[id];
@@ -2713,6 +3406,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
               historyLoadMode: null,
               diskHistoryProgress: null,
               agentBindStartedAt: null,
+              queueNotice: null,
             }
           : get().fullHistoryLoadingId === id
             ? {
@@ -2722,6 +3416,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
               }
             : {}),
       });
+      try {
+        await bridge.deleteSession(id);
+      } finally {
+        suppressNextIdleDrain.delete(id);
+      }
     },
 
     renameSession(id, title) {
@@ -2764,10 +3463,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const { activeId, sessions, model, effort, mode, permissionMode, sessionComposers, promptQueues } = get();
       const targetId = sessionId ?? activeId;
       const session = targetId ? sessions[targetId] : null;
-      if (!session) return;
+      if (!session) return false;
 
       const trimmed = text.trim();
-      if (!trimmed && attachments.length === 0) return;
+      if (!trimmed && attachments.length === 0) return false;
 
       const composer = sessionComposers[session.id] ?? {
         text: "",
@@ -2778,33 +3477,55 @@ export const useDesktop = create<DesktopState>((set, get) => {
         permissionMode,
       };
 
-      // Waiting for plan / permission / question — keep typing, block submit.
-      if (session.status === "awaiting_permission" || session.status === "awaiting_input") {
-        const isPlan = session.blocks.some(
-          (block) =>
-            block.type === "permission" &&
-            !block.resolved &&
-            block.id.startsWith("plan-approval-"),
-        );
-        const message =
-          session.status === "awaiting_input"
-            ? "请先回答当前问题再发送"
-            : isPlan
-              ? "请先批准或拒绝当前计划再发送"
-              : "请先处理当前权限请求再发送";
-        set({
-          queueNotice: {
-            id: uid(),
-            message,
-            state: "blocked",
-            at: Date.now(),
-          },
-        });
-        return;
-      }
-
-      // Busy turn (or first-send still binding) → enqueue follow-up.
-      if (session.status !== "idle" || promptInFlightSessions.has(session.id)) {
+      // Busy / gate turn — queue follow-ups (never send as a fresh primary turn).
+      // awaiting_permission / awaiting_input used to hard-block; operators often
+      // type the next instruction while approving tools — park it in the local queue.
+      if (session.status !== "idle") {
+        const existingQueue = promptQueues[session.id] ?? [];
+        // Double-Enter / sticky key: do not stack identical follow-ups.
+        if (queueHasSameText(existingQueue, trimmed)) {
+          set({
+            queueNotice: {
+              id: uid(),
+              message: tOp("相同消息已在队列中", "Same message is already queued"),
+              state: "duplicate",
+              at: Date.now(),
+            },
+          });
+          return false;
+        }
+        // Already the live user bubble — ignore (would become a ghost 已入队 row).
+        // Both sides normalized (whitespace collapse) so prune and dedup agree.
+        const liveText = activeUserPromptText(session.id);
+        if (liveText && liveText === normalizeQueueText(trimmed)) {
+          set({
+            queueNotice: {
+              id: uid(),
+              message: tOp("该消息已在当前回合执行中", "That message is already running this turn"),
+              state: "duplicate",
+              at: Date.now(),
+            },
+          });
+          return false;
+        }
+        const consumedText = normalizeQueueText(trimmed);
+        if (
+          consumedText &&
+          consumedSets(session.id).texts?.has(consumedText)
+        ) {
+          set({
+            queueNotice: {
+              id: uid(),
+              message: tOp(
+                "该消息已提交到当前回合（并发处理中）",
+                "That message is already in flight for this turn",
+              ),
+              state: "duplicate",
+              at: Date.now(),
+            },
+          });
+          return false;
+        }
         const entry: QueuedPrompt = {
           id: uid(),
           text: trimmed,
@@ -2818,84 +3539,61 @@ export const useDesktop = create<DesktopState>((set, get) => {
           [session.id]: { ...composer, text: "", attachments: [] },
         };
         persistSessionComposers(nextComposers);
-        const depth = (promptQueues[session.id] ?? []).length + 1;
+        const depth = existingQueue.length + 1;
+        const gated =
+          session.status === "awaiting_permission" || session.status === "awaiting_input";
+        const isPlan = session.blocks.some(
+          (block) =>
+            block.type === "permission" &&
+            !block.resolved &&
+            block.id.startsWith("plan-approval-"),
+        );
+        // Busy Enter = **local queue only**, drain as primary when status→idle.
+        // Concurrent session/prompt was dropped for this path: wire accept often
+        // never painted a user bubble, idle stripped held, and the follow-up only
+        // showed up after restart via CLI history — matches operator reports.
+        // (Ctrl+Enter 插话 still uses concurrent / interject RPC.)
+        const gateHint = gated
+          ? session.status === "awaiting_input"
+            ? tOp(
+                "（回答问题后，回合空闲将发送；Stop 后需手动继续）",
+                " (sends when idle after you answer; after Stop, resume manually)",
+              )
+            : isPlan
+              ? tOp(
+                  "（批准/拒绝计划后，回合空闲将发送；Stop 后需手动继续）",
+                  " (sends when idle after plan resolve; after Stop, resume manually)",
+                )
+              : tOp(
+                  "（处理权限后，回合空闲将发送；Stop 后需手动继续）",
+                  " (sends when idle after permission; after Stop, resume manually)",
+                )
+          : tOp(
+              "（当前回合结束后自动发送；Stop 后需手动继续）",
+              " (sends when this turn ends; after Stop, resume manually)",
+            );
         set({
           promptQueues: {
             ...promptQueues,
-            [session.id]: [...(promptQueues[session.id] ?? []), entry],
+            [session.id]: [...existingQueue, entry],
           },
           sessionComposers: nextComposers,
           queueNotice: {
             id: uid(),
             entryId: entry.id,
-            message: `已加入队列（第 ${depth} 条）`,
+            message: tOp(
+              `已加入队列（第 ${depth} 条）${gateHint}`,
+              `Queued (#${depth})${gateHint}`,
+            ),
             state: "queued",
             at: Date.now(),
           },
         });
-
-        // CU ensure on concurrent queue (same refuse/attach policy as promptInner).
-        void (async () => {
-          if (bridge.prepareComputerForPrompt) {
-            const cu = await bridge.prepareComputerForPrompt(session.id, trimmed);
-            if (cu === "refused") {
-              // Drop the queue entry and restore the draft — queue path already
-              // cleared sessionComposers; losing the text on CU refuse is a UX bug.
-              const q = get().promptQueues[session.id] ?? [];
-              const comps = get().sessionComposers;
-              const cur = comps[session.id] ?? composer;
-              const restored = {
-                ...comps,
-                [session.id]: {
-                  ...cur,
-                  text: trimmed || cur.text,
-                  attachments: attachments.length > 0 ? [...attachments] : cur.attachments,
-                },
-              };
-              persistSessionComposers(restored);
-              set({
-                promptQueues: {
-                  ...get().promptQueues,
-                  [session.id]: q.filter((item) => item.id !== entry.id),
-                },
-                sessionComposers: restored,
-                queueNotice: {
-                  id: uid(),
-                  message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
-                  state: "blocked",
-                  at: Date.now(),
-                },
-              });
-              return;
-            }
-          }
-          try {
-            await bridge.enqueuePrompt(
-              session.id,
-              trimmed,
-              {
-                model: composer.model,
-                effort: composer.effort,
-                mode: composer.mode,
-                attachments,
-              },
-              { promptId: entry.id },
-            );
-            const current = get().promptQueues[session.id] ?? [];
-            if (!current.some((item) => item.id === entry.id)) return;
-            set({
-              promptQueues: {
-                ...get().promptQueues,
-                [session.id]: current.map((item) =>
-                  item.id === entry.id ? { ...item, source: "cli" as const } : item,
-                ),
-              },
-            });
-          } catch {
-            // CLI rejected — keep local ownership and drain on idle.
-          }
-        })();
-        return;
+        // If somehow already idle (race), drain immediately.
+        if (!sessionIsBusy(session.id)) {
+          window.setTimeout(() => drainPromptQueue(session.id), 0);
+        }
+        return true;
       }
 
       const titleText = trimmed || attachments.map((attachment) => attachment.name).join(", ");
@@ -2906,27 +3604,40 @@ export const useDesktop = create<DesktopState>((set, get) => {
       );
       persistSessionCatalog(nextIndex);
 
+      // Operator is actively continuing — allow queue drain after this turn ends,
+      // and reset concurrent-consumed fingerprints for a fresh primary turn.
+      suppressNextIdleDrain.delete(session.id);
+      clearConsumedConcurrent(session.id);
+
       // Claim the in-flight slot before any await/set so double-click cannot dual-paint.
-      if (promptInFlightSessions.has(session.id)) return;
-      promptInFlightSessions.add(session.id);
+      // If a prior flight was left after status→idle, release it so Ready can send.
+      if (promptInFlightSessions.has(session.id)) {
+        releasePromptFlight(session.id);
+      }
+      const flightGen = beginPromptFlight(session.id);
+      const userBlockId = uid();
 
       const nextComposers = {
         ...sessionComposers,
         [session.id]: { ...composer, text: "", attachments: [] },
       };
       persistSessionComposers(nextComposers);
+      // Paint the user bubble immediately, but keep status as-is until bind/prompt
+      // actually starts streaming — avoids a long fake "0 条事件" during silent bind.
+      const needsBind = !bridge.isSessionBound?.(session.id);
       set({
         sessions: {
           ...sessions,
           [session.id]: {
             ...session,
             title: session.title === "Untitled mission" ? titleText.slice(0, 56) : session.title,
-            status: "running",
+            // Bound sessions go running now; unbound show running only after bind (below).
+            status: needsBind ? session.status : "running",
             blocks: [
               ...session.blocks,
               {
                 type: "user",
-                id: uid(),
+                id: userBlockId,
                 text: trimmed,
                 attachments: attachments.map(({ id, kind, name, mime, size, data, path }) => ({
                   id,
@@ -2946,8 +3657,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         sessionIndex: nextIndex,
         sessionComposers: nextComposers,
       });
+      // Live bubble is authoritative — never keep the same text in 队列.
+      pruneQueueGhosts(session.id);
 
-      bridge.setPermissionMode(composer.permissionMode);
+      bridge.setPermissionMode(composer.permissionMode, session.id);
       // Bind agent only when the user actually continues the chat (first send).
       // Opening/switching never does session/load — that was the freeze source.
       void (async () => {
@@ -2962,8 +3675,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
             });
           }
         };
+        const markRunning = () => {
+          const cur = get().sessions[session.id];
+          if (!cur || cur.status === "running") return;
+          set({
+            sessions: {
+              ...get().sessions,
+              [session.id]: { ...cur, status: "running" },
+            },
+          });
+        };
         try {
-          if (!bridge.isSessionBound?.(session.id)) {
+          if (needsBind) {
             set({
               fullHistoryLoadingId: session.id,
               historyLoadMode: "agent",
@@ -2982,6 +3705,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
             // Only clear if this session still owns the agent banner (not B's disk scan).
             clearAgentBannerIfOurs();
           }
+          // Stop during silent bind: do NOT start session/prompt (zombie turn).
+          if (isPromptFlightCancelled(session.id, flightGen)) {
+            clearAgentBannerIfOurs();
+            return;
+          }
+          if (offlineHistoryDeleted.has(session.id) || !get().sessions[session.id]) {
+            return;
+          }
+          // Bind done (or already bound) — now show working chrome before wire write.
+          markRunning();
           // Always prompt the mission that initiated the send — switching the UI
           // mid-bind must not orphan the already-painted user message.
           await bridge.prompt(session.id, trimmed, {
@@ -2991,6 +3724,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
             attachments,
           });
         } catch (error) {
+          // Cancelled / superseded mid-bind — do not restore draft over a Stop.
+          if (isPromptFlightCancelled(session.id, flightGen)) {
+            clearAgentBannerIfOurs();
+            return;
+          }
           const s = get();
           // Never resurrect a deleted mission from a late prompt failure.
           if (offlineHistoryDeleted.has(session.id) || !s.sessions[session.id]) {
@@ -3049,18 +3787,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
             },
           });
         } finally {
-          promptInFlightSessions.delete(session.id);
+          const cancelled = isPromptFlightCancelled(session.id, flightGen);
+          endPromptFlight(session.id, flightGen);
           flushPendingOfflineMerge(session.id);
-          // R15: if agent_reconnected skipped drain while we were in-flight,
-          // pick up local queue once this turn fully ends.
-          window.setTimeout(() => drainPromptQueue(session.id), 0);
+          // Cancelled flights must not auto-drain (Stop suppress + zombie finally).
+          if (!cancelled) {
+            window.setTimeout(() => drainPromptQueue(session.id), 0);
+          }
         }
       })();
+      return true;
     },
 
     async interjectPrompt(text, attachments = [], sessionId) {
-      const { activeId, sessions, model, effort, mode, permissionMode, sessionComposers, promptQueues } =
-        get();
+      const { activeId, sessions, model, effort, mode, permissionMode, sessionComposers } = get();
       const targetId = sessionId ?? activeId;
       const session = targetId ? sessions[targetId] : null;
       if (!session) return false;
@@ -3074,9 +3814,44 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
 
       if (session.status === "awaiting_permission" || session.status === "awaiting_input") {
-        // Gate only — sendPrompt posts a notice and does not accept the draft.
-        // Return false so callers (Composer) do not clear the composer text.
-        get().sendPrompt(trimmed, attachments, session.id);
+        // Gate: park as local queue (sendPrompt accepts and clears sessionComposers).
+        // Propagate the boolean so callers clear the composer draft on accept.
+        return get().sendPrompt(trimmed, attachments, session.id);
+      }
+
+      // Dedup before wire: same text already queued / live / concurrent-consumed
+      // must not double-send via interject + enqueue.
+      const norm = normalizeQueueText(trimmed);
+      const existingQueue = get().promptQueues[session.id] ?? [];
+      if (queueHasSameText(existingQueue, trimmed)) {
+        dropQueueRows(session.id, { text: trimmed });
+      }
+      if (
+        norm &&
+        activeTurnUserTexts(session.id).some((t) => normalizeQueueText(t) === norm)
+      ) {
+        set({
+          queueNotice: {
+            id: uid(),
+            message: tOp("该消息已在当前回合执行中", "That message is already running this turn"),
+            state: "duplicate",
+            at: Date.now(),
+          },
+        });
+        return false;
+      }
+      if (norm && consumedSets(session.id).texts?.has(norm)) {
+        set({
+          queueNotice: {
+            id: uid(),
+            message: tOp(
+              "该消息已提交到当前回合（并发处理中）",
+              "That message is already in flight for this turn",
+            ),
+            state: "duplicate",
+            at: Date.now(),
+          },
+        });
         return false;
       }
 
@@ -3111,37 +3886,38 @@ export const useDesktop = create<DesktopState>((set, get) => {
           return false;
         }
 
+        if (result.fallback || result.state === "queued_head") {
+          // Older CLI: no mid-turn RPC — pin head + concurrent session/prompt sendNow.
+          pinInterjectQueueHead(
+            session.id,
+            {
+              id: result.entryId ?? uid(),
+              text: trimmed,
+              attachments: [...attachments],
+              createdAt: Date.now(),
+              state: "interjected",
+              source: "local",
+            },
+            result.message,
+            composer,
+            {
+              model: composer.model,
+              effort: composer.effort,
+              mode: composer.mode,
+            },
+            attachments,
+            trimmed,
+          );
+          return true;
+        }
+
+        // True mid-turn interject accepted — clear draft; user bubble already emitted by bridge.
+        // Drop any queue row with the same text (queued then interjected) and re-prune CLI ghosts.
         const nextComposers = {
           ...sessionComposers,
           [session.id]: { ...composer, text: "", attachments: [] },
         };
         persistSessionComposers(nextComposers);
-
-        if (result.fallback || result.state === "queued_head") {
-          const entry: QueuedPrompt = {
-            id: result.entryId ?? uid(),
-            text: trimmed,
-            attachments: [...attachments],
-            createdAt: Date.now(),
-            state: "interjected",
-          };
-          set({
-            promptQueues: {
-              ...promptQueues,
-              [session.id]: [entry, ...(promptQueues[session.id] ?? [])],
-            },
-            sessionComposers: nextComposers,
-            queueNotice: {
-              id: uid(),
-              entryId: entry.id,
-              message: result.message,
-              state: "interjected",
-              at: Date.now(),
-            },
-          });
-          return true;
-        }
-
         set({
           sessionComposers: nextComposers,
           queueNotice: {
@@ -3152,39 +3928,31 @@ export const useDesktop = create<DesktopState>((set, get) => {
             at: Date.now(),
           },
         });
+        dropQueueRows(session.id, { text: trimmed });
+        window.setTimeout(() => pruneQueueGhosts(session.id), 0);
         return true;
       } catch (error) {
-        // Hard failure — still pin to queue head so the operator does not lose text.
-        const entry: QueuedPrompt = {
-          id: uid(),
-          text: trimmed,
-          attachments: [...attachments],
-          createdAt: Date.now(),
-          state: "interjected",
-        };
-        const nextComposers = {
-          ...get().sessionComposers,
-          [session.id]: {
-            ...(get().sessionComposers[session.id] ?? composer),
-            text: "",
-            attachments: [],
-          },
-        };
-        persistSessionComposers(nextComposers);
-        set({
-          promptQueues: {
-            ...get().promptQueues,
-            [session.id]: [entry, ...(get().promptQueues[session.id] ?? [])],
-          },
-          sessionComposers: nextComposers,
-          queueNotice: {
+        // Hard failure — pin head + try CLI sendNow so text is never lost mid-turn.
+        pinInterjectQueueHead(
+          session.id,
+          {
             id: uid(),
-            entryId: entry.id,
-            message: `插话失败，已降级为队首：${error instanceof Error ? error.message : String(error)}`,
+            text: trimmed,
+            attachments: [...attachments],
+            createdAt: Date.now(),
             state: "interjected",
-            at: Date.now(),
+            source: "local",
           },
-        });
+          `插话失败，已降级为队首：${error instanceof Error ? error.message : String(error)}`,
+          get().sessionComposers[session.id] ?? composer,
+          {
+            model: composer.model,
+            effort: composer.effort,
+            mode: composer.mode,
+          },
+          attachments,
+          trimmed,
+        );
         return true;
       }
     },
@@ -3201,7 +3969,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         queueNotice: {
           id: uid(),
           entryId: queueId,
-          message: "队列消息已移除",
+          message: tOp("队列消息已移除", "Removed from queue"),
           state: "removed",
           at: Date.now(),
         },
@@ -3224,22 +3992,30 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const [item] = next.splice(fromIndex, 1);
       if (!item) return;
       next.splice(toIndex, 0, item);
+      // Drag makes array order authoritative — demote interject flags so drain
+      // does not surprise the operator by skipping a row they placed first.
+      const normalized = next.map((entry) =>
+        entry.state === "interjected" ? { ...entry, state: "queued" as const } : entry,
+      );
       set({
         promptQueues: {
           ...get().promptQueues,
-          [sessionId]: next,
+          [sessionId]: normalized,
         },
         queueNotice: {
           id: uid(),
           entryId: item.id,
-          message: `已调整到第 ${toIndex + 1} 位`,
+          message: tOp(
+            `已调整到第 ${toIndex + 1} 位`,
+            `Moved to position ${toIndex + 1}`,
+          ),
           state: "reordered",
           at: Date.now(),
         },
       });
       void bridge.reorderQueuedPrompt(
         sessionId,
-        next.map((entry) => entry.id),
+        normalized.map((entry) => entry.id),
       );
     },
 
@@ -3247,6 +4023,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const id = sessionId ?? get().activeId;
       if (!id) return;
       const had = (get().promptQueues[id] ?? []).length > 0;
+      // Clearing queue also drops any stop-suppress so a later idle is clean.
+      suppressNextIdleDrain.delete(id);
+      for (const entry of get().promptQueues[id] ?? []) {
+        submittedEnqueueIds.delete(entry.id);
+      }
       set({
         promptQueues: {
           ...get().promptQueues,
@@ -3256,7 +4037,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           ? {
               queueNotice: {
                 id: uid(),
-                message: "等待队列已清空",
+                message: tOp("等待队列已清空", "Queue cleared"),
                 state: "cleared" as const,
                 at: Date.now(),
               },
@@ -3282,7 +4063,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         queueNotice: {
           id: uid(),
           entryId: queueId,
-          message: "已置顶；回合结束后将优先发送",
+          message: tOp(
+            "已置顶；回合结束后将优先发送",
+            "Pinned; will send first when this turn ends",
+          ),
           state: "interjected",
           at: Date.now(),
         },
@@ -3308,7 +4092,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         queueNotice: {
           id: uid(),
           entryId: queueId,
-          message: "编辑已提交，等待 CLI 确认",
+          message: tOp("编辑已提交，等待 CLI 确认", "Edit submitted; waiting for CLI"),
           state: "updated",
           at: Date.now(),
         },
@@ -3322,7 +4106,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     stop() {
       const { activeId } = get();
-      if (activeId) bridge.cancel(activeId);
+      if (!activeId) return;
+      // Cancel invalidates any concurrent enqueue bookkeeping for this mission.
+      bumpConcurrentEnqueueEpoch(activeId);
+      for (const entry of get().promptQueues[activeId] ?? []) {
+        submittedEnqueueIds.delete(entry.id);
+      }
+      releasePromptFlight(activeId);
+      // Park queue: cancel→idle must not immediately drain the next follow-up.
+      suppressNextIdleDrain.add(activeId);
+      bridge.cancel(activeId);
     },
 
     compact() {
@@ -3457,7 +4250,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({
           queueNotice: {
             id: uid(),
-            message: "该请求已处理，未重复提交",
+            message: tOp("该请求已处理，未重复提交", "Already handled; not submitted again"),
             state: "duplicate",
             at: Date.now(),
           },
@@ -3469,7 +4262,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({
           queueNotice: {
             id: uid(),
-            message: result.message ?? "该请求已处理，未重复提交",
+            message:
+              result.message ??
+              tOp("该请求已处理，未重复提交", "Already handled; not submitted again"),
             state: "duplicate",
             at: Date.now(),
           },
@@ -3490,9 +4285,15 @@ export const useDesktop = create<DesktopState>((set, get) => {
             message:
               option === "deny"
                 ? feedback?.trim()
-                  ? "已发送计划修改要求，原回合将继续规划"
-                  : "计划已拒绝，原回合将继续规划"
-                : "计划已批准，原回合将继续执行（未额外发送消息）",
+                  ? tOp(
+                      "已发送计划修改要求，原回合将继续规划",
+                      "Plan revision sent; the turn continues planning",
+                    )
+                  : tOp("计划已拒绝，原回合将继续规划", "Plan denied; the turn continues planning")
+                : tOp(
+                    "计划已批准，原回合将继续执行（未额外发送消息）",
+                    "Plan approved; the turn continues (no extra message sent)",
+                  ),
             state: "queued",
             at: Date.now(),
           },
@@ -3535,15 +4336,231 @@ export const useDesktop = create<DesktopState>((set, get) => {
       });
     },
     setPermissionMode: (permissionMode) => {
-      const { activeId, sessionComposers, model, effort, mode } = get();
+      // Product preference is global: update default + every session composer so
+      // Settings/Home do not fight stale per-session modes, and background turns
+      // do not keep a previous Bypass after the operator switches to Default.
+      const { sessionComposers, sessions, model, effort, mode } = get();
       localStorage.setItem("grok.permissionMode", permissionMode);
       bridge.setPermissionMode(permissionMode);
-      if (!activeId) return set({ permissionMode });
-      const current = sessionComposers[activeId] ?? { text: "", attachments: [], model, effort, mode, permissionMode };
-      const next = { ...sessionComposers, [activeId]: { ...current, permissionMode } };
+      const next = { ...sessionComposers };
+      const ids = new Set([...Object.keys(sessions), ...Object.keys(sessionComposers)]);
+      for (const id of ids) {
+        const current = next[id] ?? {
+          text: "",
+          attachments: [],
+          model,
+          effort,
+          mode,
+          permissionMode,
+        };
+        next[id] = { ...current, permissionMode };
+        bridge.setPermissionMode(permissionMode, id);
+      }
       persistSessionComposers(next);
       set({ permissionMode, sessionComposers: next });
     },
+
+    setSandboxPreference(preference) {
+      const previous = get().sandboxPreference;
+      writeStoredSandboxPreference(preference);
+      const anyBusy = Object.values(get().sessions).some(
+        (session) =>
+          session.status === "running" || session.status === "awaiting_permission",
+      );
+      const action = shouldRestartAgentForSandbox(
+        anyBusy,
+        isFeatureEnabled("sandboxUi"),
+        previous,
+        preference,
+      );
+      if (action === "defer_busy") {
+        // Preference is UI + future wiring only — ACP leader does not inject
+        // --sandbox (see sandboxSpawnArg). No reconnect required; clear pending.
+        set({
+          sandboxPreference: preference,
+          sandboxPendingApply: false,
+          queueNotice: {
+            id: uid(),
+            message:
+              preference === "follow_cli"
+                ? tOp(
+                    "沙箱：跟随 CLI（桌面 Agent 不注入 sandbox）",
+                    "Sandbox: follow CLI (desktop agent does not inject)",
+                  )
+                : tOp(
+                    `沙箱偏好已保存为「${preference}」— 桌面 Agent 主进程暂不注入（避免阻断模型 API）；工具隔离仍由 CLI 处理`,
+                    `Sandbox preference saved as “${preference}” — not injected into agent leader (avoids model API 403); tool isolation stays CLI-side`,
+                  ),
+            state: "queued",
+            at: Date.now(),
+          },
+        });
+        return;
+      }
+      // noop (same value or flag off)
+      set({ sandboxPreference: preference, sandboxPendingApply: false });
+    },
+
+    async listWorktrees() {
+      if (!isFeatureEnabled("worktreeUi")) return [];
+      if (bridge.kind !== "acp") {
+        throw new Error(
+          tOp(
+            "worktree 不可用（非 ACP 桥接）",
+            "Worktree unavailable (non-ACP bridge)",
+          ),
+        );
+      }
+      // Let invoke errors propagate so the panel can show status "error"
+      // (returning [] collapsed failures into "empty").
+      const raw = await invoke<unknown>("grok_worktree_list", { cwd: get().workspace });
+      return parseWorktreeList(raw);
+    },
+
+    async createWorktree(name, worktreeRef) {
+      if (!isFeatureEnabled("worktreeUi") || bridge.kind !== "acp") return null;
+      try {
+        const result = await invoke<{
+          ok?: boolean;
+          list?: unknown;
+          name?: string;
+          stderr?: string;
+          stdout?: string;
+        }>("grok_worktree_create", {
+          cwd: get().workspace,
+          name,
+          worktreeRef: worktreeRef ?? null,
+        });
+        // Require explicit CLI success — missing ok or false must not false-succeed.
+        if (result?.ok !== true) {
+          const detail =
+            (typeof result.stderr === "string" && result.stderr.trim()) ||
+            (typeof result.stdout === "string" && result.stdout.trim()) ||
+            tOp("创建 worktree 失败", "Create worktree failed");
+          set({
+            queueNotice: {
+              id: uid(),
+              message: detail,
+              state: "blocked",
+              at: Date.now(),
+            },
+          });
+          return null;
+        }
+        const entries = parseWorktreeList(result?.list);
+        // Exact name/id only — path.includes(name) false-matched e.g. feat ⊂ feature-old.
+        const match =
+          entries.find((entry) => entry.name === name || entry.id === name) ?? null;
+        if (!match) {
+          set({
+            queueNotice: {
+              id: uid(),
+              message: tOp(
+                "worktree 已请求创建，但未能解析路径（未打开会话）",
+                "Worktree create requested but path could not be resolved (no session opened)",
+              ),
+              state: "blocked",
+              at: Date.now(),
+            },
+          });
+          return null;
+        }
+        // I-06: validate path before any session open.
+        try {
+          await invoke<string>("validate_workspace", { cwd: match.path });
+        } catch (error) {
+          set({
+            queueNotice: {
+              id: uid(),
+              message:
+                error instanceof Error
+                  ? error.message
+                  : tOp("worktree 路径无效，未创建会话", "Invalid worktree path; no session created"),
+              state: "blocked",
+              at: Date.now(),
+            },
+          });
+          return null;
+        }
+        return match;
+      } catch (error) {
+        set({
+          queueNotice: {
+            id: uid(),
+            message: error instanceof Error ? error.message : String(error),
+            state: "blocked",
+            at: Date.now(),
+          },
+        });
+        return null;
+      }
+    },
+
+    async openWorktree(entry) {
+      if (!isFeatureEnabled("worktreeUi")) return false;
+      // Structural check only — existence is proven by validate_workspace (I-06).
+      if (!entry?.path?.trim()) {
+        set({
+          queueNotice: {
+            id: uid(),
+            message: tOp("无效的 worktree 条目", "Invalid worktree entry"),
+            state: "blocked",
+            at: Date.now(),
+          },
+        });
+        return false;
+      }
+      try {
+        const validated = await invoke<string>("validate_workspace", { cwd: entry.path.trim() });
+        // setWorkspace focuses home; does not auto-create a mission session.
+        await get().setWorkspace(validated);
+        return true;
+      } catch (error) {
+        set({
+          queueNotice: {
+            id: uid(),
+            message:
+              error instanceof Error
+                ? error.message
+                : tOp(
+                    "无法打开 worktree（未创建无效会话）",
+                    "Could not open worktree (no invalid session created)",
+                  ),
+            state: "blocked",
+            at: Date.now(),
+          },
+        });
+        return false;
+      }
+    },
+
+    applyReviewPreset(allowEdits) {
+      if (!isFeatureEnabled("reviewMode")) return;
+      const preset = reviewPreset(allowEdits);
+      get().setMode(preset.mode);
+      get().setPermissionMode(preset.permissionMode);
+      // Sandbox preference is UI-only (not injected into agent leader).
+      if (isFeatureEnabled("sandboxUi")) {
+        get().setSandboxPreference(preset.sandboxPreference);
+      }
+      set({
+        queueNotice: {
+          id: uid(),
+          message: allowEdits
+            ? tOp(
+                "已应用 Review 预设（允许修改）：模式/权限已生效；沙箱偏好仅存储不注入",
+                "Review preset applied (allow edits): mode/permission live; sandbox preference stored only",
+              )
+            : tOp(
+                "已应用 Review 预设（模式/权限偏只读确认）；沙箱偏好仅存储不注入",
+                "Review preset applied (mode/permission lean read-only ask); sandbox preference stored only",
+              ),
+          state: "queued",
+          at: Date.now(),
+        },
+      });
+    },
+
     setDraft(text) {
       const { activeId, sessionComposers, model, effort, mode, permissionMode } = get();
       if (!activeId) return;

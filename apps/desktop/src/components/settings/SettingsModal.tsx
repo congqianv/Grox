@@ -8,6 +8,14 @@ import {
   setComputerUseHostEnvEnabled,
   setComputerUseOperatorEnabled,
 } from "../../lib/computerUse";
+import {
+  FEATURE_FLAG_KEYS,
+  type FeatureFlagKey,
+  readFeatureFlags,
+  setFeatureFlag,
+} from "../../lib/featureFlags";
+import type { SandboxPreference } from "../../lib/sandboxPolicy";
+import { useIsFeatureEnabled } from "../../lib/useFeatureFlags";
 import { useDesktop } from "../../state/store";
 import { usePreferences } from "../../state/preferences";
 import { useI18n } from "../../lib/i18n";
@@ -189,11 +197,265 @@ function General() {
     <Row label={zh ? "Grok Build 运行时" : "Grok Build runtime"} hint={runtime?.path}><div className="flex items-center gap-2"><span className="chip">{runtimeSource}</span><ActionButton disabled={runtimeBusy} onClick={() => void refreshRuntime()}>{zh ? "重新检测" : "Detect"}</ActionButton>{runtime && runtime.source !== "override" && <ActionButton tone="accent" disabled={runtimeBusy} onClick={() => { setRuntimeError(""); void installOfficialRuntime().catch((cause) => setRuntimeError(cause instanceof Error ? cause.message : String(cause))); }}>{runtimeBusy ? (zh ? "打开安装说明" : "Open install docs") : runtime.systemPath ? (zh ? "打开官方安装说明" : "Open official install docs") : (zh ? "打开官方安装说明" : "Open official install docs")}</ActionButton>}</div></Row>
     {runtime && <Row label={zh ? "版本来源" : "Version provenance"} hint={zh ? "Lite 壳使用本机 Grok CLI；此处显示 CLI 版本与桌面壳提交。" : "Lite shell uses the system Grok CLI; shows CLI version and desktop shell commit."}><div className="max-w-[440px] space-y-1 text-right font-mono text-[9px] text-dim"><p className="truncate" title={runtime.version}>{runtime.version ?? (zh ? "无法读取 CLI 版本" : "CLI version unavailable")}</p><p className="truncate" title={runtime.groxCommit}>CLI · {runtime.source}　{zh ? "壳" : "SHELL"} · {runtime.groxCommit}</p></div></Row>}
     {runtimeError && <p className="mb-4 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{runtimeError}</p>}
+    <AgentLeaderModeRow zh={zh} bridgeKind={bridgeKind} />
     <Row label={zh ? "推理强度" : "Reasoning effort"}><div className="flex gap-1">{EFFORTS.map((item) => <button key={item} onClick={() => setEffort(item)} className={`h-7 rounded-[3px] border px-2 font-mono text-[9.5px] ${effort === item ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim"}`}>{item.toUpperCase()}</button>)}</div></Row>
-    <Row label={zh ? "权限模式" : "Permission mode"} hint={zh ? "默认 Auto：按 Agent 策略少弹批。Default 每次工具都确认；Bypass 仅用于可信环境。" : "Default is Auto (fewer prompts). Default mode confirms every tool; Bypass is for trusted environments only."}><select value={permission} onChange={(event) => setPermission(event.target.value as typeof permission)} className="h-8 rounded-[4px] border border-line2 bg-void px-2 font-mono text-[9.5px] text-fg2"><option value="auto">AUTO（默认）</option><option value="default">DEFAULT</option><option value="bypass">BYPASS / YOLO</option></select></Row>
+    <Row label={zh ? "权限模式" : "Permission mode"} hint={zh ? "Auto（默认）：读/搜/浏览/LSP 等少弹批，执行/写入/子代理仍确认。Default：每次工具都确认。Bypass/YOLO：工具自动批准（计划与提问仍要确认；仅可信环境）。Computer Use 在设置开启后单独自动过，不重复卡。" : "Auto (default): auto-allow read/search/browse/LSP; still confirm execute/write/subagents. Default: confirm every tool. Bypass/YOLO: auto-allow tools (plan & questions still need confirm; trusted envs only). Computer Use with opt-in auto-allows CU tools separately."}><select value={permission} onChange={(event) => setPermission(event.target.value as typeof permission)} className="h-8 rounded-[4px] border border-line2 bg-void px-2 font-mono text-[9.5px] text-fg2"><option value="auto">AUTO（默认）</option><option value="default">DEFAULT</option><option value="bypass">BYPASS / YOLO</option></select></Row>
+    <SandboxPreferenceRow zh={zh} />
     <SupportDiagnostics zh={zh} bridgeKind={bridgeKind} />
+    <CiExamplesCopy zh={zh} />
     <ComputerUseOptIn zh={zh} />
+    <FeatureFlagsPanel zh={zh} />
   </div>;
+}
+
+const CI_SNIPPET = `# Headless CI fragment (see apps/desktop/docs/examples/)
+grok -p "Summarize README in 5 bullets. Do not edit files." --permission-mode default
+# Optional inspect:
+# grok inspect --json
+`;
+
+function CiExamplesCopy({ zh }: { zh: boolean }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="mt-5 border-t border-line pt-4">
+      <Heading
+        title={zh ? "CI 示例（零运行时）" : "CI examples (zero runtime)"}
+        description={
+          zh
+            ? "文档在 apps/desktop/docs/examples/。复制片段到流水线；不改变桌面 spawn 行为。"
+            : "Docs live under apps/desktop/docs/examples/. Copy into pipelines; does not change desktop spawn."
+        }
+      />
+      <Row
+        label={zh ? "复制 headless 片段" : "Copy headless snippet"}
+        hint={zh ? "含 grok -p 与默认 permission" : "Includes grok -p and default permission"}
+      >
+        <ActionButton
+          onClick={() => {
+            void navigator.clipboard?.writeText(CI_SNIPPET).then(() => {
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1600);
+            });
+          }}
+        >
+          {copied ? (zh ? "已复制" : "Copied") : zh ? "复制" : "Copy"}
+        </ActionButton>
+      </Row>
+    </div>
+  );
+}
+
+function SandboxPreferenceRow({ zh }: { zh: boolean }) {
+  const preference = useDesktop((s) => s.sandboxPreference);
+  const setSandboxPreference = useDesktop((s) => s.setSandboxPreference);
+  const sandboxUi = useIsFeatureEnabled("sandboxUi");
+  if (!sandboxUi) return null;
+  return (
+    <Row
+      label={zh ? "沙箱配置" : "Sandbox"}
+      hint={
+        zh
+          ? "默认跟随 CLI。工作区/只读偏好会保存，但桌面 Agent 主进程暂不注入 --sandbox（避免模型 API 403）。工具隔离仍由 CLI 处理。"
+          : "Default follows CLI. Workspace/read-only is stored but not injected into the desktop agent leader (avoids model API 403). Tool isolation stays CLI-internal."
+      }
+    >
+      <div className="flex flex-col items-end gap-1">
+        <select
+          value={preference}
+          onChange={(event) => setSandboxPreference(event.target.value as SandboxPreference)}
+          className="h-8 rounded-[4px] border border-line2 bg-void px-2 font-mono text-[9.5px] text-fg2"
+        >
+          <option value="follow_cli">{zh ? "跟随 CLI（默认）" : "Follow CLI (default)"}</option>
+          <option value="workspace">{zh ? "工作区 workspace" : "workspace"}</option>
+          <option value="read_only">{zh ? "只读 read-only" : "read-only"}</option>
+          <option value="off">{zh ? "关闭 off（警告）" : "off (warn)"}</option>
+        </select>
+        {preference !== "follow_cli" && (
+          <span className="text-[10px] text-gold">
+            {zh ? "仅存储偏好 · 不注入 Agent" : "Preference only · not injected"}
+          </span>
+        )}
+      </div>
+    </Row>
+  );
+}
+
+const FEATURE_FLAG_LABELS: Record<FeatureFlagKey, { zh: string; en: string; hintZh: string; hintEn: string }> = {
+  effectivePanel: {
+    zh: "生效状态面板",
+    en: "Effective runtime panel",
+    hintZh: "环境摘要中显示 requested/applied（inspect 失败降级，不假装已隔离）",
+    hintEn: "Show requested/applied in environment summary (inspect degrades; no fake isolation)",
+  },
+  sandboxUi: {
+    zh: "沙箱选择 UI（A1）",
+    en: "Sandbox selector UI (A1)",
+    hintZh: "仅开关沙箱偏好 UI；桌面 Agent 主进程无论开关均不注入 --sandbox / GROK_SANDBOX",
+    hintEn: "Toggles sandbox preference UI only; desktop agent never injects --sandbox / GROK_SANDBOX either way",
+  },
+  worktreeUi: {
+    zh: "Worktree UI（A2）",
+    en: "Worktree UI (A2)",
+    hintZh: "关闭时新任务仍走 Local cwd",
+    hintEn: "When off, new missions stay on Local cwd",
+  },
+  agentStripV2: {
+    zh: "子 Agent 条 v2（B1）",
+    en: "Agent strip v2 (B1)",
+    hintZh: "纯 UI 增强；关闭回到旧条",
+    hintEn: "UI-only enhancement; off restores prior strip",
+  },
+  reviewMode: {
+    zh: "Review 预设（D）",
+    en: "Review preset (D)",
+    hintZh: "可选入口；关闭无新预设",
+    hintEn: "Optional entry; off hides review preset",
+  },
+};
+
+function FeatureFlagsPanel({ zh }: { zh: boolean }) {
+  const [flags, setFlags] = useState(() => readFeatureFlags());
+  return (
+    <div className="mt-6 border-t border-line pt-5">
+      <Heading
+        title={zh ? "功能开关" : "Feature flags"}
+        description={
+          zh
+            ? "Codex 能力迁移骨架。关闭后对应切片不生效（≈ 旧行为）。主路径 spawn 默认不因开关变严。"
+            : "Codex migration skeleton. Flag off ≈ prior behavior. Main spawn path is not tightened by defaults."
+        }
+      />
+      {FEATURE_FLAG_KEYS.map((key) => {
+        const meta = FEATURE_FLAG_LABELS[key];
+        return (
+          <Row
+            key={key}
+            label={zh ? meta.zh : meta.en}
+            hint={zh ? meta.hintZh : meta.hintEn}
+          >
+            <Toggle
+              on={flags[key]}
+              onChange={(value) => {
+                const next = setFeatureFlag(key, value);
+                setFlags(next);
+              }}
+            />
+          </Row>
+        );
+      })}
+    </div>
+  );
+}
+
+/** local = dedicated agent (`--no-leader`, default); shared = machine leader (`--leader`). */
+type AgentLeaderMode = "local" | "shared";
+
+function AgentLeaderModeRow({ zh, bridgeKind }: { zh: boolean; bridgeKind: string }) {
+  const forceReconnectAgent = useDesktop((state) => state.forceReconnectAgent);
+  const [mode, setMode] = useState<AgentLeaderMode>("local");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (bridgeKind !== "acp") return;
+    void invoke<string>("get_agent_leader_mode")
+      .then((value) => {
+        setMode(value === "shared" ? "shared" : "local");
+      })
+      .catch(() => {
+        /* mock / older shell */
+      });
+  }, [bridgeKind]);
+
+  const apply = (next: AgentLeaderMode) => {
+    if (bridgeKind !== "acp") {
+      setError(zh ? "仅 ACP 桌面壳可切换 Agent 进程模式" : "Agent process mode requires the ACP desktop shell");
+      return;
+    }
+    if (next === mode || busy) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    void invoke<string>("set_agent_leader_mode", { mode: next })
+      .then(async (saved) => {
+        const resolved: AgentLeaderMode = saved === "shared" ? "shared" : "local";
+        setMode(resolved);
+        try {
+          await forceReconnectAgent();
+          setNotice(
+            zh
+              ? resolved === "local"
+                ? "已切换为独立进程（--no-leader），Agent 已重连"
+                : "已切换为共享 Leader（--leader），Agent 已重连"
+              : resolved === "local"
+                ? "Switched to local process (--no-leader); agent reconnected"
+                : "Switched to shared leader (--leader); agent reconnected",
+          );
+        } catch (cause) {
+          setError(
+            cause instanceof Error
+              ? cause.message
+              : zh
+                ? "已保存偏好，但 Agent 重连失败；请手动重连或重启 Grox"
+                : "Preference saved, but agent reconnect failed; reconnect manually or restart Grox",
+          );
+        }
+      })
+      .catch((cause) => {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      })
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <>
+      <Row
+        label={zh ? "Agent 进程模式" : "Agent process mode"}
+        hint={
+          zh
+            ? "默认「独立进程」：专用 agent，握手更稳，Computer Use（--plugin-dir）可用。可选「共享 Leader」与本机 CLI / 其他 ACP 共用进程以省资源；若共享出现 403「coming soon」或握手超时，会自动切回独立。"
+            : "Default Local process: dedicated agent (stable handshake; Computer Use --plugin-dir works). Optional Shared leader reuses the machine-wide agent with CLI/other ACP. On product-gate 403 or handshake timeout, auto-falls back to Local."
+        }
+      >
+        <div className="flex gap-1">
+          {(
+            [
+              { id: "local" as const, label: zh ? "独立（默认）" : "Local (default)" },
+              { id: "shared" as const, label: zh ? "共享 Leader" : "Shared leader" },
+            ] as const
+          ).map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              disabled={busy || bridgeKind !== "acp"}
+              onClick={() => apply(item.id)}
+              className={`h-7 rounded-[3px] border px-2 font-mono text-[9.5px] disabled:opacity-40 ${
+                mode === item.id ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim"
+              }`}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+      </Row>
+      {busy && (
+        <p className="mb-3 text-[10.5px] text-dim">
+          {zh ? "正在保存并重连 Agent…" : "Saving and reconnecting agent…"}
+        </p>
+      )}
+      {notice && (
+        <p className="mb-3 rounded-[4px] border border-acc/25 bg-acc-wash/40 px-3 py-2 text-[10px] text-acc">
+          {notice}
+        </p>
+      )}
+      {error && (
+        <p className="mb-3 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">
+          {error}
+        </p>
+      )}
+    </>
+  );
 }
 
 /** Copy redacted support dump (no raw API keys / .env) to the clipboard. */

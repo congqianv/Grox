@@ -3,14 +3,57 @@
    the last known UI snapshot immediately, then refresh in the background. */
 
 import { invoke } from "@tauri-apps/api/core";
-import type { Session, SessionBlock } from "../bridge/types";
+import type { PromptAttachmentSummary, Session, SessionBlock } from "../bridge/types";
 
 /** Keep cache JSON small enough to parse quickly (last N blocks). */
 const MAX_CACHED_BLOCKS = 160;
+/** Cap tool output / terminal text in cache (chars). */
+const MAX_CACHED_TOOL_TEXT = 8_000;
+/** Cap assistant/thinking text in cache (chars) — full text returns via offline scan. */
+const MAX_CACHED_BODY_TEXT = 24_000;
+
+function stripAttachmentPayloads(
+  attachments: PromptAttachmentSummary[] | undefined,
+): PromptAttachmentSummary[] | undefined {
+  if (!attachments?.length) return attachments;
+  return attachments.map((a) => {
+    // Drop base64 image bytes — reopen uses offline history / re-attach for thumbs.
+    if (a.kind === "image" && a.data) {
+      const { data: _drop, ...rest } = a;
+      return { ...rest, name: a.name || "image" };
+    }
+    return a;
+  });
+}
+
+function truncateText(value: string | undefined, limit: number): string | undefined {
+  if (value == null) return value;
+  if (value.length <= limit) return value;
+  return `${value.slice(0, limit)}\n…[cache truncated ${value.length.toLocaleString()} chars]`;
+}
 
 function freezeBlock(block: SessionBlock): SessionBlock {
-  if (block.type === "assistant") return { ...block, streaming: false };
-  if (block.type === "thinking") return { ...block, live: false };
+  if (block.type === "assistant") {
+    return {
+      ...block,
+      streaming: false,
+      text: truncateText(block.text, MAX_CACHED_BODY_TEXT) ?? "",
+    };
+  }
+  if (block.type === "thinking") {
+    return {
+      ...block,
+      live: false,
+      text: truncateText(block.text, MAX_CACHED_BODY_TEXT) ?? "",
+    };
+  }
+  if (block.type === "user") {
+    return {
+      ...block,
+      attachments: stripAttachmentPayloads(block.attachments),
+      text: truncateText(block.text, MAX_CACHED_BODY_TEXT) ?? "",
+    };
+  }
   if (block.type === "tool") {
     const raw = String(block.call?.status ?? "done");
     const status =
@@ -25,7 +68,25 @@ function freezeBlock(block: SessionBlock): SessionBlock {
         ...block.call,
         status,
         title: block.call?.title || block.call?.rawKind || "tool",
+        input: truncateText(block.call?.input, MAX_CACHED_TOOL_TEXT),
+        output: truncateText(block.call?.output, MAX_CACHED_TOOL_TEXT),
+        // Drop embedded screenshots from cache; cap terminal line dump.
+        images: undefined,
+        terminal: block.call?.terminal
+          ? {
+              ...block.call.terminal,
+              lines: (block.call.terminal.lines ?? []).slice(-80).map((line) =>
+                line.length > 500 ? `${line.slice(0, 500)}…` : line,
+              ),
+            }
+          : undefined,
       },
+    };
+  }
+  if (block.type === "system") {
+    return {
+      ...block,
+      text: truncateText(block.text, MAX_CACHED_TOOL_TEXT) ?? "",
     };
   }
   return block;

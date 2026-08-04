@@ -141,7 +141,19 @@ export type QuestionResponse =
   | { outcome: "cancelled" };
 
 export type SessionBlock =
-  | { type: "user"; id: string; text: string; attachments?: PromptAttachmentSummary[]; ts: number }
+  | {
+      type: "user";
+      id: string;
+      text: string;
+      attachments?: PromptAttachmentSummary[];
+      ts: number;
+      /**
+       * Same-turn interjection (Ctrl+Enter / x.ai/interject).
+       * Must not start a new timeline turn — otherwise the in-flight turn
+       * collapses to "Processed" and the scroller rubber-bands through history.
+       */
+      interjected?: boolean;
+    }
   | { type: "assistant"; id: string; text: string; ts: number; streaming?: boolean }
   | { type: "thinking"; id: string; text: string; ts: number; live?: boolean; elapsedMs?: number }
   | { type: "tool"; id: string; call: ToolCall; ts: number }
@@ -403,8 +415,12 @@ export type BridgeEvent =
   | { type: "thinking_append"; sessionId: string; blockId: string; delta: string }
   | { type: "permission_request"; sessionId: string; blockId: string; req: PermissionRequest }
   | { type: "permission_resolved"; sessionId: string; blockId: string; option: PermissionOption }
+  /** Wire write failed after optimistic resolve — re-open the card for retry. */
+  | { type: "permission_restored"; sessionId: string; blockId: string }
   | { type: "question_request"; sessionId: string; blockId: string; req: QuestionRequest }
   | { type: "question_resolved"; sessionId: string; blockId: string; response: QuestionResponse }
+  /** Wire write failed after optimistic resolve — re-open the question card. */
+  | { type: "question_restored"; sessionId: string; blockId: string }
   | { type: "status"; sessionId: string; status: SessionStatus }
   | { type: "usage"; sessionId: string; usage: Usage }
   | { type: "error"; sessionId: string; message: string }

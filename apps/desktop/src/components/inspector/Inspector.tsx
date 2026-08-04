@@ -175,12 +175,29 @@ function FileTreeNode({ node, onOpen }: { node: FileNode; onOpen(path: string): 
 /* ── TASKS ─────────────────────────────────────────────────────────────── */
 
 function TasksTab({ session }: { session: Session }) {
-  const { t } = useI18n();
+  const { t, language } = useI18n();
+  const zh = language === "zh-CN";
   const plans = session.blocks.filter((b) => b.type === "plan");
   const latest = plans[plans.length - 1];
-  if (!latest || latest.type !== "plan") return <Empty text={t("noPlan")} />;
+  if (!latest || latest.type !== "plan") {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-center">
+        <span className="lbl !text-[9.5px]">{t("noPlan").toUpperCase()}</span>
+        <p className="max-w-[220px] text-[11px] leading-relaxed text-dim">
+          {zh
+            ? "此页只显示 Plan 模式的步骤清单，不是子代理运行轨迹。子代理进度与历史请看左侧「子代理」栏。"
+            : "This tab lists Plan-mode steps only — not subagent runs. Live agents and history are in the Subagents rail."}
+        </p>
+      </div>
+    );
+  }
   return (
     <div className="space-y-1">
+      <p className="mb-2 px-1 text-[10px] leading-snug text-faint">
+        {zh
+          ? "Plan 步骤清单（与左侧「子代理」栏不同）"
+          : "Plan checklist (separate from the Subagents rail)"}
+      </p>
       {latest.steps.map((s: PlanStep, i: number) => (
         <div key={s.id} className="flex items-start gap-2.5 rounded-[4px] border border-line bg-raise px-3 py-2.5">
           <span className="tnum mt-0.5 text-[9.5px] text-faint">{String(i + 1).padStart(2, "0")}</span>

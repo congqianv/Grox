@@ -74,7 +74,7 @@ export function TitleBar() {
   return (
     <header
       data-tauri-drag-region
-      className={`relative z-10 flex h-11 shrink-0 items-center overflow-visible border-b border-line bg-panel select-none ${
+      className={`relative z-40 flex h-11 shrink-0 items-center overflow-visible border-b border-line bg-panel select-none ${
         isMac() ? "pl-[88px] pr-2" : "pl-3 pr-1"
       }`}
     >
@@ -95,7 +95,7 @@ export function TitleBar() {
         </div>
       </div>
 
-      <div className="relative z-20 flex shrink-0 items-center gap-1.5">
+      <div className="relative z-50 flex shrink-0 items-center gap-1.5">
         {showUpdate && appUpdate && (
           <div className="mr-0.5 flex items-center gap-1 rounded-md border border-acc-dim/50 bg-acc-wash px-1.5 py-0.5">
             <button
