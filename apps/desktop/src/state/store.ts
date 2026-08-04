@@ -4372,15 +4372,21 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const preset = reviewPreset(allowEdits);
       get().setMode(preset.mode);
       get().setPermissionMode(preset.permissionMode);
+      // Sandbox may trigger agent restart when idle (I-03); set last so notice is accurate.
       if (isFeatureEnabled("sandboxUi")) {
         get().setSandboxPreference(preset.sandboxPreference);
       }
+      const pending = get().sandboxPendingApply;
       set({
         queueNotice: {
           id: uid(),
           message: allowEdits
-            ? "已应用 Review 预设（允许修改）"
-            : "已应用 Review 预设（只读审查）",
+            ? pending
+              ? "已应用 Review（允许修改）；沙箱待 Agent 重连后生效"
+              : "已应用 Review 预设（允许修改）"
+            : pending
+              ? "已应用 Review（只读）；沙箱待 Agent 重连后生效"
+              : "已应用 Review 预设（只读审查）",
           state: "queued",
           at: Date.now(),
         },

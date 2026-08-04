@@ -7646,13 +7646,9 @@ async fn acp_spawn(
     };
     let command_path = PathBuf::from(&runtime.path);
     let mut command = Command::new(&command_path);
-    command.arg("agent");
-    if let Some(plugin) = computer_plugin.as_ref() {
-        command.arg("--plugin-dir").arg(plugin);
-    }
-    // A1: explicit sandbox only (never implicit). Profile validated here;
-    // env is re-applied *after* apply_cli_provider_environment so ~/.grok/.env
-    // GROK_* cannot override the operator's UI choice.
+    // A1: explicit sandbox only (never implicit).
+    // CLI shape: `grok --sandbox <profile> agent …` (global flag BEFORE subcommand).
+    // `grok agent --sandbox …` is rejected: unexpected argument '--sandbox'.
     let sandbox_profile = sandbox
         .as_deref()
         .map(str::trim)
@@ -7664,6 +7660,10 @@ async fn acp_spawn(
         }
         command.arg("--sandbox").arg(profile);
     }
+    command.arg("agent");
+    if let Some(plugin) = computer_plugin.as_ref() {
+        command.arg("--plugin-dir").arg(plugin);
+    }
     command
         .args(["--leader", "--reasoning-effort", "high", "stdio"])
         .current_dir(&cwd)
@@ -7672,6 +7672,7 @@ async fn acp_spawn(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     apply_cli_provider_environment(&mut command);
+    // Re-apply after provider/.env so UI explicit choice wins over GROK_* from file.
     if let Some(profile) = sandbox_profile {
         command.env("GROK_SANDBOX", profile);
     }
