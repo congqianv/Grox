@@ -612,8 +612,11 @@ export function Composer() {
                     const isDragging = queueDragIndex === index;
                     const isDropTarget =
                       queueDropIndex === index && queueDragIndex !== null && queueDragIndex !== index;
-                    const stateLabel =
-                      item.state === "interjected"
+                    const stateLabel = item.heldByCli
+                      ? zh
+                        ? "等待当前回合结束"
+                        : "Waiting for turn"
+                      : item.state === "interjected"
                         ? zh
                           ? "插话优先"
                           : "Interject"

@@ -9,6 +9,7 @@ import {
   normalizeQueueText,
   queueHasSameText,
   stripCliOwnedEntries,
+  stripHeldByCliEntries,
   type QueueEntryLike,
 } from "./promptQueue";
 
@@ -147,6 +148,24 @@ describe("filterBusyTurnQueueEntries", () => {
     });
     expect(next.map((e) => e.id)).toEqual(["local-pending"]);
   });
+
+  it("keeps heldByCli placeholders even when consumed (visible wait row)", () => {
+    const queue: (QueueEntryLike & { text?: string })[] = [
+      {
+        id: "held-1",
+        state: "sending",
+        source: "local",
+        heldByCli: true,
+        text: "队列消息A",
+      },
+      { id: "cli-echo", state: "queued", source: "cli", text: "队列消息A" },
+    ];
+    const next = filterBusyTurnQueueEntries(queue, {
+      consumedIds: new Set(["held-1"]),
+      consumedTexts: new Set([normalizeQueueText("队列消息A")]),
+    });
+    expect(next.map((e) => e.id)).toEqual(["held-1"]);
+  });
 });
 
 describe("stripCliOwnedEntries", () => {
@@ -157,6 +176,16 @@ describe("stripCliOwnedEntries", () => {
       { id: "u", state: "queued" },
     ];
     expect(stripCliOwnedEntries(queue).map((e) => e.id)).toEqual(["l", "u"]);
+  });
+});
+
+describe("stripHeldByCliEntries", () => {
+  it("removes held placeholders after idle", () => {
+    const queue: QueueEntryLike[] = [
+      { id: "h", state: "sending", source: "local", heldByCli: true },
+      { id: "q", state: "queued", source: "local" },
+    ];
+    expect(stripHeldByCliEntries(queue).map((e) => e.id)).toEqual(["q"]);
   });
 });
 

@@ -59,6 +59,7 @@ import {
   normalizeQueueText,
   queueHasSameText,
   stripCliOwnedEntries,
+  stripHeldByCliEntries,
 } from "../lib/promptQueue";
 import { reconcileIncomingStatus, statusAfterGateResolve } from "../lib/sessionGate";
 import {
@@ -502,6 +503,12 @@ export interface QueuedPrompt {
   state: "queued" | "interjected" | "sending";
   version?: number;
   source?: "local" | "cli";
+  /**
+   * Concurrent session/prompt was accepted by the CLI; shell keeps a visible
+   * "waiting for current turn" row so the operator does not think the item vanished.
+   * Drain must never re-send these (CLI owns execution).
+   */
+  heldByCli?: boolean;
 }
 
 /** Ephemeral operator-facing receipt for queue / interject / gate actions. */
@@ -1691,15 +1698,15 @@ export const useDesktop = create<DesktopState>((set, get) => {
     });
   };
 
-  /** On idle, drop CLI-owned rows (server queue is empty after settle).
+  /** On idle, drop CLI-owned rows and heldByCli placeholders (server already ran them).
    * Keep consumed concurrent id/text fingerprints so a late queue/changed
    * cannot resurrect the same follow-up as 已入队 after strip. */
   const stripStaleCliQueue = (sessionId: string) => {
     const queue = get().promptQueues[sessionId] ?? [];
-    const next = stripCliOwnedEntries(queue);
+    const next = stripHeldByCliEntries(stripCliOwnedEntries(queue));
     if (next.length === queue.length) return;
     for (const item of queue) {
-      if (item.source === "cli") submittedEnqueueIds.delete(item.id);
+      if (item.source === "cli" || item.heldByCli) submittedEnqueueIds.delete(item.id);
     }
     set({
       promptQueues: {
@@ -1740,6 +1747,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       (item) =>
         item.source !== "cli" &&
         item.state !== "sending" &&
+        !item.heldByCli &&
         !submittedEnqueueIds.has(item.id),
     );
     if (localIndex < 0) {
@@ -3490,11 +3498,37 @@ export const useDesktop = create<DesktopState>((set, get) => {
               },
               { promptId: entry.id },
             );
-            // Write accepted — CLI owns execution. Remember id+text so
-            // queue/changed cannot resurrect a ghost (CLI often re-ids).
+            // Write accepted — CLI owns execution. Keep a visible local row so
+            // the operator still sees "等待当前回合结束" (do not drop silently).
             submittedEnqueueIds.delete(entry.id);
+            const q = get().promptQueues[session.id] ?? [];
+            set({
+              promptQueues: {
+                ...get().promptQueues,
+                [session.id]: q.map((item) =>
+                  item.id === entry.id
+                    ? {
+                        ...item,
+                        state: "sending" as const,
+                        source: "local" as const,
+                        heldByCli: true,
+                      }
+                    : item,
+                ),
+              },
+              queueNotice: {
+                id: uid(),
+                entryId: entry.id,
+                message: `已入队 · 等待当前回合结束后发送（第 ${
+                  q.findIndex((item) => item.id === entry.id) + 1 || 1
+                } 条）`,
+                state: "queued",
+                at: Date.now(),
+              },
+            });
+            // Fingerprint for ghost suppression when CLI re-emits the same text
+            // on queue/changed — the heldByCli row itself stays until idle.
             markConsumedConcurrent(session.id, entry.id, trimmed);
-            dropQueueRows(session.id, { id: entry.id, text: trimmed });
           } catch {
             // CLI rejected write — keep local ownership for idle drain.
             submittedEnqueueIds.delete(entry.id);

@@ -8,6 +8,7 @@ import { StatusBar } from "./components/chrome/StatusBar";
 import { Home } from "./components/home/Home";
 import { Timeline } from "./components/session/Timeline";
 import { Composer } from "./components/session/Composer";
+import { SubagentRail } from "./components/session/SubagentRail";
 import { Inspector } from "./components/inspector/Inspector";
 import { CommandPalette } from "./components/palette/CommandPalette";
 import { SettingsModal } from "./components/settings/SettingsModal";
@@ -147,6 +148,9 @@ export default function App() {
             )}
           </SessionErrorBoundary>
         </main>
+        {inSession && session && (
+          <SubagentRail session={session} zh={language === "zh-CN"} />
+        )}
         {inspectorOpen && !planPreviewOpen && inSession && session && <Inspector />}
         {previewOpen && <PreviewPane />}
         {planPreviewOpen && inSession && session && <PlanPreviewPane />}

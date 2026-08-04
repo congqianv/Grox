@@ -5,6 +5,8 @@ export type QueueEntryLike = {
   text?: string;
   state: "queued" | "interjected" | "sending";
   source?: "local" | "cli";
+  /** Visible placeholder after concurrent enqueue was accepted by CLI. */
+  heldByCli?: boolean;
 };
 
 /** Normalize operator text for ghost / duplicate matching. */
@@ -89,9 +91,9 @@ export function filterConsumedQueueEntries<T extends { id: string; text?: string
 
 /**
  * Operator-visible queue while a turn is live.
- * - Hide CLI echoes (concurrent session/prompt already on the wire).
- * - Hide rows already consumed by id or text.
- * Local rows still waiting for a wire write remain visible.
+ * - Hide pure CLI echoes (source=cli without a held local placeholder).
+ * - Keep heldByCli rows (operator-facing "waiting for turn end").
+ * - Hide other consumed ghosts by id/text, but never strip heldByCli placeholders.
  */
 export function filterBusyTurnQueueEntries<T extends QueueEntryLike & { text?: string }>(
   queue: readonly T[],
@@ -100,8 +102,18 @@ export function filterBusyTurnQueueEntries<T extends QueueEntryLike & { text?: s
     consumedTexts?: ReadonlySet<string> | null;
   } = {},
 ): T[] {
-  const withoutCli = queue.filter((item) => item.source !== "cli");
-  return filterConsumedQueueEntries(withoutCli, opts.consumedIds, opts.consumedTexts);
+  const visible = queue.filter(
+    (item) => item.source !== "cli" || item.heldByCli === true,
+  );
+  return visible.filter((item) => {
+    if (item.heldByCli) return true;
+    return filterConsumedQueueEntries([item], opts.consumedIds, opts.consumedTexts).length > 0;
+  });
+}
+
+/** Drop CLI-held placeholders once the session is idle (CLI already ran them). */
+export function stripHeldByCliEntries<T extends QueueEntryLike>(queue: readonly T[]): T[] {
+  return queue.filter((item) => !item.heldByCli);
 }
 
 /** When the session is idle, CLI-owned rows are stale ghosts — keep only local. */
