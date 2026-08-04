@@ -117,6 +117,59 @@ describe("isSubagentNoise / isRealSubagentCall", () => {
       ),
     ).toBe(true);
   });
+
+  it("does not treat ordinary task prose with plan/general as subagents", () => {
+    expect(
+      isRealSubagentCall(
+        tool({
+          id: "fp1",
+          status: "running",
+          kind: "task",
+          title: "Task",
+          detail: "Fix general bug in auth",
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isRealSubagentCall(
+        tool({
+          id: "fp2",
+          status: "running",
+          kind: "task",
+          title: "Implement plan for release",
+          detail: "update docs",
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps spawn_subagent even when kind is execute (strong signal wins)", () => {
+    expect(
+      isRealSubagentCall(
+        tool({
+          id: "fn1",
+          status: "running",
+          kind: "execute",
+          title: "spawn_subagent",
+          input: '{"subagent_type":"explore"}',
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("accepts structured explore · role prefix on task kind", () => {
+    expect(
+      isRealSubagentCall(
+        tool({
+          id: "role",
+          status: "running",
+          kind: "task",
+          title: "Task call-uuid-here",
+          detail: "explore · scan routes",
+        }),
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("extractActiveSubagents / extractRecentSubagents", () => {

@@ -30,7 +30,10 @@ export function StatusBar() {
   const authError = auth.error?.trim() || "";
   const showReconnect =
     Boolean(authError) &&
-    (/重连|退出|Agent|崩溃|暂停自动/i.test(authError) || auth.inProgress);
+    (/重连|退出|Agent|崩溃|暂停自动|reconnect|crash|exit|disconnect|timeout|超时|stall/i.test(
+      authError,
+    ) ||
+      auth.inProgress);
 
   const onForceReconnect = () => {
     if (reconnecting) return;

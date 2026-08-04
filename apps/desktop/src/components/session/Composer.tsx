@@ -612,6 +612,7 @@ export function Composer() {
                     const isDragging = queueDragIndex === index;
                     const isDropTarget =
                       queueDropIndex === index && queueDragIndex !== null && queueDragIndex !== index;
+                    // Local parked follow-ups wait for idle drain (same as heldByCli).
                     const stateLabel = item.heldByCli
                       ? zh
                         ? "等待当前回合结束"
@@ -625,8 +626,8 @@ export function Composer() {
                             ? "发送中"
                             : "Sending"
                           : zh
-                            ? "已入队"
-                            : "Queued";
+                            ? "等待当前回合结束"
+                            : "Waiting for turn";
                     return (
                       <div
                         key={item.id}
@@ -804,12 +805,27 @@ export function Composer() {
                         )}
                         <button
                           type="button"
-                          disabled={item.state !== "queued"}
+                          disabled={item.state !== "queued" || item.heldByCli}
                           onClick={() =>
-                            activeId && item.state === "queued" && removeQueuedPrompt(activeId, item.id)
+                            activeId &&
+                            item.state === "queued" &&
+                            !item.heldByCli &&
+                            removeQueuedPrompt(activeId, item.id)
                           }
                           className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-faint hover:bg-high hover:text-fg disabled:opacity-25"
-                          title={zh ? "移除" : "Remove"}
+                          title={
+                            item.heldByCli
+                              ? zh
+                                ? "CLI 已接管此 follow-up — 等待当前回合结束；可用「清空」仅隐藏本地行"
+                                : "CLI already owns this follow-up — waits for turn end; Clear only hides local row"
+                              : item.state !== "queued"
+                                ? zh
+                                  ? "发送中不可移除"
+                                  : "Cannot remove while sending"
+                                : zh
+                                  ? "移除"
+                                  : "Remove"
+                          }
                         >
                           <Icon name="x" size={10} />
                         </button>

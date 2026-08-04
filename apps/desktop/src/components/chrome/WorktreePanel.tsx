@@ -61,10 +61,14 @@ export function WorktreePanel({ zh }: { zh: boolean }) {
         setNotice(zh ? `已创建 ${entry.name ?? entry.id}` : `Created ${entry.name ?? entry.id}`);
         await refresh();
       } else {
+        // Read store immediately — React hook state may still be stale after await.
+        const blocked = useDesktop.getState().queueNotice;
+        const detail = blocked?.state === "blocked" ? blocked.message : "";
         setNotice(
-          zh
-            ? "创建失败或路径未确认（未打开会话）"
-            : "Create failed or path unconfirmed (no session opened)",
+          detail ||
+            (zh
+              ? "创建失败或路径未确认（未打开会话）"
+              : "Create failed or path unconfirmed (no session opened)"),
         );
       }
     } finally {
@@ -77,14 +81,17 @@ export function WorktreePanel({ zh }: { zh: boolean }) {
     setNotice("");
     try {
       const ok = await openWorktree(entry);
+      const blocked = useDesktop.getState().queueNotice;
+      const failDetail = blocked?.state === "blocked" ? blocked.message : "";
       setNotice(
         ok
           ? zh
             ? `已切换到 worktree：${baseName(entry.path)}`
             : `Switched to worktree: ${baseName(entry.path)}`
-          : zh
-            ? "打开失败（无效路径，未建会话）"
-            : "Open failed (invalid path; no session created)",
+          : failDetail ||
+              (zh
+                ? "打开失败（无效路径，未建会话）"
+                : "Open failed (invalid path; no session created)"),
       );
     } finally {
       setBusy(false);

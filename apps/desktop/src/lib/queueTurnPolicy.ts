@@ -38,15 +38,17 @@ export function composerAffordances(kind: TurnKind): {
 /**
  * Enter / 「加入队列」 path.
  * - idle → primary session/prompt (may silent-bind first)
- * - running → local queue + concurrent session/prompt
- * - gated → local queue only; drain on idle
+ * - running / gated → local queue only; drain as primary on idle
+ *   (no concurrent session/prompt on Enter — wire accept without user bubble
+ *   caused follow-ups to vanish until restart)
  */
 export type SendPath = "primary" | "concurrent_queue" | "local_gate_queue";
 
 export function resolveSendPath(kind: TurnKind): SendPath {
   if (kind === "idle") return "primary";
+  // running and gated both park locally; name kept for tests / Composer smoke.
   if (kind === "gated") return "local_gate_queue";
-  return "concurrent_queue";
+  return "local_gate_queue";
 }
 
 /**
@@ -80,7 +82,8 @@ export function shouldDrainQueue(input: {
 
 /**
  * Next local row eligible for idle drain (mirrors store drainPromptQueue).
- * Skips CLI, sending, and in-flight submitted concurrent ids — never drops them.
+ * Skips CLI, sending, heldByCli (CLI already accepted), and in-flight submitted
+ * concurrent ids — never drops them.
  */
 export function nextDrainableIndex(
   queue: readonly QueueEntryLike[],
@@ -90,6 +93,7 @@ export function nextDrainableIndex(
     (item) =>
       item.source !== "cli" &&
       item.state !== "sending" &&
+      !item.heldByCli &&
       !(submittedIds?.has(item.id) ?? false),
   );
 }

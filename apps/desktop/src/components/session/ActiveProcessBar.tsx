@@ -44,7 +44,9 @@ export function ActiveProcessBar({ session, zh }: { session: Session | null | un
     );
   }
 
-  if (!hint?.show) return null;
+  // With agentStripV2, SubagentRail already shows soft concurrency detail.
+  // Only surface the higher "soft" threshold here to avoid double banners at info.
+  if (!hint?.show || hint.level !== "soft") return null;
 
   return (
     <div className="mb-2 rounded-lg border border-gold/25 bg-gold/5 px-3 py-1.5 font-mono text-[11px] text-gold">

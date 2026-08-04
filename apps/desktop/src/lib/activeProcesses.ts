@@ -103,40 +103,68 @@ export function isSubagentNoise(call: ToolCall): boolean {
   return false;
 }
 
-/**
- * Real subagents only (Codex-style): spawn_subagent / subagent_type / named agent roles.
- * Plain shell execute/task tools and poll helpers are excluded.
- */
-export function isRealSubagentCall(call: ToolCall): boolean {
-  if (isSubagentNoise(call)) return false;
-  const blob = callBlob(call);
-
-  // Strong signals — always keep
+/** Structured / strong signals that identify a nested agent spawn. */
+function hasStrongSubagentSignal(blob: string): boolean {
   if (/spawn_subagent/.test(blob)) return true;
   if (/"subagent_type"\s*:|subagent_type\s*[:=]/.test(blob)) return true;
   if (/\bsubagent\b|子代理/.test(blob) && !/get_command_or_subagent/.test(blob)) return true;
+  return false;
+}
 
-  // Role label like "explore · …" or reviewer agent titles — only with agent-ish framing
-  const role = parseAgentType(call);
-  const roleLooksAgent =
-    role === "explore" ||
-    role === "plan" ||
-    role === "general-purpose" ||
-    role === "general" ||
-    role === "research" ||
-    role === "review" ||
-    role === "implement" ||
-    /reviewer|code-reviewer|architect|探索|审查/.test(blob);
+/**
+ * Role token from structured prefix / subagent_type only — not bare substring includes.
+ * Avoids "Fix general bug" / "plan the release" false positives.
+ */
+function structuredAgentRole(call: ToolCall): string | null {
+  const detail = call.detail ?? "";
+  const title = call.title ?? "";
+  const input = call.input ?? "";
 
-  if (roleLooksAgent) {
-    // Reject if title is still clearly a shell one-liner
-    if (looksLikeShellTool(call)) return false;
-    // Prefer task/spawn kinds; avoid random tools that mention "test" in output
-    if (call.kind === "task" || call.kind === "other" || /agent|spawn|subagent|reviewer/.test(blob)) {
-      return true;
-    }
+  const fromDetail = detail.match(
+    /^\s*([a-z][a-z0-9_-]*)\s*[·•|]\s+/i,
+  );
+  if (fromDetail?.[1]) return fromDetail[1].toLowerCase();
+
+  const fromTitle = title.match(
+    /^\s*([a-z][a-z0-9_-]*)\s*[·•|]\s+/i,
+  );
+  if (fromTitle?.[1]) return fromTitle[1].toLowerCase();
+
+  const fromInput =
+    input.match(/"subagent_type"\s*:\s*"([^"]+)"/i) ??
+    input.match(/subagent_type["\s:=]+([a-z][a-z0-9_-]*)/i);
+  if (fromInput?.[1]) return fromInput[1].toLowerCase();
+
+  // Explicit agent-role titles (not casual English words in prose).
+  if (/^(code-reviewer|reviewer|architect|general-purpose)\b/i.test(title.trim())) {
+    return title.trim().split(/[\s·•|]/)[0]!.toLowerCase();
   }
+  if (/\b(code-reviewer|architect)\b/i.test(`${title} ${detail}`)) {
+    return "review";
+  }
+  return null;
+}
 
+/**
+ * Real subagents only (Codex-style): spawn_subagent / subagent_type / structured roles.
+ * Plain shell execute/task tools and poll helpers are excluded.
+ * Strong signals win over shell-kind short-circuit (wire may map spawn to execute).
+ */
+export function isRealSubagentCall(call: ToolCall): boolean {
+  const blob = callBlob(call);
+
+  // Strong signals first — never lose real spawns to shell kind noise.
+  if (hasStrongSubagentSignal(blob)) return true;
+
+  if (isSubagentNoise(call)) return false;
+
+  const role = structuredAgentRole(call);
+  if (!role) return false;
+
+  // Structured role + agent-ish kind/title only (no bare blob.includes role words).
+  if (looksLikeShellTool(call)) return false;
+  if (call.kind === "task" || call.kind === "other") return true;
+  if (/agent|spawn|reviewer|子代理/.test(blob)) return true;
   return false;
 }
 

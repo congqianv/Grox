@@ -63,6 +63,7 @@ export function EffectiveRuntimePanel({ zh }: { zh: boolean }) {
 
   if (!enabled) return null;
 
+  // Applied always unknown until U-01 agent report; desktop never injects sandbox.
   const snapshot = buildEffectiveRuntimeSnapshot({
     permissionRequested: permissionMode,
     sandboxRequested: sandboxPreference,

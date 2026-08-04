@@ -1,8 +1,11 @@
-# Grox Desktop 0.2.9 — 测试说明
+# Grox Desktop 0.2.9 — 测试说明（**已过时**）
+
+> **请改用 [`RELEASE_0.2.11_TEST.md`](./RELEASE_0.2.11_TEST.md)。**  
+> 当前壳版本为 **0.2.11**。下文 §A1 中「重连注入沙箱 / pending 重连应用」与现网产品相反（桌面 Agent **永不**注入 `--sandbox`）。
 
 **主题：** Codex 能力迁移 A0–D（开放优先，防回归）  
-**版本：** `apps/desktop` **0.2.9**  
-**分支建议：** `feat/desktop-turn-queue-permission-stall`（或你合入后的测试分支）
+**版本：** `apps/desktop` **0.2.9**（历史）  
+**分支建议：** `feat/desktop-turn-queue-permission-stall`
 
 ## 启动
 
@@ -49,13 +52,11 @@ pnpm desktop:dev   # 真 ACP（需本机 grok）
 - [ ] 浏览器 `pnpm dev`：inspect 显示 unavailable/降级，**不挡聊天**
 - [ ] `pnpm desktop:dev`：inspect 尽量加载 CLI 版本；失败只降级
 
-### 2. A1 沙箱（开放）
+### 2. A1 沙箱（开放）— **已废弃期望，见 0.2.11**
 
-- [ ] 默认标签含「跟随 CLI」；**不**无故变严
-- [ ] 显式选 workspace → 空闲时重连 Agent → 新 spawn 带沙箱（可用任务试写文件感知）
-- [ ] 选 **off** → 仅金色警告，**无**二次弹窗拦截
-- [ ] **忙碌时**改沙箱 → 提示 pending +「重连应用」；当前回合行为不半切换
-- [ ] 设置 → 功能开关 **关闭 sandboxUi** → 重启/重连后不再由壳注入沙箱
+- [ ] ~~显式选 workspace → 重连后 spawn 带沙箱~~ → **错误**：现网 **不** 注入
+- [ ] ~~忙碌改沙箱 → pending + 重连应用~~ → **错误**：pending 恒 false，仅存偏好
+- [ ] 正确期望见 `RELEASE_0.2.11_TEST.md` §2
 
 ### 3. A2 Worktree
 

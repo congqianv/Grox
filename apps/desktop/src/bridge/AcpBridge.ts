@@ -48,6 +48,7 @@ import {
   COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
   computerLeaseIfAttached,
   computerToolNameFromPermissionTool,
+  computerUseOptInRefuseMessage,
   decideComputerAttachForPrompt,
   hasActiveComputerLease,
   isComputerUseMcpTool,
@@ -823,6 +824,17 @@ export class AcpBridge implements GrokBridge {
   /** Generation so a late concurrent `finally` cannot settle a newer turn after cancel. */
   private concurrentPromptGen = new Map<string, number>();
   /**
+   * Floor for concurrent gens when the per-session map is empty.
+   * Bumped on agent exit/restart so in-flight concurrent enqueues that captured
+   * gen `0` cannot pass checks after `concurrentPromptGen.clear()` (clear alone
+   * re-validated genAtEnqueue=0 and allowed dual-send onto the new child).
+   */
+  private flightEpoch = 0;
+  /** Current concurrent generation for a session (map entry or flightEpoch floor). */
+  private concurrentGenOf(sessionId: string): number {
+    return this.concurrentPromptGen.get(sessionId) ?? this.flightEpoch;
+  }
+  /**
    * Wall clock of the last live session/update (or gate request) while a primary
    * prompt is open. Used to detect "0 条事件" stalls after session/prompt write.
    */
@@ -1381,6 +1393,8 @@ export class AcpBridge implements GrokBridge {
     this.primaryPromptSessions.clear();
     this.primaryPromptGen.clear();
     this.concurrentPromptCount.clear();
+    // Invalidate every in-flight concurrent gen (including implicit 0) before clear.
+    this.flightEpoch += 1;
     this.concurrentPromptGen.clear();
     this.liveTurnActivityAt.clear();
     // Dead agent cannot receive plan/permission answers — drop locks.
@@ -1445,18 +1459,33 @@ export class AcpBridge implements GrokBridge {
     // process replaced during a Tauri hot reload produces misleading errors.
     this.diagnostics = [];
     try {
-      // A1: only pass sandbox when feature on AND user explicitly chose a profile.
-      // Flag off / follow_cli → null → Tauri does not inject GROK_SANDBOX (I-08).
+      // Desktop ACP leader never injects sandbox (sandboxSpawnArg → null; I-08 / API 403).
       const sandbox = sandboxSpawnArg(isFeatureEnabled("sandboxUi"));
-      await Promise.race([
-        invoke("acp_spawn", { cwd: this.workspace, sandbox }),
-        new Promise<never>((_, reject) => {
-          window.setTimeout(
-            () => reject(new Error("启动 Grok Agent 超时（30 秒）")),
-            30_000,
-          );
-        }),
-      ]);
+      let timedOut = false;
+      let timeoutId: number | undefined;
+      try {
+        await Promise.race([
+          invoke("acp_spawn", { cwd: this.workspace, sandbox }),
+          new Promise<never>((_, reject) => {
+            timeoutId = window.setTimeout(() => {
+              timedOut = true;
+              reject(new Error("启动 Grok Agent 超时（30 秒）"));
+            }, 30_000);
+          }),
+        ]);
+      } catch (error) {
+        // FE timeout must not leave a live orphan child owned by Rust.
+        if (timedOut) {
+          try {
+            await invoke("acp_kill");
+          } catch {
+            /* best-effort */
+          }
+        }
+        throw error;
+      } finally {
+        if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+      }
     } catch (error) {
       const detail = errorText(error);
       throw new Error(
@@ -2530,7 +2559,7 @@ export class AcpBridge implements GrokBridge {
 
   /** Begin a concurrent follow-up; returns generation for the matching end. */
   private noteConcurrentStart(sessionId: string): number {
-    const gen = this.concurrentPromptGen.get(sessionId) ?? 0;
+    const gen = this.concurrentGenOf(sessionId);
     this.concurrentPromptCount.set(
       sessionId,
       (this.concurrentPromptCount.get(sessionId) ?? 0) + 1,
@@ -2543,7 +2572,7 @@ export class AcpBridge implements GrokBridge {
    * (cancel / agent restart) and must not touch counts or UI settle.
    */
   private noteConcurrentEnd(sessionId: string, gen: number): boolean {
-    if ((this.concurrentPromptGen.get(sessionId) ?? 0) !== gen) return false;
+    if (this.concurrentGenOf(sessionId) !== gen) return false;
     const next = (this.concurrentPromptCount.get(sessionId) ?? 1) - 1;
     if (next <= 0) this.concurrentPromptCount.delete(sessionId);
     else this.concurrentPromptCount.set(sessionId, next);
@@ -2552,8 +2581,8 @@ export class AcpBridge implements GrokBridge {
 
   /** Invalidate all open primary/concurrent bookkeeping for a session (cancel/exit). */
   private invalidatePromptFlights(sessionId: string): void {
-    this.primaryPromptGen.set(sessionId, (this.primaryPromptGen.get(sessionId) ?? 0) + 1);
-    this.concurrentPromptGen.set(sessionId, (this.concurrentPromptGen.get(sessionId) ?? 0) + 1);
+    this.primaryPromptGen.set(sessionId, (this.primaryPromptGen.get(sessionId) ?? this.flightEpoch) + 1);
+    this.concurrentPromptGen.set(sessionId, this.concurrentGenOf(sessionId) + 1);
     this.primaryPromptSessions.delete(sessionId);
     this.concurrentPromptCount.delete(sessionId);
   }
@@ -3464,7 +3493,7 @@ export class AcpBridge implements GrokBridge {
       if (cu === "refused") {
         return {
           state: "refused",
-          message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
+          message: computerUseOptInRefuseMessage(),
           fallback: false,
         };
       }
@@ -3554,10 +3583,10 @@ export class AcpBridge implements GrokBridge {
      */
     // Capture gen before waiting on the exclusive channel so Stop/cancel during
     // the wait aborts without starting a fresh concurrent flight.
-    const genAtEnqueue = this.concurrentPromptGen.get(sessionId) ?? 0;
+    const genAtEnqueue = this.concurrentGenOf(sessionId);
     try {
       await this.runOnChannel(async () => {
-        if ((this.concurrentPromptGen.get(sessionId) ?? 0) !== genAtEnqueue) {
+        if (this.concurrentGenOf(sessionId) !== genAtEnqueue) {
           // Cancelled while queued for the channel — do not write.
           throw new Error("队列提交已取消");
         }
@@ -3571,7 +3600,7 @@ export class AcpBridge implements GrokBridge {
           await written;
           // Cancelled mid-write: do not re-raise running; fail the store await so
           // it does not markConsumed / drop the local row as "accepted".
-          if ((this.concurrentPromptGen.get(sessionId) ?? 0) !== concurrentGen) {
+          if (this.concurrentGenOf(sessionId) !== concurrentGen) {
             throw new Error("队列提交已取消");
           }
           // Follow-up is live — keep Composer in busy (queue/interject) mode,
@@ -3608,7 +3637,7 @@ export class AcpBridge implements GrokBridge {
     }
 
     // Final cancel race: channel finished but gen was invalidated after return.
-    if ((this.concurrentPromptGen.get(sessionId) ?? 0) !== genAtEnqueue) {
+    if (this.concurrentGenOf(sessionId) !== genAtEnqueue) {
       throw new Error("队列提交已取消");
     }
 
@@ -3717,7 +3746,7 @@ export class AcpBridge implements GrokBridge {
         // Refuse (opt-in off) aborts the turn — do not session/prompt (R4A-CU-02).
         const cu = await this.ensureComputerAttachedForPrompt(sessionId, text);
         if (cu === "refused") {
-          throw new Error(COMPUTER_USE_OPT_IN_REFUSE_MESSAGE);
+          throw new Error(computerUseOptInRefuseMessage());
         }
         // Live turn must receive session/update — never leave silent filter on
         // after silent bind / CU attach (would freeze UI at "0 条事件").
@@ -4165,7 +4194,7 @@ export class AcpBridge implements GrokBridge {
       case "refuse_opt_in":
         // Soft: hard BridgeEvent error forces store status→idle mid-turn when
         // a busy-path queue prepareComputer refuses CU (would unlock send early).
-        this.emitSoftError(sessionId, COMPUTER_USE_OPT_IN_REFUSE_MESSAGE);
+        this.emitSoftError(sessionId, computerUseOptInRefuseMessage());
         return "refused";
       case "revoke_stale_and_refuse":
         await this.revokeComputerLease(sessionId);
@@ -4175,7 +4204,7 @@ export class AcpBridge implements GrokBridge {
         if (this.computerLeases.size === 0) {
           await invoke("computer_revoke_http_auth").catch(() => {});
         }
-        this.emitSoftError(sessionId, COMPUTER_USE_OPT_IN_REFUSE_MESSAGE);
+        this.emitSoftError(sessionId, computerUseOptInRefuseMessage());
         return "refused";
       case "attach":
         await this.attachComputerMcp(sessionId);

@@ -18,11 +18,28 @@ export function normalizeQueueText(text: string | undefined | null): string {
  * Merge CLI-authoritative queue with local-only entries the CLI has not yet
  * acknowledged. Prevents x.ai/queue/changed from wiping in-flight local
  * enqueues (race: FE adds local → CLI snapshot arrives before our promptId).
+ *
+ * Same-id CLI echoes must not clobber `heldByCli` wait rows (operator sticky receipt).
  */
 export function mergeCliQueueWithLocal<T extends QueueEntryLike>(
   cliEntries: T[],
   previous: T[],
 ): T[] {
+  const heldById = new Map(
+    previous.filter((item) => item.heldByCli).map((item) => [item.id, item] as const),
+  );
+  const mergedCli = cliEntries.map((cli) => {
+    const held = heldById.get(cli.id);
+    if (!held) return cli;
+    return {
+      ...cli,
+      text: cli.text || held.text,
+      // Keep local ownership + held flag so busy UI still shows "waiting for turn".
+      source: "local" as const,
+      state: held.state === "sending" ? ("sending" as const) : cli.state,
+      heldByCli: true as const,
+    };
+  });
   const cliIds = new Set(cliEntries.map((item) => item.id));
   const localOnly = previous.filter(
     (item) => item.source !== "cli" && !cliIds.has(item.id),
@@ -30,7 +47,7 @@ export function mergeCliQueueWithLocal<T extends QueueEntryLike>(
   const interjectedLocal = localOnly.filter((item) => item.state === "interjected");
   const otherLocal = localOnly.filter((item) => item.state !== "interjected");
   // Interjected locals first (drain priority), then CLI order, then other locals.
-  return [...interjectedLocal, ...cliEntries, ...otherLocal];
+  return [...interjectedLocal, ...mergedCli, ...otherLocal];
 }
 
 /**
@@ -39,7 +56,9 @@ export function mergeCliQueueWithLocal<T extends QueueEntryLike>(
  * to the head when created; later drag can demote them.
  */
 export function nextLocalDrainIndex(queue: readonly QueueEntryLike[]): number {
-  return queue.findIndex((item) => item.source !== "cli" && item.state !== "sending");
+  return queue.findIndex(
+    (item) => item.source !== "cli" && item.state !== "sending" && !item.heldByCli,
+  );
 }
 
 /** Drop rows whose text matches the live turn's primary user bubble. */
@@ -114,6 +133,64 @@ export function filterBusyTurnQueueEntries<T extends QueueEntryLike & { text?: s
 /** Drop CLI-held placeholders once the session is idle (CLI already ran them). */
 export function stripHeldByCliEntries<T extends QueueEntryLike>(queue: readonly T[]): T[] {
   return queue.filter((item) => !item.heldByCli);
+}
+
+/**
+ * Healthy idle settle (UI: "等待当前回合结束后发送").
+ *
+ * - Pure CLI ghosts → drop.
+ * - heldByCli whose text already appears as a user bubble → drop (concurrent ran).
+ * - heldByCli **not** in transcript → rehome to local `queued` so drain can send.
+ *   (Wire accept ≠ UI delivery; blind strip lost follow-ups when CLI never painted user.)
+ * - Other local rows → keep.
+ */
+export function settleQueueOnIdle<T extends QueueEntryLike & { text?: string }>(
+  queue: readonly T[],
+  transcriptUserTexts: readonly string[],
+): T[] {
+  const seen = new Set(
+    transcriptUserTexts.map((t) => normalizeQueueText(t)).filter(Boolean),
+  );
+  const out: T[] = [];
+  for (const item of queue) {
+    if (item.source === "cli" && !item.heldByCli) continue;
+    if (item.heldByCli) {
+      const t = normalizeQueueText(item.text);
+      if (t && seen.has(t)) continue;
+      out.push({
+        ...item,
+        source: "local" as const,
+        heldByCli: false as const,
+        state: "queued" as const,
+      });
+      continue;
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+/**
+ * Agent fault / hard error recovery: keep operator text, clear heldByCli so drain
+ * can re-send. Unlike stripHeldByCliEntries, does **not** delete held rows
+ * (dead child may never have run them). Drops pure CLI ghosts only.
+ */
+export function rehomeHeldQueueForRecovery<T extends QueueEntryLike>(
+  queue: readonly T[],
+): T[] {
+  return queue
+    .filter((item) => item.source !== "cli" || item.heldByCli === true)
+    .map((entry) => ({
+      ...entry,
+      source: "local" as const,
+      heldByCli: false as const,
+      state:
+        entry.state === "sending" ||
+        entry.state === "interjected" ||
+        entry.heldByCli
+          ? ("queued" as const)
+          : entry.state,
+    }));
 }
 
 /** When the session is idle, CLI-owned rows are stale ghosts — keep only local. */

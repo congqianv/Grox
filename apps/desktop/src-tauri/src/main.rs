@@ -7646,6 +7646,26 @@ async fn acp_spawn(
     }
 
     let runtime = configured_grok_command(&app);
+    // Never spawn a bare PATH name ("grok" / "grok.exe") — missing resolution is
+    // a hard error (PATH hijack / TOCTOU). Prefer absolute resolved paths only.
+    if runtime.source == "missing" || runtime.path.trim().is_empty() {
+        return Err(
+            "未找到可用的 Grok CLI（需系统安装、内置或 GROK_DESKTOP_CLI 绝对路径）".into(),
+        );
+    }
+    let command_path = PathBuf::from(&runtime.path);
+    if !command_path.is_absolute() {
+        return Err(format!(
+            "Grok CLI 路径必须为绝对路径，拒绝相对/PATH 名称：{}",
+            command_path.display()
+        ));
+    }
+    if !command_path.exists() {
+        return Err(format!(
+            "Grok CLI 不存在：{}。可通过 GROK_DESKTOP_CLI 指定可执行文件。",
+            command_path.display()
+        ));
+    }
     let computer_plugin = if cfg!(target_os = "windows") {
         match ensure_computer_plugin() {
             Ok(path) => Some(path),
@@ -7657,7 +7677,6 @@ async fn acp_spawn(
     } else {
         None
     };
-    let command_path = PathBuf::from(&runtime.path);
     let mut command = Command::new(&command_path);
     // A1: explicit sandbox only — global args BEFORE `agent` (see sandbox_global_cli_args).
     let sandbox_args = sandbox_global_cli_args(sandbox.as_deref())?;

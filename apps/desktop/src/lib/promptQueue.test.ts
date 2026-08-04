@@ -8,6 +8,8 @@ import {
   nextLocalDrainIndex,
   normalizeQueueText,
   queueHasSameText,
+  rehomeHeldQueueForRecovery,
+  settleQueueOnIdle,
   stripCliOwnedEntries,
   stripHeldByCliEntries,
   type QueueEntryLike,
@@ -45,6 +47,14 @@ describe("mergeCliQueueWithLocal", () => {
 });
 
 describe("nextLocalDrainIndex", () => {
+  it("skips heldByCli rows", () => {
+    const queue: QueueEntryLike[] = [
+      { id: "h", state: "queued", source: "local", heldByCli: true },
+      { id: "q", state: "queued", source: "local" },
+    ];
+    expect(nextLocalDrainIndex(queue)).toBe(1);
+  });
+
   it("respects array order (drag-reorder is authoritative)", () => {
     const queue: QueueEntryLike[] = [
       { id: "q1", state: "queued", source: "local" },
@@ -186,6 +196,106 @@ describe("stripHeldByCliEntries", () => {
       { id: "q", state: "queued", source: "local" },
     ];
     expect(stripHeldByCliEntries(queue).map((e) => e.id)).toEqual(["q"]);
+  });
+});
+
+describe("settleQueueOnIdle", () => {
+  it("rehomes held not in transcript so drain can send (user-reported loss fix)", () => {
+    const queue: (QueueEntryLike & { text?: string })[] = [
+      {
+        id: "held-1",
+        state: "sending",
+        source: "local",
+        heldByCli: true,
+        text: "后续请用三条 bullet 总结",
+      },
+      { id: "cli", state: "queued", source: "cli", text: "ghost" },
+    ];
+    // Transcript only has the long primary user message — follow-up never painted.
+    const next = settleQueueOnIdle(queue, [
+      "请完整梳理当前仓库 apps/desktop 的目录…",
+    ]);
+    expect(next).toHaveLength(1);
+    expect(next[0]).toMatchObject({
+      id: "held-1",
+      heldByCli: false,
+      source: "local",
+      state: "queued",
+      text: "后续请用三条 bullet 总结",
+    });
+  });
+
+  it("drops held when transcript already has the same user text", () => {
+    const queue: (QueueEntryLike & { text?: string })[] = [
+      {
+        id: "held-1",
+        state: "sending",
+        source: "local",
+        heldByCli: true,
+        text: "后续请用三条 bullet 总结",
+      },
+    ];
+    const next = settleQueueOnIdle(queue, ["后续请用三条 bullet 总结"]);
+    expect(next).toEqual([]);
+  });
+});
+
+describe("rehomeHeldQueueForRecovery", () => {
+  it("keeps held text as drainable local queued (does not delete)", () => {
+    const queue: QueueEntryLike[] = [
+      {
+        id: "held-1",
+        state: "sending",
+        source: "local",
+        heldByCli: true,
+        text: "follow-up after crash",
+      },
+      { id: "cli-ghost", state: "queued", source: "cli", text: "echo" },
+      { id: "parked", state: "queued", source: "local", text: "parked" },
+    ];
+    const next = rehomeHeldQueueForRecovery(queue);
+    expect(next.map((e) => e.id)).toEqual(["held-1", "parked"]);
+    expect(next[0]).toMatchObject({
+      id: "held-1",
+      heldByCli: false,
+      source: "local",
+      state: "queued",
+      text: "follow-up after crash",
+    });
+    // Contrast: healthy-idle strip deletes held (loses text); rehome keeps it.
+    expect(stripHeldByCliEntries(queue).map((e) => e.id)).toEqual([
+      "cli-ghost",
+      "parked",
+    ]);
+  });
+});
+
+describe("mergeCliQueueWithLocal heldByCli preserve", () => {
+  it("keeps heldByCli when CLI re-echoes the same id", () => {
+    const previous: QueueEntryLike[] = [
+      {
+        id: "held-1",
+        state: "sending",
+        source: "local",
+        heldByCli: true,
+        text: "follow-up",
+      },
+      { id: "local-2", state: "queued", source: "local", text: "parked" },
+    ];
+    const fromCli: QueueEntryLike[] = [
+      { id: "held-1", state: "queued", source: "cli", text: "follow-up" },
+    ];
+    const next = mergeCliQueueWithLocal(fromCli, previous);
+    const held = next.find((e) => e.id === "held-1");
+    expect(held?.heldByCli).toBe(true);
+    expect(held?.source).toBe("local");
+    expect(next.map((e) => e.id)).toContain("local-2");
+    // Busy filter still shows the wait row
+    expect(
+      filterBusyTurnQueueEntries(next as (QueueEntryLike & { text?: string })[], {
+        consumedIds: new Set(["held-1"]),
+      }).map((e) => e.id),
+    ).toEqual(["held-1", "local-2"]);
   });
 });
 

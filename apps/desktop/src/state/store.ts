@@ -8,8 +8,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { bridge } from "../bridge";
 import { DEFAULT_PERMISSION_MODE, MODELS, readStoredPermissionMode } from "../bridge/types";
-import { COMPUTER_USE_OPT_IN_REFUSE_MESSAGE } from "../lib/computerUse";
+import { computerUseOptInRefuseMessage } from "../lib/computerUse";
 import { isFeatureEnabled } from "../lib/featureFlags";
+import { tOp } from "../lib/operatorLocale";
 import { isSafeMarkdownOpenUrl } from "../lib/openUrlSafety";
 import { reviewPreset } from "../lib/reviewPreset";
 import {
@@ -59,7 +60,8 @@ import {
   normalizeQueueText,
   queueHasSameText,
   stripCliOwnedEntries,
-  stripHeldByCliEntries,
+  rehomeHeldQueueForRecovery as rehomeHeldQueueEntries,
+  settleQueueOnIdle,
 } from "../lib/promptQueue";
 import { reconcileIncomingStatus, statusAfterGateResolve } from "../lib/sessionGate";
 import {
@@ -95,6 +97,20 @@ const promptFlightGen = new Map<string, number>();
  * "Grok 正在处理" + the same row still 已入队.
  */
 const submittedEnqueueIds = new Set<string>();
+/**
+ * Per-session epoch for concurrent enqueue IIFEs. Bumped on agent reconnect /
+ * Stop so a late `await enqueuePrompt` success cannot dual-send or re-hold a row
+ * the reconnect drain already re-homed.
+ */
+const concurrentEnqueueEpoch = new Map<string, number>();
+function bumpConcurrentEnqueueEpoch(sessionId: string): number {
+  const next = (concurrentEnqueueEpoch.get(sessionId) ?? 0) + 1;
+  concurrentEnqueueEpoch.set(sessionId, next);
+  return next;
+}
+function currentConcurrentEnqueueEpoch(sessionId: string): number {
+  return concurrentEnqueueEpoch.get(sessionId) ?? 0;
+}
 /**
  * Ids whose concurrent session/prompt wire write already succeeded. CLI may
  * still echo them in x.ai/queue/changed — re-showing those as 已入队 is a ghost
@@ -712,9 +728,12 @@ interface DesktopState {
   setEffort(effort: Effort): void;
   setMode(mode: AgentMode): void;
   setPermissionMode(mode: PermissionMode): void;
-  /** A1: sandbox preference; idle → restart agent; busy → defer (I-03). */
+  /** A1: sandbox preference (UI-only; ACP leader never injects). */
   setSandboxPreference(preference: SandboxPreference): void;
-  /** A2: list worktrees via grok CLI (empty/degraded on failure). */
+  /**
+   * A2: list worktrees via grok CLI.
+   * Throws on invoke/CLI failure so UI can show error (not empty).
+   */
   listWorktrees(): Promise<WorktreeEntry[]>;
   /** A2: create worktree via grok --worktree; does not open session on failure (I-06). */
   createWorktree(name: string, worktreeRef?: string): Promise<WorktreeEntry | null>;
@@ -723,7 +742,7 @@ interface DesktopState {
    * Rejects invalid paths without creating a session (I-06).
    */
   openWorktree(entry: WorktreeEntry): Promise<boolean>;
-  /** D: apply review preset (optional; flag-gated). */
+  /** D: apply review preset (optional; flag-gated). Mode/permission real; sandbox pref-only. */
   applyReviewPreset(allowEdits: boolean): void;
   setDraft(text: string): void;
   setComposerAttachments(attachments: PromptAttachment[]): void;
@@ -1410,7 +1429,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
                 set({
                   queueNotice: {
                     id: uid(),
-                    message: `已停止；队列仍保留 ${n} 条（不会自动发送，可清空或继续输入后发送）`,
+                    message: tOp(
+                      `已停止；队列仍保留 ${n} 条（不会自动发送，可清空或继续输入后发送）`,
+                      `Stopped; ${n} queue item(s) kept (will not auto-send — clear or send again)`,
+                    ),
                     state: "blocked",
                     at: Date.now(),
                   },
@@ -1454,7 +1476,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
         if (!softQueueFail) {
           releasePromptFlight(e.sessionId);
+          // Invalidate concurrent IIFEs for this mission (agent may be dead/restarting).
+          bumpConcurrentEnqueueEpoch(e.sessionId);
           window.setTimeout(() => {
+            // Crash/hard error: do NOT strip held (would delete follow-ups before
+            // agent_reconnected can re-home them). Re-home held → local queued so
+            // drain/reconnect can re-send; drop pure CLI ghosts only.
+            rehomeHeldQueueForRecovery(e.sessionId);
             flushPendingOfflineMerge(e.sessionId);
             // Respect Stop-suppress (same as status→idle).
             drainPromptQueue(e.sessionId);
@@ -1471,7 +1499,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
         consumedConcurrentTextsBySession.clear();
         // Reconnect is a clean slate — allow queue drain again.
         suppressNextIdleDrain.clear();
-        // A1: deferred sandbox now lives on the new child if flag still on.
+        // Invalidate in-flight concurrent enqueue IIFEs (pre-reconnect awaits).
+        for (const id of Object.keys(get().sessions)) {
+          bumpConcurrentEnqueueEpoch(id);
+        }
+        for (const id of Object.keys(get().promptQueues)) {
+          bumpConcurrentEnqueueEpoch(id);
+        }
+        // Sandbox is preference-only (never injected); clear any stale pending bit.
         set({ sandboxPendingApply: false });
         for (const id of Object.keys(get().sessions)) {
           releasePromptFlight(id);
@@ -1482,9 +1517,15 @@ export const useDesktop = create<DesktopState>((set, get) => {
           nextQueues[id] = entries.map((entry) => ({
             ...entry,
             source: "local" as const,
-            state: entry.state === "sending" || entry.state === "interjected"
-              ? ("queued" as const)
-              : entry.state,
+            // New agent never ran concurrent holds — clear heldByCli so idle drain
+            // can re-send operator text (otherwise rows stick undrainable forever).
+            heldByCli: false,
+            state:
+              entry.state === "sending" ||
+              entry.state === "interjected" ||
+              entry.heldByCli
+                ? ("queued" as const)
+                : entry.state,
           }));
         }
         const live = get().sessions;
@@ -1536,17 +1577,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
       case "prompt_queue": {
         // CLI is authoritative for known ids, but must not wipe local-only rows
         // that have not been acknowledged yet (enqueue race with queue/changed).
+        // heldByCli wait rows must survive same-id CLI echoes (sticky receipt).
         const previous = get().promptQueues[e.sessionId] ?? [];
         const fromCli: QueuedPrompt[] = e.entries.map((entry) => {
           const prior = previous.find((item) => item.id === entry.id);
+          const held = prior?.heldByCli === true;
           return {
             id: entry.id,
             text: entry.text || prior?.text || "",
             attachments: prior?.attachments ?? entry.attachments ?? [],
             createdAt: entry.createdAt || prior?.createdAt || Date.now(),
-            state: entry.state,
+            state: held ? (prior?.state === "sending" ? "sending" : entry.state) : entry.state,
             version: entry.version ?? prior?.version ?? 0,
-            source: "cli" as const,
+            source: held ? ("local" as const) : ("cli" as const),
+            heldByCli: held || undefined,
           };
         });
         let nextQueue = mergeCliQueueWithLocal(fromCli, previous);
@@ -1698,16 +1742,72 @@ export const useDesktop = create<DesktopState>((set, get) => {
     });
   };
 
-  /** On idle, drop CLI-owned rows and heldByCli placeholders (server already ran them).
-   * Keep consumed concurrent id/text fingerprints so a late queue/changed
-   * cannot resurrect the same follow-up as 已入队 after strip. */
+  /**
+   * On healthy idle: pure CLI ghosts drop; held whose text is already a user
+   * bubble drop; held **missing** from transcript rehome → local queued so
+   * drain can send (matches "等待当前回合结束后发送"). Blind strip lost
+   * follow-ups when concurrent wire accept never painted a user bubble.
+   */
   const stripStaleCliQueue = (sessionId: string) => {
     const queue = get().promptQueues[sessionId] ?? [];
-    const next = stripHeldByCliEntries(stripCliOwnedEntries(queue));
-    if (next.length === queue.length) return;
+    if (queue.length === 0) return;
+    const session = get().sessions[sessionId];
+    const userTexts =
+      session?.blocks
+        .filter((b): b is Extract<typeof b, { type: "user" }> => b.type === "user")
+        .map((b) => b.text) ?? [];
+    const next = settleQueueOnIdle(queue, userTexts);
+    // Rehomed held must not stay in "submitted/consumed" so drain can send.
     for (const item of queue) {
-      if (item.source === "cli" || item.heldByCli) submittedEnqueueIds.delete(item.id);
+      if (item.source === "cli" || item.heldByCli) {
+        submittedEnqueueIds.delete(item.id);
+        const texts = consumedConcurrentTextsBySession.get(sessionId);
+        const t = normalizeQueueText(item.text);
+        if (t && texts) texts.delete(t);
+        const ids = consumedConcurrentIdsBySession.get(sessionId);
+        if (ids) ids.delete(item.id);
+      }
     }
+    const same =
+      next.length === queue.length &&
+      next.every(
+        (row, i) =>
+          row.id === queue[i]?.id &&
+          row.heldByCli === queue[i]?.heldByCli &&
+          row.state === queue[i]?.state &&
+          row.source === queue[i]?.source,
+      );
+    if (same) return;
+    set({
+      promptQueues: {
+        ...get().promptQueues,
+        [sessionId]: next,
+      },
+    });
+  };
+
+  /**
+   * Agent fault / hard error: keep operator text, clear heldByCli so drain can
+   * re-send. Do not delete held rows (unlike stripStaleCliQueue on healthy idle —
+   * concurrent work may never have run on a dead child). Drops pure CLI ghosts.
+   */
+  const rehomeHeldQueueForRecovery = (sessionId: string) => {
+    const queue = get().promptQueues[sessionId] ?? [];
+    if (queue.length === 0) return;
+    const next = rehomeHeldQueueEntries(queue);
+    for (const item of queue) {
+      submittedEnqueueIds.delete(item.id);
+    }
+    const same =
+      next.length === queue.length &&
+      next.every(
+        (row, i) =>
+          row.id === queue[i]?.id &&
+          row.heldByCli === queue[i]?.heldByCli &&
+          row.state === queue[i]?.state &&
+          row.source === queue[i]?.source,
+      );
+    if (same) return;
     set({
       promptQueues: {
         ...get().promptQueues,
@@ -1765,7 +1865,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
       queueNotice: {
         id: uid(),
         entryId: next.id,
-        message: next.state === "interjected" ? "正在发送插话优先消息…" : "正在发送队首消息…",
+        message:
+          next.state === "interjected"
+            ? tOp("正在发送插话优先消息…", "Sending interject-first message…")
+            : tOp("正在发送队首消息…", "Sending queue head…"),
         state: "queued",
         at: Date.now(),
       },
@@ -1818,41 +1921,53 @@ export const useDesktop = create<DesktopState>((set, get) => {
     });
 
     // Fire-and-forget: do not block Composer "插话中…" on concurrent session/prompt.
+    // Mark before any await so idle-drain cannot dual-send this id.
+    submittedEnqueueIds.add(entry.id);
+    patchQueueEntryState(sessionId, entry.id, "sending");
+    const enqueueEpoch = currentConcurrentEnqueueEpoch(sessionId);
     void (async () => {
-      if (bridge.prepareComputerForPrompt) {
-        const cu = await bridge.prepareComputerForPrompt(sessionId, trimmed);
-        if (cu === "refused") {
-          const q = get().promptQueues[sessionId] ?? [];
-          const comps = get().sessionComposers;
-          const cur = comps[sessionId] ?? composerBase;
-          const restored = {
-            ...comps,
-            [sessionId]: {
-              ...cur,
-              text: trimmed || cur.text,
-              attachments: attachments.length > 0 ? [...attachments] : cur.attachments,
-            },
-          };
-          persistSessionComposers(restored);
-          set({
-            promptQueues: {
-              ...get().promptQueues,
-              [sessionId]: q.filter((item) => item.id !== entry.id),
-            },
-            sessionComposers: restored,
-            queueNotice: {
-              id: uid(),
-              message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
-              state: "blocked",
-              at: Date.now(),
-            },
-          });
+      const stale = () => currentConcurrentEnqueueEpoch(sessionId) !== enqueueEpoch;
+      try {
+        if (bridge.prepareComputerForPrompt) {
+          const cu = await bridge.prepareComputerForPrompt(sessionId, trimmed);
+          if (stale()) {
+            submittedEnqueueIds.delete(entry.id);
+            return;
+          }
+          if (cu === "refused") {
+            submittedEnqueueIds.delete(entry.id);
+            const q = get().promptQueues[sessionId] ?? [];
+            const comps = get().sessionComposers;
+            const cur = comps[sessionId] ?? composerBase;
+            const restored = {
+              ...comps,
+              [sessionId]: {
+                ...cur,
+                text: trimmed || cur.text,
+                attachments: attachments.length > 0 ? [...attachments] : cur.attachments,
+              },
+            };
+            persistSessionComposers(restored);
+            set({
+              promptQueues: {
+                ...get().promptQueues,
+                [sessionId]: q.filter((item) => item.id !== entry.id),
+              },
+              sessionComposers: restored,
+              queueNotice: {
+                id: uid(),
+                message: computerUseOptInRefuseMessage(),
+                state: "blocked",
+                at: Date.now(),
+              },
+            });
+            return;
+          }
+        }
+        if (stale()) {
+          submittedEnqueueIds.delete(entry.id);
           return;
         }
-      }
-      submittedEnqueueIds.add(entry.id);
-      patchQueueEntryState(sessionId, entry.id, "sending");
-      try {
         await bridge.enqueuePrompt(
           sessionId,
           trimmed,
@@ -1864,14 +1979,25 @@ export const useDesktop = create<DesktopState>((set, get) => {
           },
           { promptId: entry.id, sendNow: true },
         );
+        if (stale()) {
+          submittedEnqueueIds.delete(entry.id);
+          return;
+        }
         // Wire write ok — drop by id+text; mark consumed so CLI cannot resurrect.
         submittedEnqueueIds.delete(entry.id);
         markConsumedConcurrent(sessionId, entry.id, trimmed);
         dropQueueRows(sessionId, { id: entry.id, text: trimmed });
       } catch {
-        // CLI rejected concurrency — keep local ownership; drain on idle.
+        if (stale()) {
+          submittedEnqueueIds.delete(entry.id);
+          return;
+        }
+        // CLI rejected concurrency — keep local ownership; drain if already idle.
         submittedEnqueueIds.delete(entry.id);
         patchQueueEntryState(sessionId, entry.id, "interjected");
+        if (!sessionIsBusy(sessionId)) {
+          window.setTimeout(() => drainPromptQueue(sessionId), 0);
+        }
       }
     })();
   };
@@ -3419,13 +3545,30 @@ export const useDesktop = create<DesktopState>((set, get) => {
             !block.resolved &&
             block.id.startsWith("plan-approval-"),
         );
+        // Busy Enter = **local queue only**, drain as primary when status→idle.
+        // Concurrent session/prompt was dropped for this path: wire accept often
+        // never painted a user bubble, idle stripped held, and the follow-up only
+        // showed up after restart via CLI history — matches operator reports.
+        // (Ctrl+Enter 插话 still uses concurrent / interject RPC.)
         const gateHint = gated
           ? session.status === "awaiting_input"
-            ? "（回答问题后将自动发送）"
+            ? tOp(
+                "（回答问题后，回合空闲将发送；Stop 后需手动继续）",
+                " (sends when idle after you answer; after Stop, resume manually)",
+              )
             : isPlan
-              ? "（批准/拒绝计划后将自动发送）"
-              : "（处理权限后将自动发送）"
-          : "";
+              ? tOp(
+                  "（批准/拒绝计划后，回合空闲将发送；Stop 后需手动继续）",
+                  " (sends when idle after plan resolve; after Stop, resume manually)",
+                )
+              : tOp(
+                  "（处理权限后，回合空闲将发送；Stop 后需手动继续）",
+                  " (sends when idle after permission; after Stop, resume manually)",
+                )
+          : tOp(
+              "（当前回合结束后自动发送；Stop 后需手动继续）",
+              " (sends when this turn ends; after Stop, resume manually)",
+            );
         set({
           promptQueues: {
             ...promptQueues,
@@ -3435,106 +3578,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
           queueNotice: {
             id: uid(),
             entryId: entry.id,
-            message: `已加入队列（第 ${depth} 条）${gateHint}`,
+            message: tOp(
+              `已加入队列（第 ${depth} 条）${gateHint}`,
+              `Queued (#${depth})${gateHint}`,
+            ),
             state: "queued",
             at: Date.now(),
           },
         });
-
-        // Permission / question gate: local queue only — concurrent session/prompt
-        // mid-permission confuses most CLIs. Drain when the turn returns to idle.
-        if (gated) {
-          return true;
+        // If somehow already idle (race), drain immediately.
+        if (!sessionIsBusy(session.id)) {
+          window.setTimeout(() => drainPromptQueue(session.id), 0);
         }
-
-        // CU ensure on concurrent queue (same refuse/attach policy as promptInner).
-        void (async () => {
-          if (bridge.prepareComputerForPrompt) {
-            const cu = await bridge.prepareComputerForPrompt(session.id, trimmed);
-            if (cu === "refused") {
-              // Drop the queue entry and restore the draft — queue path already
-              // cleared sessionComposers; losing the text on CU refuse is a UX bug.
-              const q = get().promptQueues[session.id] ?? [];
-              const comps = get().sessionComposers;
-              const cur = comps[session.id] ?? composer;
-              const restored = {
-                ...comps,
-                [session.id]: {
-                  ...cur,
-                  text: trimmed || cur.text,
-                  attachments: attachments.length > 0 ? [...attachments] : cur.attachments,
-                },
-              };
-              persistSessionComposers(restored);
-              set({
-                promptQueues: {
-                  ...get().promptQueues,
-                  [session.id]: q.filter((item) => item.id !== entry.id),
-                },
-                sessionComposers: restored,
-                queueNotice: {
-                  id: uid(),
-                  message: COMPUTER_USE_OPT_IN_REFUSE_MESSAGE,
-                  state: "blocked",
-                  at: Date.now(),
-                },
-              });
-              return;
-            }
-          }
-          // Mark before wire write so idle-drain cannot dual-send this id.
-          // UI: "发送中" so the operator does not think it is still waiting.
-          submittedEnqueueIds.add(entry.id);
-          patchQueueEntryState(session.id, entry.id, "sending");
-          try {
-            await bridge.enqueuePrompt(
-              session.id,
-              trimmed,
-              {
-                model: composer.model,
-                effort: composer.effort,
-                mode: composer.mode,
-                attachments,
-              },
-              { promptId: entry.id },
-            );
-            // Write accepted — CLI owns execution. Keep a visible local row so
-            // the operator still sees "等待当前回合结束" (do not drop silently).
-            submittedEnqueueIds.delete(entry.id);
-            const q = get().promptQueues[session.id] ?? [];
-            set({
-              promptQueues: {
-                ...get().promptQueues,
-                [session.id]: q.map((item) =>
-                  item.id === entry.id
-                    ? {
-                        ...item,
-                        state: "sending" as const,
-                        source: "local" as const,
-                        heldByCli: true,
-                      }
-                    : item,
-                ),
-              },
-              queueNotice: {
-                id: uid(),
-                entryId: entry.id,
-                message: `已入队 · 等待当前回合结束后发送（第 ${
-                  q.findIndex((item) => item.id === entry.id) + 1 || 1
-                } 条）`,
-                state: "queued",
-                at: Date.now(),
-              },
-            });
-            // Fingerprint for ghost suppression when CLI re-emits the same text
-            // on queue/changed — the heldByCli row itself stays until idle.
-            markConsumedConcurrent(session.id, entry.id, trimmed);
-          } catch {
-            // CLI rejected write — keep local ownership for idle drain.
-            submittedEnqueueIds.delete(entry.id);
-            patchQueueEntryState(session.id, entry.id, "queued");
-          }
-        })();
         return true;
       }
 
@@ -4041,6 +4096,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const { activeId } = get();
       if (!activeId) return;
       // Cancel invalidates any concurrent enqueue bookkeeping for this mission.
+      bumpConcurrentEnqueueEpoch(activeId);
       for (const entry of get().promptQueues[activeId] ?? []) {
         submittedEnqueueIds.delete(entry.id);
       }
@@ -4307,8 +4363,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
             id: uid(),
             message:
               preference === "follow_cli"
-                ? "沙箱：跟随 CLI（桌面 Agent 不注入 sandbox）"
-                : `沙箱偏好已保存为「${preference}」— 桌面 Agent 主进程暂不注入（避免阻断模型 API）；工具隔离仍由 CLI 处理`,
+                ? tOp(
+                    "沙箱：跟随 CLI（桌面 Agent 不注入 sandbox）",
+                    "Sandbox: follow CLI (desktop agent does not inject)",
+                  )
+                : tOp(
+                    `沙箱偏好已保存为「${preference}」— 桌面 Agent 主进程暂不注入（避免阻断模型 API）；工具隔离仍由 CLI 处理`,
+                    `Sandbox preference saved as “${preference}” — not injected into agent leader (avoids model API 403); tool isolation stays CLI-side`,
+                  ),
             state: "queued",
             at: Date.now(),
           },
@@ -4321,13 +4383,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     async listWorktrees() {
       if (!isFeatureEnabled("worktreeUi")) return [];
-      if (bridge.kind !== "acp") return [];
-      try {
-        const raw = await invoke<unknown>("grok_worktree_list", { cwd: get().workspace });
-        return parseWorktreeList(raw);
-      } catch {
-        return [];
+      if (bridge.kind !== "acp") {
+        throw new Error(
+          tOp(
+            "worktree 不可用（非 ACP 桥接）",
+            "Worktree unavailable (non-ACP bridge)",
+          ),
+        );
       }
+      // Let invoke errors propagate so the panel can show status "error"
+      // (returning [] collapsed failures into "empty").
+      const raw = await invoke<unknown>("grok_worktree_list", { cwd: get().workspace });
+      return parseWorktreeList(raw);
     },
 
     async createWorktree(name, worktreeRef) {
@@ -4338,21 +4405,43 @@ export const useDesktop = create<DesktopState>((set, get) => {
           list?: unknown;
           name?: string;
           stderr?: string;
+          stdout?: string;
         }>("grok_worktree_create", {
           cwd: get().workspace,
           name,
           worktreeRef: worktreeRef ?? null,
         });
+        // Require explicit CLI success — missing ok or false must not false-succeed.
+        if (result?.ok !== true) {
+          const detail =
+            (typeof result.stderr === "string" && result.stderr.trim()) ||
+            (typeof result.stdout === "string" && result.stdout.trim()) ||
+            tOp("创建 worktree 失败", "Create worktree failed");
+          set({
+            queueNotice: {
+              id: uid(),
+              message: detail,
+              state: "blocked",
+              at: Date.now(),
+            },
+          });
+          return null;
+        }
         const entries = parseWorktreeList(result?.list);
+        // Exact name/id only — path.includes(name) false-matched e.g. feat ⊂ feature-old.
         const match =
-          entries.find((entry) => entry.name === name || entry.id === name) ??
-          entries.find((entry) => entry.path.includes(name)) ??
-          null;
+          entries.find((entry) => entry.name === name || entry.id === name) ?? null;
         if (!match) {
           set({
-            startupError: result?.ok === false
-              ? (result.stderr || "创建 worktree 失败")
-              : "worktree 已请求创建，但未能解析路径（未打开会话）",
+            queueNotice: {
+              id: uid(),
+              message: tOp(
+                "worktree 已请求创建，但未能解析路径（未打开会话）",
+                "Worktree create requested but path could not be resolved (no session opened)",
+              ),
+              state: "blocked",
+              at: Date.now(),
+            },
           });
           return null;
         }
@@ -4361,17 +4450,27 @@ export const useDesktop = create<DesktopState>((set, get) => {
           await invoke<string>("validate_workspace", { cwd: match.path });
         } catch (error) {
           set({
-            startupError:
-              error instanceof Error
-                ? error.message
-                : "worktree 路径无效，未创建会话",
+            queueNotice: {
+              id: uid(),
+              message:
+                error instanceof Error
+                  ? error.message
+                  : tOp("worktree 路径无效，未创建会话", "Invalid worktree path; no session created"),
+              state: "blocked",
+              at: Date.now(),
+            },
           });
           return null;
         }
         return match;
       } catch (error) {
         set({
-          startupError: error instanceof Error ? error.message : String(error),
+          queueNotice: {
+            id: uid(),
+            message: error instanceof Error ? error.message : String(error),
+            state: "blocked",
+            at: Date.now(),
+          },
         });
         return null;
       }
@@ -4381,7 +4480,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (!isFeatureEnabled("worktreeUi")) return false;
       // Structural check only — existence is proven by validate_workspace (I-06).
       if (!entry?.path?.trim()) {
-        set({ startupError: "无效的 worktree 条目" });
+        set({
+          queueNotice: {
+            id: uid(),
+            message: tOp("无效的 worktree 条目", "Invalid worktree entry"),
+            state: "blocked",
+            at: Date.now(),
+          },
+        });
         return false;
       }
       try {
@@ -4391,10 +4497,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
         return true;
       } catch (error) {
         set({
-          startupError:
-            error instanceof Error
-              ? error.message
-              : "无法打开 worktree（未创建无效会话）",
+          queueNotice: {
+            id: uid(),
+            message:
+              error instanceof Error
+                ? error.message
+                : tOp(
+                    "无法打开 worktree（未创建无效会话）",
+                    "Could not open worktree (no invalid session created)",
+                  ),
+            state: "blocked",
+            at: Date.now(),
+          },
         });
         return false;
       }
@@ -4405,21 +4519,22 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const preset = reviewPreset(allowEdits);
       get().setMode(preset.mode);
       get().setPermissionMode(preset.permissionMode);
-      // Sandbox may trigger agent restart when idle (I-03); set last so notice is accurate.
+      // Sandbox preference is UI-only (not injected into agent leader).
       if (isFeatureEnabled("sandboxUi")) {
         get().setSandboxPreference(preset.sandboxPreference);
       }
-      const pending = get().sandboxPendingApply;
       set({
         queueNotice: {
           id: uid(),
           message: allowEdits
-            ? pending
-              ? "已应用 Review（允许修改）；沙箱待 Agent 重连后生效"
-              : "已应用 Review 预设（允许修改）"
-            : pending
-              ? "已应用 Review（只读）；沙箱待 Agent 重连后生效"
-              : "已应用 Review 预设（只读审查）",
+            ? tOp(
+                "已应用 Review 预设（允许修改）：模式/权限已生效；沙箱偏好仅存储不注入",
+                "Review preset applied (allow edits): mode/permission live; sandbox preference stored only",
+              )
+            : tOp(
+                "已应用 Review 预设（模式/权限偏只读确认）；沙箱偏好仅存储不注入",
+                "Review preset applied (mode/permission lean read-only ask); sandbox preference stored only",
+              ),
           state: "queued",
           at: Date.now(),
         },

@@ -84,10 +84,9 @@ export function writeStoredSandboxPreference(
 /**
  * I-03: never half-apply sandbox mid-turn.
  *
- * Open default: **do not auto-restart** the agent on preference change.
- * Preference is always stored; it applies on the next ACP spawn / manual reconnect.
- * Auto-restart caused confusing reconnect storms and looked like "sandbox breaks API"
- * when the child failed to start (e.g. bad `--sandbox` argv order on old builds).
+ * Desktop ACP leader does **not** inject sandbox today (`sandboxSpawnArg` → null).
+ * Preference changes are store-only; no agent restart / reconnect is required or offered.
+ * Return value is kept for API stability: non-noop means "preference changed, UI-only".
  */
 export function shouldRestartAgentForSandbox(
   _anySessionBusy: boolean,
@@ -97,7 +96,7 @@ export function shouldRestartAgentForSandbox(
 ): "restart_now" | "defer_busy" | "noop" {
   if (!featureEnabled) return "noop";
   if (previous === next) return "noop";
-  // Always defer: UI offers "Reconnect to apply" when pending.
+  // Historical name: never restart; store treats this as "save preference only".
   return "defer_busy";
 }
 

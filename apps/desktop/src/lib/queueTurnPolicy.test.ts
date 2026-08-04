@@ -26,7 +26,8 @@ describe("smoke 1: busy 入队 → Stop → 队列保留且不自动发", () => 
       showQueue: true,
       showInterject: true,
     });
-    expect(resolveSendPath("running")).toBe("concurrent_queue");
+    // Enter while busy parks locally; drain as primary on idle (no concurrent wire).
+    expect(resolveSendPath("running")).toBe("local_gate_queue");
   });
 
   it("after Stop: suppress blocks drain even when status is idle and local rows exist", () => {
@@ -67,6 +68,27 @@ describe("smoke 1: busy 入队 → Stop → 队列保留且不自动发", () => 
     // Must skip sending + submitted — not delete them (H3).
     expect(nextDrainableIndex(queue, submitted)).toBe(2);
     expect(queue.map((e) => e.id)).toEqual(["sending-1", "sub-1", "ok"]);
+  });
+
+  it("skips heldByCli rows (CLI already accepted — never dual-send)", () => {
+    const queue = [
+      {
+        id: "held",
+        state: "queued" as const,
+        source: "local" as const,
+        heldByCli: true,
+        text: "waiting turn",
+      },
+      { id: "ok", state: "queued" as const, source: "local" as const, text: "ready" },
+    ];
+    expect(nextDrainableIndex(queue)).toBe(1);
+    expect(
+      shouldDrainQueue({
+        status: "idle",
+        suppressNextIdleDrain: false,
+        queue: [queue[0]!],
+      }),
+    ).toBe(false);
   });
 
   it("idle late CLI echo is stripped (M2) — not re-shown as 已入队", () => {

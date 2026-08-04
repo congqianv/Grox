@@ -70,24 +70,28 @@ export function PromptOptionsMenu({
   const [open, setOpen] = useState(false);
   const anchorRef = useRef<HTMLDivElement>(null);
   const sandboxPreference = useDesktop((s) => s.sandboxPreference);
-  const sandboxPendingApply = useDesktop((s) => s.sandboxPendingApply);
   const setSandboxPreference = useDesktop((s) => s.setSandboxPreference);
   const applyReviewPreset = useDesktop((s) => s.applyReviewPreset);
   const showSandbox = useIsFeatureEnabled("sandboxUi");
   const showReview = useIsFeatureEnabled("reviewMode");
 
+  // Preference-only labels — never look like live applied isolation.
   const sandboxLabel =
     sandboxPreference === "follow_cli"
       ? zh
-        ? "跟随CLI"
+        ? "CLI"
         : "CLI"
       : sandboxPreference === "read_only"
         ? zh
-          ? "只读"
-          : "RO"
+          ? "pref·只读"
+          : "pref:RO"
         : sandboxPreference === "off"
-          ? "off"
-          : "ws";
+          ? zh
+            ? "pref·off"
+            : "pref:off"
+          : zh
+            ? "pref·ws"
+            : "pref:ws";
 
   return (
     <div ref={anchorRef} className="relative">
@@ -95,7 +99,11 @@ export function PromptOptionsMenu({
         type="button"
         onClick={() => setOpen((value) => !value)}
         className="chip max-w-[220px]"
-        title={zh ? "模式、权限、沙箱与思考强度" : "Mode, access, sandbox and reasoning effort"}
+        title={
+          zh
+            ? "模式、权限、沙箱偏好（不注入）与思考强度"
+            : "Mode, access, sandbox preference (not injected), and reasoning effort"
+        }
       >
         <Icon name="gear" size={11} />
         <span className="truncate capitalize">
@@ -110,7 +118,6 @@ export function PromptOptionsMenu({
                 ? "确认"
                 : "Ask"}
           {showSandbox ? ` · ${sandboxLabel}` : ""}
-          {sandboxPendingApply ? "*" : ""}
         </span>
         <Icon name="chevronDown" size={9} className="text-faint" />
       </button>

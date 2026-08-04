@@ -5,6 +5,7 @@ import {
   COMPUTER_USE_STORAGE_KEY,
   computerLeaseIfAttached,
   computerToolNameFromPermissionTool,
+  computerUseOptInRefuseMessage,
   decideComputerAttachForPrompt,
   hasActiveComputerLease,
   isComputerUseEnvFlag,
@@ -194,6 +195,7 @@ describe("decideComputerAttachForPrompt (R4A-CU-01)", () => {
   it("exports refuse message for UI parity", () => {
     expect(COMPUTER_USE_OPT_IN_REFUSE_MESSAGE).toMatch(/Computer Use/);
     expect(COMPUTER_USE_OPT_IN_REFUSE_MESSAGE).toMatch(/设置/);
+    expect(computerUseOptInRefuseMessage()).toMatch(/Computer Use/);
   });
 });
 

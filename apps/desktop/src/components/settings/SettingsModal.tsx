@@ -246,7 +246,6 @@ function CiExamplesCopy({ zh }: { zh: boolean }) {
 
 function SandboxPreferenceRow({ zh }: { zh: boolean }) {
   const preference = useDesktop((s) => s.sandboxPreference);
-  const pending = useDesktop((s) => s.sandboxPendingApply);
   const setSandboxPreference = useDesktop((s) => s.setSandboxPreference);
   const sandboxUi = useIsFeatureEnabled("sandboxUi");
   if (!sandboxUi) return null;
@@ -270,9 +269,9 @@ function SandboxPreferenceRow({ zh }: { zh: boolean }) {
           <option value="read_only">{zh ? "只读 read-only" : "read-only"}</option>
           <option value="off">{zh ? "关闭 off（警告）" : "off (warn)"}</option>
         </select>
-        {pending && (
+        {preference !== "follow_cli" && (
           <span className="text-[10px] text-gold">
-            {zh ? "将在下次会话生效" : "Applies next session"}
+            {zh ? "仅存储偏好 · 不注入 Agent" : "Preference only · not injected"}
           </span>
         )}
       </div>
@@ -290,8 +289,8 @@ const FEATURE_FLAG_LABELS: Record<FeatureFlagKey, { zh: string; en: string; hint
   sandboxUi: {
     zh: "沙箱选择 UI（A1）",
     en: "Sandbox selector UI (A1)",
-    hintZh: "关闭时不注入 GROK_SANDBOX，行为与改前一致",
-    hintEn: "When off, no GROK_SANDBOX injection — same as pre-A1",
+    hintZh: "仅开关沙箱偏好 UI；桌面 Agent 主进程无论开关均不注入 --sandbox / GROK_SANDBOX",
+    hintEn: "Toggles sandbox preference UI only; desktop agent never injects --sandbox / GROK_SANDBOX either way",
   },
   worktreeUi: {
     zh: "Worktree UI（A2）",
