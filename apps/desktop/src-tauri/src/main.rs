@@ -4818,8 +4818,8 @@ async fn generate_media(
 ) -> Result<MediaGenerationResult, String> {
     let cwd = checked_workspace(&request.cwd)?;
     let prompt = checked_media_prompt(&request, &cwd)?;
-    let runtime = configured_grok_command(&app);
-    let mut command = Command::new(&runtime.path);
+    let command_path = require_absolute_grok_cli(&app)?;
+    let mut command = Command::new(&command_path);
     // Headless media child: tool allowlist is a hard constant (never from request).
     // `--always-approve` only covers these four media tools — not full agent yolo.
     // Chat `permissionMode` does not apply to this child process.
@@ -7532,6 +7532,30 @@ fn open_preview_external(url: String) -> Result<(), String> {
     spawn_system_browser(&parsed)
 }
 
+/// Absolute existing Grok CLI path — never bare PATH names (`grok` / `grok.exe`).
+fn require_absolute_grok_cli(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let runtime = configured_grok_command(app);
+    if runtime.source == "missing" || runtime.path.trim().is_empty() {
+        return Err(
+            "未找到可用的 Grok CLI（需系统安装、内置或 GROK_DESKTOP_CLI 绝对路径）".into(),
+        );
+    }
+    let command_path = PathBuf::from(&runtime.path);
+    if !command_path.is_absolute() {
+        return Err(format!(
+            "Grok CLI 路径必须为绝对路径，拒绝相对/PATH 名称：{}",
+            command_path.display()
+        ));
+    }
+    if !command_path.exists() {
+        return Err(format!(
+            "Grok CLI 不存在：{}。可通过 GROK_DESKTOP_CLI 指定可执行文件。",
+            command_path.display()
+        ));
+    }
+    Ok(command_path)
+}
+
 /// Shared helper: run a short-lived `grok <args>` with timeout (inspect / worktree).
 async fn run_grok_cli_json(
     app: &tauri::AppHandle,
@@ -7539,8 +7563,8 @@ async fn run_grok_cli_json(
     args: &[&str],
     timeout_secs: u64,
 ) -> Result<serde_json::Value, String> {
-    let runtime = configured_grok_command(app);
-    let mut command = Command::new(&runtime.path);
+    let command_path = require_absolute_grok_cli(app)?;
+    let mut command = Command::new(&command_path);
     command
         .args(args)
         .current_dir(cwd)
@@ -7622,8 +7646,8 @@ async fn grok_worktree_create(
     {
         return Err("worktree 名称包含非法字符".into());
     }
-    let runtime = configured_grok_command(&app);
-    let mut command = Command::new(&runtime.path);
+    let command_path = require_absolute_grok_cli(&app)?;
+    let mut command = Command::new(&command_path);
     // Create via Grok CLI only (no raw git worktree). Prefer headless print mode.
     // Failure degrades to error JSON for the shell — never fabricates a session cwd.
     command.arg("--worktree").arg(name);
@@ -7689,7 +7713,7 @@ async fn acp_spawn(
     state: tauri::State<'_, Arc<AcpState>>,
     cwd: String,
     sandbox: Option<String>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     // One spawn at a time: terminate → spawn → store must not interleave.
     let _spawn_guard = state.spawn_lock.lock().await;
 
@@ -7709,27 +7733,7 @@ async fn acp_spawn(
         terminate_process(old).await;
     }
 
-    let runtime = configured_grok_command(&app);
-    // Never spawn a bare PATH name ("grok" / "grok.exe") — missing resolution is
-    // a hard error (PATH hijack / TOCTOU). Prefer absolute resolved paths only.
-    if runtime.source == "missing" || runtime.path.trim().is_empty() {
-        return Err(
-            "未找到可用的 Grok CLI（需系统安装、内置或 GROK_DESKTOP_CLI 绝对路径）".into(),
-        );
-    }
-    let command_path = PathBuf::from(&runtime.path);
-    if !command_path.is_absolute() {
-        return Err(format!(
-            "Grok CLI 路径必须为绝对路径，拒绝相对/PATH 名称：{}",
-            command_path.display()
-        ));
-    }
-    if !command_path.exists() {
-        return Err(format!(
-            "Grok CLI 不存在：{}。可通过 GROK_DESKTOP_CLI 指定可执行文件。",
-            command_path.display()
-        ));
-    }
+    let command_path = require_absolute_grok_cli(&app)?;
     let computer_plugin = if cfg!(target_os = "windows") {
         match ensure_computer_plugin() {
             Ok(path) => Some(path),
@@ -7899,7 +7903,8 @@ async fn acp_spawn(
         }
     });
 
-    Ok(())
+    // FE must pass this generation on acp_send so stale writes after respawn fail.
+    Ok(generation)
 }
 
 /// Enable/disable silent history filtering for a session (or clear all).
@@ -7936,7 +7941,11 @@ fn acp_set_silent_stream(
 }
 
 #[tauri::command]
-async fn acp_send(state: tauri::State<'_, Arc<AcpState>>, line: String) -> Result<(), String> {
+async fn acp_send(
+    state: tauri::State<'_, Arc<AcpState>>,
+    line: String,
+    generation: Option<u64>,
+) -> Result<(), String> {
     if line.contains('\n') || line.contains('\r') {
         return Err("ACP 消息必须是单行 JSON".into());
     }
@@ -7953,6 +7962,12 @@ async fn acp_send(state: tauri::State<'_, Arc<AcpState>>, line: String) -> Resul
     let process = guard
         .as_mut()
         .ok_or_else(|| "Grok Agent 尚未启动".to_string())?;
+    // Reject writes aimed at a previous child after reconnect/spawn (FE passes generation).
+    if let Some(expected) = generation {
+        if process.generation != expected {
+            return Err("ACP 连接已更换，请重试当前操作".into());
+        }
+    }
     process
         .stdin
         .write_all(line.as_bytes())

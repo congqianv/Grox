@@ -156,7 +156,7 @@ function sanitizeHtml(html: string): string {
       "stroke-width",
       "class",
       "id",
-      "style",
+      // no "style" — reduce UI-redress risk from agent HTML (R2 security)
       "transform",
       "points",
       "marker-end",
@@ -234,7 +234,7 @@ async function hydrateMermaid(root: HTMLElement, renderKey: string) {
         // Mermaid SVG is produced by the library; still sanitize.
         const clean = DOMPurify.sanitize(svg, {
           USE_PROFILES: { svg: true, html: true },
-          ADD_ATTR: ["viewBox", "xmlns", "fill", "stroke", "stroke-width", "d", "cx", "cy", "r", "x", "y", "width", "height", "transform", "points", "marker-end", "markerWidth", "markerHeight", "orient", "refX", "refY", "class", "id", "style"],
+          ADD_ATTR: ["viewBox", "xmlns", "fill", "stroke", "stroke-width", "d", "cx", "cy", "r", "x", "y", "width", "height", "transform", "points", "marker-end", "markerWidth", "markerHeight", "orient", "refX", "refY", "class", "id"],
         });
         node.innerHTML = clean;
         node.dataset.mermaidDone = "1";

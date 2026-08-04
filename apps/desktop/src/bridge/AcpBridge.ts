@@ -820,6 +820,8 @@ export class AcpBridge implements GrokBridge {
   private listeners = new Set<(event: BridgeEvent) => void>();
   private pending = new Map<RpcId, PendingRequest>();
   private interactions = new Map<string, PendingInteraction>();
+  /** Matches Rust ACP child generation; required on acp_send after respawn. */
+  private acpGeneration = 0;
   /** Plan decisions keyed by `sessionId:rpcId` — first answer wins. */
   private resolvedPlanDecisions = new Map<string, PermissionOption>();
   /** Same decisions keyed by blockId for UI duplicate clicks after map delete. */
@@ -1504,8 +1506,8 @@ export class AcpBridge implements GrokBridge {
       let timedOut = false;
       let timeoutId: number | undefined;
       try {
-        await Promise.race([
-          invoke("acp_spawn", { cwd: this.workspace, sandbox }),
+        const generation = await Promise.race([
+          invoke<number>("acp_spawn", { cwd: this.workspace, sandbox }),
           new Promise<never>((_, reject) => {
             timeoutId = window.setTimeout(() => {
               timedOut = true;
@@ -1513,6 +1515,9 @@ export class AcpBridge implements GrokBridge {
             }, 30_000);
           }),
         ]);
+        if (typeof generation === "number" && Number.isFinite(generation)) {
+          this.acpGeneration = generation;
+        }
       } catch (error) {
         // FE timeout must not leave a live orphan child owned by Rust.
         if (timedOut) {
@@ -1566,8 +1571,11 @@ export class AcpBridge implements GrokBridge {
             this.suppressExitHandling = true;
             try {
               // acp_spawn terminates the previous child under spawn_lock; no bare kill.
-              await Promise.race([
-                invoke("acp_spawn", { cwd: this.workspace }),
+              const generation = await Promise.race([
+                invoke<number>("acp_spawn", {
+                  cwd: this.workspace,
+                  sandbox: sandboxSpawnArg(isFeatureEnabled("sandboxUi")),
+                }),
                 new Promise<never>((_, reject) => {
                   window.setTimeout(
                     () => reject(new Error("启动 Grok Agent 超时（30 秒）")),
@@ -1575,6 +1583,9 @@ export class AcpBridge implements GrokBridge {
                   );
                 }),
               ]);
+              if (typeof generation === "number" && Number.isFinite(generation)) {
+                this.acpGeneration = generation;
+              }
               response = await this.requestRaw(
                 ACP_METHODS.initialize,
                 {
@@ -2932,7 +2943,10 @@ export class AcpBridge implements GrokBridge {
   }
 
   private async sendRaw(message: JsonRpcMessage): Promise<void> {
-    await invoke("acp_send", { line: JSON.stringify(message) });
+    await invoke("acp_send", {
+      line: JSON.stringify(message),
+      generation: this.acpGeneration,
+    });
   }
 
   private requestRaw(method: string, params: unknown, timeoutMs = 30_000): Promise<unknown> {

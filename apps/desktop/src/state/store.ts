@@ -3487,7 +3487,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           set({
             queueNotice: {
               id: uid(),
-              message: "相同消息已在队列中",
+              message: tOp("相同消息已在队列中", "Same message is already queued"),
               state: "duplicate",
               at: Date.now(),
             },
@@ -3501,7 +3501,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           set({
             queueNotice: {
               id: uid(),
-              message: "该消息已在当前回合执行中",
+              message: tOp("该消息已在当前回合执行中", "That message is already running this turn"),
               state: "duplicate",
               at: Date.now(),
             },
@@ -3516,7 +3516,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
           set({
             queueNotice: {
               id: uid(),
-              message: "该消息已提交到当前回合（并发处理中）",
+              message: tOp(
+                "该消息已提交到当前回合（并发处理中）",
+                "That message is already in flight for this turn",
+              ),
               state: "duplicate",
               at: Date.now(),
             },
@@ -3830,7 +3833,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({
           queueNotice: {
             id: uid(),
-            message: "该消息已在当前回合执行中",
+            message: tOp("该消息已在当前回合执行中", "That message is already running this turn"),
             state: "duplicate",
             at: Date.now(),
           },
@@ -3841,7 +3844,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({
           queueNotice: {
             id: uid(),
-            message: "该消息已提交到当前回合（并发处理中）",
+            message: tOp(
+              "该消息已提交到当前回合（并发处理中）",
+              "That message is already in flight for this turn",
+            ),
             state: "duplicate",
             at: Date.now(),
           },
@@ -3963,7 +3969,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         queueNotice: {
           id: uid(),
           entryId: queueId,
-          message: "队列消息已移除",
+          message: tOp("队列消息已移除", "Removed from queue"),
           state: "removed",
           at: Date.now(),
         },
@@ -3999,7 +4005,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         queueNotice: {
           id: uid(),
           entryId: item.id,
-          message: `已调整到第 ${toIndex + 1} 位`,
+          message: tOp(
+            `已调整到第 ${toIndex + 1} 位`,
+            `Moved to position ${toIndex + 1}`,
+          ),
           state: "reordered",
           at: Date.now(),
         },
@@ -4028,7 +4037,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           ? {
               queueNotice: {
                 id: uid(),
-                message: "等待队列已清空",
+                message: tOp("等待队列已清空", "Queue cleared"),
                 state: "cleared" as const,
                 at: Date.now(),
               },
@@ -4054,7 +4063,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         queueNotice: {
           id: uid(),
           entryId: queueId,
-          message: "已置顶；回合结束后将优先发送",
+          message: tOp(
+            "已置顶；回合结束后将优先发送",
+            "Pinned; will send first when this turn ends",
+          ),
           state: "interjected",
           at: Date.now(),
         },
@@ -4080,7 +4092,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         queueNotice: {
           id: uid(),
           entryId: queueId,
-          message: "编辑已提交，等待 CLI 确认",
+          message: tOp("编辑已提交，等待 CLI 确认", "Edit submitted; waiting for CLI"),
           state: "updated",
           at: Date.now(),
         },
@@ -4238,7 +4250,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({
           queueNotice: {
             id: uid(),
-            message: "该请求已处理，未重复提交",
+            message: tOp("该请求已处理，未重复提交", "Already handled; not submitted again"),
             state: "duplicate",
             at: Date.now(),
           },
@@ -4250,7 +4262,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({
           queueNotice: {
             id: uid(),
-            message: result.message ?? "该请求已处理，未重复提交",
+            message:
+              result.message ??
+              tOp("该请求已处理，未重复提交", "Already handled; not submitted again"),
             state: "duplicate",
             at: Date.now(),
           },
@@ -4271,9 +4285,15 @@ export const useDesktop = create<DesktopState>((set, get) => {
             message:
               option === "deny"
                 ? feedback?.trim()
-                  ? "已发送计划修改要求，原回合将继续规划"
-                  : "计划已拒绝，原回合将继续规划"
-                : "计划已批准，原回合将继续执行（未额外发送消息）",
+                  ? tOp(
+                      "已发送计划修改要求，原回合将继续规划",
+                      "Plan revision sent; the turn continues planning",
+                    )
+                  : tOp("计划已拒绝，原回合将继续规划", "Plan denied; the turn continues planning")
+                : tOp(
+                    "计划已批准，原回合将继续执行（未额外发送消息）",
+                    "Plan approved; the turn continues (no extra message sent)",
+                  ),
             state: "queued",
             at: Date.now(),
           },
