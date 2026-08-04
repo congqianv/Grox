@@ -179,7 +179,14 @@ export function SubagentRail({ session, zh }: { session: Session; zh: boolean })
     >
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3">
         <Icon name="layers" size={12} className="text-acc" />
-        <span className="font-mono text-[10px] tracking-[0.12em] text-fg2">
+        <span
+          className="font-mono text-[10px] tracking-[0.12em] text-fg2"
+          title={
+            zh
+              ? "真·子代理进度/历史（不含 shell）。Plan 步骤在右侧「任务」Tab。"
+              : "Real subagent progress/history (no shell). Plan steps live under Tasks."
+          }
+        >
           {zh ? "子代理" : "AGENTS"}
         </span>
         {live.length > 0 && (
@@ -229,8 +236,10 @@ export function SubagentRail({ session, zh }: { session: Session; zh: boolean })
             {zh ? "进行中" : "IN PROGRESS"}
           </p>
           {live.length === 0 ? (
-            <p className="px-0.5 py-2 text-[11px] text-faint">
-              {zh ? "当前无运行中的子代理" : "No live subagents"}
+            <p className="px-0.5 py-2 text-[11px] leading-relaxed text-faint">
+              {zh
+                ? "当前无运行中的子代理（不含普通 shell/工具）"
+                : "No live subagents (plain shell tools are hidden)"}
             </p>
           ) : (
             <div className="flex flex-col gap-1.5">
@@ -259,8 +268,10 @@ export function SubagentRail({ session, zh }: { session: Session; zh: boolean })
           </button>
           {showHistory &&
             (recent.length === 0 ? (
-              <p className="px-0.5 py-2 text-[11px] text-faint">
-                {zh ? "本会话尚无已完成子代理" : "No finished subagents yet"}
+              <p className="px-0.5 py-2 text-[11px] leading-relaxed text-faint">
+                {zh
+                  ? "尚无已完成的子代理。普通 Task/shell 不会出现在这里。"
+                  : "No finished subagents. Plain Task/shell tools are omitted."}
               </p>
             ) : (
               <div className="flex flex-col gap-1.5">
