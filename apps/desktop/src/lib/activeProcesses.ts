@@ -128,3 +128,55 @@ export function extractActiveSubagents(session: Session | null | undefined): Act
   out.sort((a, b) => b.startedAt - a.startedAt);
   return out;
 }
+
+const FINISHED: ReadonlySet<ToolStatus> = new Set(["done", "cancelled", "error"]);
+
+/**
+ * Recent finished subagents for the history strip (B1).
+ * Newest first; capped so the composer stays compact.
+ */
+export function extractRecentSubagents(
+  session: Session | null | undefined,
+  limit = 8,
+): ActiveSubagent[] {
+  if (!session) return [];
+  const out: ActiveSubagent[] = [];
+  for (const block of session.blocks) {
+    if (block.type !== "tool") continue;
+    const { call } = block;
+    if (!FINISHED.has(call.status)) continue;
+    if (!isSubagentCall(call)) continue;
+    const title = subagentTitle(call);
+    out.push({
+      id: call.id,
+      blockId: block.id,
+      title,
+      detail: subagentDetail(call, title),
+      agentType: parseAgentType(call),
+      status: call.status,
+      startedAt: call.startedAt,
+      kind: call.kind,
+    });
+  }
+  out.sort((a, b) => b.startedAt - a.startedAt);
+  return out.slice(0, Math.max(0, limit));
+}
+
+/** Focus a timeline tool card by block id (B1 click-to-locate). */
+export function focusTimelineBlock(blockId: string): boolean {
+  if (typeof document === "undefined") return false;
+  const safe =
+    typeof CSS !== "undefined" && typeof CSS.escape === "function"
+      ? CSS.escape(blockId)
+      : blockId.replace(/["\\]/g, "\\$&");
+  const el =
+    document.querySelector(`[data-block-id="${safe}"]`) ??
+    document.getElementById(`block-${blockId}`);
+  if (!(el instanceof HTMLElement)) return false;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.classList.add("ring-1", "ring-acc/50");
+  window.setTimeout(() => {
+    el.classList.remove("ring-1", "ring-acc/50");
+  }, 1600);
+  return true;
+}

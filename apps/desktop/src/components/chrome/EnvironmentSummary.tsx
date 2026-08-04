@@ -6,6 +6,8 @@ import { baseName } from "../../lib/format";
 import { useI18n } from "../../lib/i18n";
 import { isSafeMarkdownOpenUrl } from "../../lib/openUrlSafety";
 import { Icon } from "../fx/Icon";
+import { EffectiveRuntimePanel } from "./EffectiveRuntimePanel";
+import { WorktreePanel } from "./WorktreePanel";
 
 interface GitSummary {
   isRepository: boolean;
@@ -254,6 +256,9 @@ export function EnvironmentSummary() {
           </div>
 
           <div className="p-3">
+            <EffectiveRuntimePanel zh={zh} />
+            <WorktreePanel zh={zh} />
+
             <SummaryRow icon="edit" label={zh ? "变更" : "Changes"}>
               <span className="ml-auto flex items-center gap-1.5 font-mono text-[10.5px]">
                 <span className="text-dim">{summary?.changedFiles ?? 0}</span>

@@ -7468,14 +7468,150 @@ fn open_preview_external(url: String) -> Result<(), String> {
     spawn_system_browser(&parsed)
 }
 
+/// Shared helper: run a short-lived `grok <args>` with timeout (inspect / worktree).
+async fn run_grok_cli_json(
+    app: &tauri::AppHandle,
+    cwd: &Path,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Result<serde_json::Value, String> {
+    let runtime = configured_grok_command(app);
+    let mut command = Command::new(&runtime.path);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    apply_cli_provider_environment(&mut command);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), command.output())
+        .await
+        .map_err(|_| format!("grok {} 超时（{timeout_secs} 秒）", args.join(" ")))?
+        .map_err(|error| format!("无法启动 grok {}：{error}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.as_ref()
+        } else {
+            stdout.as_ref()
+        };
+        return Err(format!(
+            "grok {} 失败：{}",
+            args.join(" "),
+            detail.trim().chars().take(2_000).collect::<String>()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        // list may legitimately be empty JSON array — callers parse "[]"
+        return Ok(serde_json::json!([]));
+    }
+    serde_json::from_str(trimmed).map_err(|error| {
+        format!(
+            "无法解析 grok {} JSON：{error} · {}",
+            args.join(" "),
+            trimmed.chars().take(240).collect::<String>()
+        )
+    })
+}
+
+/// Run `grok inspect --json` for the workspace (A0 Effective panel).
+/// Read-only discovery — does not change agent spawn, sandbox, or permissions.
+/// Hard timeout so a hung CLI never blocks the shell UI.
+#[tauri::command]
+async fn grok_inspect(app: tauri::AppHandle, cwd: String) -> Result<serde_json::Value, String> {
+    let root = checked_workspace(&cwd)?;
+    run_grok_cli_json(&app, &root, &["inspect", "--json"], 12).await
+}
+
+/// List tracked worktrees via `grok worktree list --json` (A2). Never uses raw git worktree.
+#[tauri::command]
+async fn grok_worktree_list(app: tauri::AppHandle, cwd: String) -> Result<serde_json::Value, String> {
+    let root = checked_workspace(&cwd)?;
+    run_grok_cli_json(&app, &root, &["worktree", "list", "--json", "--all"], 20).await
+}
+
+/// Create a worktree through Grok CLI (`--worktree`), not raw `git worktree` (A2).
+/// Returns JSON `{ "path": "...", "name": "..." }` when path can be resolved.
+#[tauri::command]
+async fn grok_worktree_create(
+    app: tauri::AppHandle,
+    cwd: String,
+    name: String,
+    worktree_ref: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let root = checked_workspace(&cwd)?;
+    let name = name.trim();
+    if name.is_empty() || name.len() > 80 {
+        return Err("worktree 名称需为 1–80 个字符".into());
+    }
+    if name.contains("..")
+        || name.chars().any(|c| c.is_control() || c == '/' || c == '\\' || c == ':')
+    {
+        return Err("worktree 名称包含非法字符".into());
+    }
+    let runtime = configured_grok_command(&app);
+    let mut command = Command::new(&runtime.path);
+    // Create via Grok CLI only (no raw git worktree). Prefer headless print mode.
+    // Failure degrades to error JSON for the shell — never fabricates a session cwd.
+    command.arg("--worktree").arg(name);
+    if let Some(reference) = worktree_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.arg("--worktree-ref").arg(reference);
+    }
+    command
+        .args(["-p", "true"])
+        .current_dir(&root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    apply_cli_provider_environment(&mut command);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .map_err(|_| "创建 worktree 超时（90 秒）".to_string())?
+        .map_err(|error| format!("无法启动 grok --worktree：{error}"))?;
+    // Re-list so we return a concrete path (I-06: caller must validate before session).
+    let listed = run_grok_cli_json(&app, &root, &["worktree", "list", "--json", "--all"], 20)
+        .await
+        .unwrap_or_else(|_| serde_json::json!([]));
+    Ok(serde_json::json!({
+        "name": name,
+        "ok": output.status.success(),
+        "stderr": String::from_utf8_lossy(&output.stderr).trim().chars().take(800).collect::<String>(),
+        "stdout": String::from_utf8_lossy(&output.stdout).trim().chars().take(800).collect::<String>(),
+        "list": listed,
+    }))
+}
+
 /// Start a fresh ACP child and stream each stdout JSON-RPC line to the webview.
 /// A repeated call intentionally replaces the old child so a webview reload
 /// cannot initialize the same agent process twice.
+///
+/// `sandbox`: optional profile. Only set when the user explicitly chose one
+/// (A1). `None` / empty → follow CLI (do not inject GROK_SANDBOX).
 #[tauri::command]
 async fn acp_spawn(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AcpState>>,
     cwd: String,
+    sandbox: Option<String>,
 ) -> Result<(), String> {
     // One spawn at a time: terminate → spawn → store must not interleave.
     let _spawn_guard = state.spawn_lock.lock().await;
@@ -7514,6 +7650,20 @@ async fn acp_spawn(
     if let Some(plugin) = computer_plugin.as_ref() {
         command.arg("--plugin-dir").arg(plugin);
     }
+    // A1: explicit sandbox only (never implicit). Profile validated here;
+    // env is re-applied *after* apply_cli_provider_environment so ~/.grok/.env
+    // GROK_* cannot override the operator's UI choice.
+    let sandbox_profile = sandbox
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(profile) = sandbox_profile {
+        let allowed = matches!(profile, "workspace" | "read-only" | "off");
+        if !allowed {
+            return Err(format!("不支持的沙箱配置：{profile}"));
+        }
+        command.arg("--sandbox").arg(profile);
+    }
     command
         .args(["--leader", "--reasoning-effort", "high", "stdio"])
         .current_dir(&cwd)
@@ -7522,6 +7672,9 @@ async fn acp_spawn(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     apply_cli_provider_environment(&mut command);
+    if let Some(profile) = sandbox_profile {
+        command.env("GROK_SANDBOX", profile);
+    }
     // Keep config.toml in lockstep with the active profile so a restart after
     // editing resident models still routes away from stale local [model.*]
     // base_url overrides without requiring a manual re-activate.
@@ -8061,6 +8214,9 @@ fn main() {
             check_app_update,
             install_app_update,
             start_project_preview,
+            grok_inspect,
+            grok_worktree_list,
+            grok_worktree_create,
             acp_spawn,
             acp_send,
             acp_kill,

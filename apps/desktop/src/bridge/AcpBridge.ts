@@ -3,6 +3,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { GrokBridge } from "./GrokBridge";
+import { isFeatureEnabled } from "../lib/featureFlags";
+import { sandboxSpawnArg } from "../lib/sandboxPolicy";
 import {
   MODELS,
   readStoredPermissionMode,
@@ -1443,8 +1445,11 @@ export class AcpBridge implements GrokBridge {
     // process replaced during a Tauri hot reload produces misleading errors.
     this.diagnostics = [];
     try {
+      // A1: only pass sandbox when feature on AND user explicitly chose a profile.
+      // Flag off / follow_cli → null → Tauri does not inject GROK_SANDBOX (I-08).
+      const sandbox = sandboxSpawnArg(isFeatureEnabled("sandboxUi"));
       await Promise.race([
-        invoke("acp_spawn", { cwd: this.workspace }),
+        invoke("acp_spawn", { cwd: this.workspace, sandbox }),
         new Promise<never>((_, reject) => {
           window.setTimeout(
             () => reject(new Error("启动 Grok Agent 超时（30 秒）")),

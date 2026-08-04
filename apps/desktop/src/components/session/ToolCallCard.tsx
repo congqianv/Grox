@@ -69,7 +69,11 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
     : call.title;
 
   return (
-    <div className="mb-1 animate-fade-up pl-0.5">
+    <div
+      className="mb-1 animate-fade-up pl-0.5"
+      data-block-id={block.id}
+      id={`block-${block.id}`}
+    >
       <div className="toolline rounded-r-[4px] bg-raise/45 pl-2 pr-1">
         {/* header */}
         <button onClick={() => setOpen((v) => !v)} className="flex h-7 w-full items-center gap-1.5 text-left">

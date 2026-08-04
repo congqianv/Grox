@@ -9,7 +9,16 @@ import { listen } from "@tauri-apps/api/event";
 import { bridge } from "../bridge";
 import { DEFAULT_PERMISSION_MODE, MODELS, readStoredPermissionMode } from "../bridge/types";
 import { COMPUTER_USE_OPT_IN_REFUSE_MESSAGE } from "../lib/computerUse";
+import { isFeatureEnabled } from "../lib/featureFlags";
 import { isSafeMarkdownOpenUrl } from "../lib/openUrlSafety";
+import { reviewPreset } from "../lib/reviewPreset";
+import {
+  type SandboxPreference,
+  readStoredSandboxPreference,
+  shouldRestartAgentForSandbox,
+  writeStoredSandboxPreference,
+} from "../lib/sandboxPolicy";
+import { parseWorktreeList, type WorktreeEntry } from "../lib/worktreePolicy";
 import type {
   AgentMode,
   AccountInfo,
@@ -557,6 +566,13 @@ interface DesktopState {
   effort: Effort;
   mode: AgentMode;
   permissionMode: PermissionMode;
+  /** A1: requested sandbox preference (follow_cli by default). */
+  sandboxPreference: SandboxPreference;
+  /**
+   * A1: user changed sandbox while a turn was busy — apply on next agent restart.
+   * Never half-applies mid-turn (I-03).
+   */
+  sandboxPendingApply: boolean;
   sessionComposers: Record<string, SessionComposerState>;
   promptQueues: Record<string, QueuedPrompt[]>;
   /** Last queue/interject/gate receipt shown above the composer. */
@@ -689,6 +705,19 @@ interface DesktopState {
   setEffort(effort: Effort): void;
   setMode(mode: AgentMode): void;
   setPermissionMode(mode: PermissionMode): void;
+  /** A1: sandbox preference; idle → restart agent; busy → defer (I-03). */
+  setSandboxPreference(preference: SandboxPreference): void;
+  /** A2: list worktrees via grok CLI (empty/degraded on failure). */
+  listWorktrees(): Promise<WorktreeEntry[]>;
+  /** A2: create worktree via grok --worktree; does not open session on failure (I-06). */
+  createWorktree(name: string, worktreeRef?: string): Promise<WorktreeEntry | null>;
+  /**
+   * A2: bind workspace to an existing worktree path then open home.
+   * Rejects invalid paths without creating a session (I-06).
+   */
+  openWorktree(entry: WorktreeEntry): Promise<boolean>;
+  /** D: apply review preset (optional; flag-gated). */
+  applyReviewPreset(allowEdits: boolean): void;
   setDraft(text: string): void;
   setComposerAttachments(attachments: PromptAttachment[]): void;
   setInspectorTab(tab: InspectorTab): void;
@@ -1435,6 +1464,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
         consumedConcurrentTextsBySession.clear();
         // Reconnect is a clean slate — allow queue drain again.
         suppressNextIdleDrain.clear();
+        // A1: deferred sandbox now lives on the new child if flag still on.
+        set({ sandboxPendingApply: false });
         for (const id of Object.keys(get().sessions)) {
           releasePromptFlight(id);
         }
@@ -1905,6 +1936,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
     effort: (localStorage.getItem("grok.effort") as Effort) ?? "high",
     mode: "agent",
     permissionMode: readStoredPermissionMode(),
+    sandboxPreference: readStoredSandboxPreference(),
+    sandboxPendingApply: false,
     sessionComposers: loadSessionComposers(),
     promptQueues: {},
     queueNotice: null,
@@ -4216,6 +4249,144 @@ export const useDesktop = create<DesktopState>((set, get) => {
       persistSessionComposers(next);
       set({ permissionMode, sessionComposers: next });
     },
+
+    setSandboxPreference(preference) {
+      const previous = get().sandboxPreference;
+      writeStoredSandboxPreference(preference);
+      const anyBusy = Object.values(get().sessions).some(
+        (session) =>
+          session.status === "running" || session.status === "awaiting_permission",
+      );
+      const action = shouldRestartAgentForSandbox(
+        anyBusy,
+        isFeatureEnabled("sandboxUi"),
+        previous,
+        preference,
+      );
+      if (action === "defer_busy") {
+        set({
+          sandboxPreference: preference,
+          sandboxPendingApply: true,
+          queueNotice: {
+            id: uid(),
+            message: "沙箱将在当前回合结束后 / 下次 Agent 重启时生效",
+            state: "queued",
+            at: Date.now(),
+          },
+        });
+        return;
+      }
+      set({ sandboxPreference: preference, sandboxPendingApply: false });
+      if (action === "restart_now" && bridge.forceReconnectAgent) {
+        void bridge.forceReconnectAgent().catch((error) => {
+          set({
+            startupError: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
+    },
+
+    async listWorktrees() {
+      if (!isFeatureEnabled("worktreeUi")) return [];
+      if (bridge.kind !== "acp") return [];
+      try {
+        const raw = await invoke<unknown>("grok_worktree_list", { cwd: get().workspace });
+        return parseWorktreeList(raw);
+      } catch {
+        return [];
+      }
+    },
+
+    async createWorktree(name, worktreeRef) {
+      if (!isFeatureEnabled("worktreeUi") || bridge.kind !== "acp") return null;
+      try {
+        const result = await invoke<{
+          ok?: boolean;
+          list?: unknown;
+          name?: string;
+          stderr?: string;
+        }>("grok_worktree_create", {
+          cwd: get().workspace,
+          name,
+          worktreeRef: worktreeRef ?? null,
+        });
+        const entries = parseWorktreeList(result?.list);
+        const match =
+          entries.find((entry) => entry.name === name || entry.id === name) ??
+          entries.find((entry) => entry.path.includes(name)) ??
+          null;
+        if (!match) {
+          set({
+            startupError: result?.ok === false
+              ? (result.stderr || "创建 worktree 失败")
+              : "worktree 已请求创建，但未能解析路径（未打开会话）",
+          });
+          return null;
+        }
+        // I-06: validate path before any session open.
+        try {
+          await invoke<string>("validate_workspace", { cwd: match.path });
+        } catch (error) {
+          set({
+            startupError:
+              error instanceof Error
+                ? error.message
+                : "worktree 路径无效，未创建会话",
+          });
+          return null;
+        }
+        return match;
+      } catch (error) {
+        set({
+          startupError: error instanceof Error ? error.message : String(error),
+        });
+        return null;
+      }
+    },
+
+    async openWorktree(entry) {
+      if (!isFeatureEnabled("worktreeUi")) return false;
+      // Structural check only — existence is proven by validate_workspace (I-06).
+      if (!entry?.path?.trim()) {
+        set({ startupError: "无效的 worktree 条目" });
+        return false;
+      }
+      try {
+        const validated = await invoke<string>("validate_workspace", { cwd: entry.path.trim() });
+        // setWorkspace focuses home; does not auto-create a mission session.
+        await get().setWorkspace(validated);
+        return true;
+      } catch (error) {
+        set({
+          startupError:
+            error instanceof Error
+              ? error.message
+              : "无法打开 worktree（未创建无效会话）",
+        });
+        return false;
+      }
+    },
+
+    applyReviewPreset(allowEdits) {
+      if (!isFeatureEnabled("reviewMode")) return;
+      const preset = reviewPreset(allowEdits);
+      get().setMode(preset.mode);
+      get().setPermissionMode(preset.permissionMode);
+      if (isFeatureEnabled("sandboxUi")) {
+        get().setSandboxPreference(preset.sandboxPreference);
+      }
+      set({
+        queueNotice: {
+          id: uid(),
+          message: allowEdits
+            ? "已应用 Review 预设（允许修改）"
+            : "已应用 Review 预设（只读审查）",
+          state: "queued",
+          at: Date.now(),
+        },
+      });
+    },
+
     setDraft(text) {
       const { activeId, sessionComposers, model, effort, mode, permissionMode } = get();
       if (!activeId) return;
