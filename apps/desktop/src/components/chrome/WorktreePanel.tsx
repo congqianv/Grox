@@ -61,7 +61,11 @@ export function WorktreePanel({ zh }: { zh: boolean }) {
         setNotice(zh ? `已创建 ${entry.name ?? entry.id}` : `Created ${entry.name ?? entry.id}`);
         await refresh();
       } else {
-        setNotice(zh ? "创建失败或路径未确认（未打开会话）" : "Create failed or path unconfirmed (no session opened)");
+        setNotice(
+          zh
+            ? "创建失败或路径未确认（未打开会话）"
+            : "Create failed or path unconfirmed (no session opened)",
+        );
       }
     } finally {
       setBusy(false);
@@ -90,8 +94,8 @@ export function WorktreePanel({ zh }: { zh: boolean }) {
   return (
     <div className="mx-2 mb-2 rounded-[6px] border border-line bg-void/80 p-2.5">
       <div className="mb-2 flex items-center gap-1.5">
-        <span className="lbl !text-[9px] !tracking-[0.1em]">
-          {zh ? "工作区绑定" : "WORKSPACE BIND"}
+        <span className="text-[10px] font-medium tracking-wide text-mute">
+          {zh ? "工作区绑定" : "Workspace bind"}
         </span>
         <button
           type="button"
@@ -103,20 +107,27 @@ export function WorktreePanel({ zh }: { zh: boolean }) {
         </button>
       </div>
 
-      <p className="mb-2 font-mono text-[9.5px] text-faint">
-        {zh ? "默认 Local（当前项目）。Worktree 可选。" : "Default Local (current project). Worktree optional."}
+      <p className="mb-2 text-[10px] leading-snug text-faint">
+        {zh
+          ? "默认使用当前 Local 项目。Worktree 可选，失败不挡聊天。"
+          : "Default is the current Local project. Worktree is optional."}
       </p>
 
-      <div className="summary-row mb-1">
-        <Icon name="folder" size={13} className="text-mute" />
-        <span className="min-w-0 flex-1 truncate text-left">{zh ? "Local（当前）" : "Local (current)"}</span>
-        <span className="max-w-[140px] truncate font-mono text-[9px] text-faint" title={workspace}>
-          {baseName(workspace)}
-        </span>
+      <div className="mb-1.5 rounded-[5px] border border-line2 bg-raise/60 px-2.5 py-2">
+        <div className="flex items-center gap-1.5">
+          <Icon name="folder" size={13} className="shrink-0 text-mute" />
+          <span className="text-[11px] text-fg2">{zh ? "Local（当前）" : "Local (current)"}</span>
+        </div>
+        <p className="mt-1 truncate font-mono text-[10px] text-mute" title={baseName(workspace)}>
+          {baseName(workspace) || "—"}
+        </p>
+        <p className="mt-0.5 break-all font-mono text-[9px] leading-snug text-faint" title={workspace}>
+          {workspace}
+        </p>
       </div>
 
       {status !== "ok" && status !== "loading" && (
-        <p className="mb-2 px-1 font-mono text-[9.5px] text-dim">
+        <p className="mb-2 text-[10px] leading-snug text-dim">
           {worktreeListDegradeMessage(status === "empty" ? "empty" : status, zh)}
         </p>
       )}
@@ -129,18 +140,23 @@ export function WorktreePanel({ zh }: { zh: boolean }) {
               type="button"
               disabled={busy}
               onClick={() => void onOpen(entry)}
-              className="summary-row w-full disabled:opacity-40"
+              className="flex w-full flex-col items-start rounded-[5px] border border-line px-2.5 py-1.5 text-left hover:bg-high disabled:opacity-40"
               title={entry.path}
             >
-              <Icon name="branch" size={12} className="text-mute" />
-              <span className="min-w-0 flex-1 truncate text-left text-mute">
-                {entry.name ?? entry.id}
-              </span>
-              {entry.branch && (
-                <span className="max-w-[72px] truncate font-mono text-[9px] text-faint">
-                  {entry.branch}
+              <span className="flex w-full items-center gap-1.5">
+                <Icon name="branch" size={12} className="shrink-0 text-mute" />
+                <span className="min-w-0 flex-1 truncate text-[11px] text-mute">
+                  {entry.name ?? entry.id}
                 </span>
-              )}
+                {entry.branch && (
+                  <span className="max-w-[72px] truncate font-mono text-[9px] text-faint">
+                    {entry.branch}
+                  </span>
+                )}
+              </span>
+              <span className="mt-0.5 w-full truncate pl-5 font-mono text-[9px] text-faint">
+                {entry.path}
+              </span>
             </button>
           ))}
         </div>
@@ -161,12 +177,10 @@ export function WorktreePanel({ zh }: { zh: boolean }) {
           onClick={() => void onCreate()}
           className="summary-action disabled:opacity-40"
         >
-          {busy ? (zh ? "…" : "…") : zh ? "创建" : "Create"}
+          {busy ? "…" : zh ? "创建" : "Create"}
         </button>
       </div>
-      {notice && (
-        <p className="mt-1.5 px-1 font-mono text-[9px] text-dim">{notice}</p>
-      )}
+      {notice && <p className="mt-1.5 text-[9.5px] leading-snug text-dim">{notice}</p>}
     </div>
   );
 }

@@ -55,11 +55,37 @@ function callBlob(call: ToolCall): string {
   return `${call.rawKind ?? ""} ${call.title} ${call.detail ?? ""} ${call.input ?? ""}`.toLowerCase();
 }
 
+/** Shell / harness tools that must never appear as "subagents". */
+export function looksLikeShellTool(call: ToolCall): boolean {
+  if (
+    call.kind === "execute" ||
+    call.kind === "terminal" ||
+    call.kind === "monitor" ||
+    call.kind === "background_task_action" ||
+    call.kind === "wait_tasks_action" ||
+    call.kind === "kill_task_action"
+  ) {
+    return true;
+  }
+  const head = `${call.title} ${call.detail ?? ""}`.trim();
+  if (/^(execute|command|run|shell|cmd)\b/i.test(head)) return true;
+  if (/^\[bg\]/i.test(head)) return true;
+  if (
+    /select-string|foreach-object|write-output|powershell|bash\s|cmd\.exe|\/c\s|git\s+(status|diff|log)\b/i.test(
+      head,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
 /**
  * Harness / shell noise that used to pollute the subagent rail
  * (e.g. get_command_or_subagent_output, bare Task call-uuid shells).
  */
 export function isSubagentNoise(call: ToolCall): boolean {
+  if (looksLikeShellTool(call)) return true;
   const blob = callBlob(call);
   if (
     /get_command_or_subagent|wait_tasks|kill_task|list_tasks|background_task_action|wait_tasks_action|kill_task_action|list_task/.test(
@@ -78,26 +104,37 @@ export function isSubagentNoise(call: ToolCall): boolean {
 }
 
 /**
- * Real subagents only (Codex-style): spawn_subagent / subagent_type / named roles.
- * Plain shell `task` tools and poll helpers are excluded.
+ * Real subagents only (Codex-style): spawn_subagent / subagent_type / named agent roles.
+ * Plain shell execute/task tools and poll helpers are excluded.
  */
 export function isRealSubagentCall(call: ToolCall): boolean {
   if (isSubagentNoise(call)) return false;
   const blob = callBlob(call);
 
+  // Strong signals — always keep
   if (/spawn_subagent/.test(blob)) return true;
   if (/"subagent_type"\s*:|subagent_type\s*[:=]/.test(blob)) return true;
+  if (/\bsubagent\b|子代理/.test(blob) && !/get_command_or_subagent/.test(blob)) return true;
 
-  // Named agent role in detail/title (explore · …)
+  // Role label like "explore · …" or reviewer agent titles — only with agent-ish framing
   const role = parseAgentType(call);
-  if (role !== "subagent" && role in TYPE_TONE) {
-    // Avoid classifying random tools that merely mention "test"/"code" in output
-    if (call.kind === "task" || /subagent|agent/.test(blob)) return true;
-  }
+  const roleLooksAgent =
+    role === "explore" ||
+    role === "plan" ||
+    role === "general-purpose" ||
+    role === "general" ||
+    role === "research" ||
+    role === "review" ||
+    role === "implement" ||
+    /reviewer|code-reviewer|architect|探索|审查/.test(blob);
 
-  // Explicit subagent wording (not the get_command_or_subagent_* family)
-  if (/\bsubagent\b|子代理|spawn.?agent/.test(blob) && !/get_command_or_subagent/.test(blob)) {
-    return true;
+  if (roleLooksAgent) {
+    // Reject if title is still clearly a shell one-liner
+    if (looksLikeShellTool(call)) return false;
+    // Prefer task/spawn kinds; avoid random tools that mention "test" in output
+    if (call.kind === "task" || call.kind === "other" || /agent|spawn|subagent|reviewer/.test(blob)) {
+      return true;
+    }
   }
 
   return false;

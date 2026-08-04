@@ -66,7 +66,6 @@ export function EffectiveRuntimePanel({ zh }: { zh: boolean }) {
   const snapshot = buildEffectiveRuntimeSnapshot({
     permissionRequested: permissionMode,
     sandboxRequested: sandboxPreference,
-    // Upstream does not yet report applied sandbox on the ACP wire (U-01).
     sandboxApplied: { kind: "unknown", reason: "not_reported_by_agent" },
     permissionApplied: { kind: "unknown", reason: "not_reported_by_agent" },
     cwd: workspace,
@@ -97,8 +96,8 @@ export function EffectiveRuntimePanel({ zh }: { zh: boolean }) {
   return (
     <div className="mx-2 mb-2 rounded-[6px] border border-line bg-void/80 p-2.5">
       <div className="mb-2 flex items-center gap-1.5">
-        <span className="lbl !text-[9px] !tracking-[0.1em]">
-          {zh ? "生效状态" : "EFFECTIVE"}
+        <span className="text-[10px] font-medium tracking-wide text-mute">
+          {zh ? "生效状态" : "Effective"}
         </span>
         <button
           type="button"
@@ -111,28 +110,26 @@ export function EffectiveRuntimePanel({ zh }: { zh: boolean }) {
         </button>
       </div>
 
-      <div className="space-y-1.5 font-mono text-[10px] leading-snug">
-        <Row
-          label={zh ? "权限 requested" : "Permission requested"}
+      <div className="space-y-2 text-[10.5px] leading-snug">
+        <Field
+          label={zh ? "权限 · 请求" : "Permission · requested"}
           value={snapshot.permission.requested}
         />
-        <Row
-          label={zh ? "权限 applied" : "Permission applied"}
+        <Field
+          label={zh ? "权限 · 实际" : "Permission · applied"}
           value={
             snapshot.permission.applied.kind === "known"
               ? snapshot.permission.applied.value
-              : zh
-                ? "unknown"
-                : "unknown"
+              : "unknown"
           }
           muted
         />
-        <Row
-          label={zh ? "沙箱 requested" : "Sandbox requested"}
+        <Field
+          label={zh ? "沙箱 · 请求" : "Sandbox · requested"}
           value={snapshot.sandbox.requested}
         />
-        <Row
-          label={zh ? "沙箱 applied" : "Sandbox applied"}
+        <Field
+          label={zh ? "沙箱 · 实际" : "Sandbox · applied"}
           value={
             snapshot.sandbox.applied.kind === "known"
               ? snapshot.sandbox.applied.value
@@ -140,30 +137,29 @@ export function EffectiveRuntimePanel({ zh }: { zh: boolean }) {
           }
           muted
         />
-        <div className="flex items-start gap-2 pt-0.5">
-          <span className="shrink-0 text-faint">{zh ? "隔离" : "Isolation"}</span>
-          <span className={`min-w-0 flex-1 text-right ${toneClass(isolation.tone)}`}>
-            {isolationLabelText(isolation, zh)}
-          </span>
-        </div>
-        <div className="flex items-start gap-2">
-          <span className="shrink-0 text-faint">CU</span>
-          <span className="min-w-0 flex-1 text-right text-mute">
-            {snapshot.computerUseOptIn
+        <Field
+          label={zh ? "隔离" : "Isolation"}
+          value={isolationLabelText(isolation, zh)}
+          valueClass={toneClass(isolation.tone)}
+        />
+        <Field
+          label="Computer Use"
+          value={
+            snapshot.computerUseOptIn
               ? zh
                 ? "已 opt-in"
                 : "opt-in on"
               : zh
                 ? "未开启（独立开关）"
-                : "off (independent)"}
-          </span>
-        </div>
+                : "off (independent)"
+          }
+        />
       </div>
 
-      <div className="mt-2 border-t border-line pt-2 font-mono text-[9.5px] text-faint">
+      <div className="mt-2 border-t border-line pt-2 text-[10px] leading-snug text-faint">
         <p>{inspectStatusText(inspect, zh)}</p>
         {inspect.status === "ok" && (
-          <p className="mt-0.5 truncate text-mute" title={inspect.projectRoot}>
+          <p className="mt-1 break-all text-mute" title={inspect.projectRoot}>
             CLI {inspect.grokVersion ?? "—"}
             {inspect.projectTrusted === true
               ? zh
@@ -177,7 +173,7 @@ export function EffectiveRuntimePanel({ zh }: { zh: boolean }) {
           </p>
         )}
         {inspect.error && inspect.status !== "ok" && (
-          <p className="mt-0.5 truncate text-dim" title={inspect.error}>
+          <p className="mt-1 break-all text-dim" title={inspect.error}>
             {inspect.error}
           </p>
         )}
@@ -186,19 +182,23 @@ export function EffectiveRuntimePanel({ zh }: { zh: boolean }) {
   );
 }
 
-function Row({
+function Field({
   label,
   value,
   muted,
+  valueClass,
 }: {
   label: string;
   value: string;
   muted?: boolean;
+  valueClass?: string;
 }) {
   return (
-    <div className="flex items-start gap-2">
-      <span className="shrink-0 text-faint">{label}</span>
-      <span className={`min-w-0 flex-1 truncate text-right ${muted ? "text-dim" : "text-mute"}`}>
+    <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)] gap-x-2 gap-y-0.5">
+      <span className="min-w-0 text-faint">{label}</span>
+      <span
+        className={`min-w-0 break-words text-right font-mono ${valueClass ?? (muted ? "text-dim" : "text-mute")}`}
+      >
         {value}
       </span>
     </div>

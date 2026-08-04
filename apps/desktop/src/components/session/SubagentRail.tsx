@@ -38,7 +38,8 @@ function formatDelta(start: UsageSnap | undefined, end: UsageSnap, zh: boolean):
   const dIn = Math.max(0, end.in - start.in);
   const dOut = Math.max(0, end.out - start.out);
   const dTotal = dIn + dOut;
-  if (dTotal <= 0) return zh ? "token ~0" : "tok ~0";
+  // Session usage often already settled when history is first painted → delta 0
+  if (dTotal <= 0) return zh ? "token —" : "tok —";
   return `↑${fmtTokens(dIn)} ↓${fmtTokens(dOut)}`;
 }
 
@@ -265,15 +266,18 @@ export function SubagentRail({ session, zh }: { session: Session; zh: boolean })
         <div className="rounded-md border border-line bg-raise/80 px-2 py-1.5 font-mono text-[10px] text-mute">
           <div className="text-faint">{zh ? "会话用量（合计）" : "Session usage"}</div>
           <div className="mt-0.5 tnum text-fg2">
-            ↑{fmtTokens(usageNow.in)} ↓{fmtTokens(usageNow.out)}
-            {usageNow.cache > 0 ? ` · cache ${fmtTokens(usageNow.cache)}` : ""}
-            {" · "}
-            {fmtCost(usageNow.cost)}
+            {usageNow.in + usageNow.out <= 0
+              ? zh
+                ? "本会话尚未上报 token（—）"
+                : "No usage reported yet (—)"
+              : `↑${fmtTokens(usageNow.in)} ↓${fmtTokens(usageNow.out)}${
+                  usageNow.cache > 0 ? ` · cache ${fmtTokens(usageNow.cache)}` : ""
+                } · ${fmtCost(usageNow.cost)}`}
           </div>
           <div className="mt-0.5 text-[9px] leading-snug text-faint">
             {zh
-              ? "单卡 token 为运行期间会话增量估算；并行时共享，非上游精确分账。"
-              : "Per-card tokens ≈ session delta while live; shared if concurrent."}
+              ? "单卡 token≈该代理可见期间的会话增量；并行共享。无上报时显示 —。不含普通 shell。"
+              : "Per-card ≈ session delta while visible; shared if concurrent. — if none. Shell tools hidden."}
           </div>
         </div>
 

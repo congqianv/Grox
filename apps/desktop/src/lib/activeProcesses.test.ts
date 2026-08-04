@@ -73,7 +73,29 @@ describe("isSubagentNoise / isRealSubagentCall", () => {
     expect(isRealSubagentCall(call)).toBe(false);
   });
 
-  it("accepts spawn_subagent / subagent_type", () => {
+  it("excludes Execute/Select-String shell and [bg] shells", () => {
+    expect(
+      isRealSubagentCall(
+        tool({
+          id: "ex",
+          status: "done",
+          kind: "execute",
+          title: "Execute `Select-String -Path scripts\\v2\\ship-publish`",
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isRealSubagentCall(
+        tool({
+          id: "bg",
+          status: "done",
+          title: "[bg] $ErrorActionPreference = 'Continue'",
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("accepts spawn_subagent / subagent_type and reviewer-style agents", () => {
     const call = tool({
       id: "3",
       status: "running",
@@ -82,6 +104,18 @@ describe("isSubagentNoise / isRealSubagentCall", () => {
     });
     expect(isRealSubagentCall(call)).toBe(true);
     expect(isSubagentNoise(call)).toBe(false);
+    expect(
+      isRealSubagentCall(
+        tool({
+          id: "rev",
+          status: "done",
+          kind: "task",
+          title: "code-reviewer",
+          detail: "Review deploy/ship recent diffs",
+          input: '{"subagent_type":"code-reviewer"}',
+        }),
+      ),
+    ).toBe(true);
   });
 });
 
