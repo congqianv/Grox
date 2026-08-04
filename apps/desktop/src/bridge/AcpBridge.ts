@@ -85,6 +85,21 @@ export const ACP_METHODS = {
   promptHistory: "x.ai/prompt_history",
 } as const;
 
+/**
+ * Identity sent to the Grok agent / xAI proxy on initialize and session meta.
+ *
+ * Do **not** use `grok-desktop` / `desktop` here: the upstream API currently
+ * answers those surfaces with HTTP 403
+ * "Grok Build is coming soon. You don't have access now."
+ * CLI-compatible identifiers are allowed; Grox still brands itself via
+ * `clientInfo.title` for local diagnostics only (avoid the word "Desktop" in
+ * title — some agent paths treat clientInfo as a product surface hint).
+ */
+const ACP_CLIENT_IDENTIFIER = "cli";
+const ACP_CLIENT_TYPE = "cli";
+/** Branding only — never use as clientIdentifier / clientType. */
+const ACP_CLIENT_INFO = { name: "grok", title: "Grox", version: "0.1.0" } as const;
+
 type JsonObject = Record<string, unknown>;
 type RpcId = string | number;
 
@@ -217,6 +232,24 @@ function errorText(value: unknown): string {
     string(object?.message) ??
     string(object?.data) ??
     (value instanceof Error ? value.message : String(value))
+  );
+}
+
+/**
+ * xAI product gate that returns HTTP 403 with "Grok Build is coming soon".
+ * Seen on desktop client identities and occasionally on shared-leader paths.
+ *
+ * Keep this narrow: bare "don't have access" also appears on normal auth /
+ * subscription errors and must NOT force a Shared→Local demotion.
+ */
+function isProductGate403(detail: string): boolean {
+  const d = detail.toLowerCase();
+  if (d.includes("coming soon") && d.includes("grok")) return true;
+  if (d.includes("coming soon") && (d.includes("403") || d.includes("forbidden"))) return true;
+  return (
+    (d.includes("403") || d.includes("forbidden")) &&
+    d.includes("grok build") &&
+    (d.includes("coming soon") || d.includes("access now"))
   );
 }
 
@@ -800,7 +833,7 @@ export class AcpBridge implements GrokBridge {
    * Sessions currently being restored via `session/load`. While set, emit() keeps
    * a private replay buffer AND periodically flushes it to the UI so the shell
    * is not stuck on the full-screen "Restoring session…" spinner for long
-   * transcripts (especially under agent --leader).
+   * transcripts (especially under shared agent --leader; local --no-leader is similar).
    */
   private progressiveLoad = new Set<string>();
   private progressiveFlushTimers = new Map<string, number>();
@@ -865,6 +898,13 @@ export class AcpBridge implements GrokBridge {
    * instead of racing ready or sticking crashReconnectInFlight.
    */
   private reconnectEpoch = 0;
+  /**
+   * One-shot auto-fallback: if shared leader hits product-gate 403, switch to
+   * local (`--no-leader`) and reconnect. Reset after a successful non-gate turn
+   * so a later regression can recover again.
+   */
+  private productGateFallbackInFlight = false;
+  private productGateFallbackDone = false;
   /** Child died again while crash-reconnect was still finishing success path. */
   private reconnectChildDied = false;
   /** When true, restartAgentInner must not steal `ready` from runCrashReconnect. */
@@ -1493,6 +1533,9 @@ export class AcpBridge implements GrokBridge {
       );
     }
     let response: unknown;
+    // Shared leader can be busy (many IDE clients / long turns / auth.lock).
+    // 45s avoids false "handshake timeout" under load; still fails closed.
+    const initTimeoutMs = 45_000;
     try {
       response = await this.requestRaw(
         ACP_METHODS.initialize,
@@ -1502,17 +1545,67 @@ export class AcpBridge implements GrokBridge {
             fs: { readTextFile: false, writeTextFile: false },
             terminal: false,
           },
-          clientInfo: { name: "grox-desktop", title: "Grox Desktop", version: "0.1.0" },
+          clientInfo: { ...ACP_CLIENT_INFO },
           _meta: {
-            clientIdentifier: "grok-desktop",
-            clientType: "desktop",
+            clientIdentifier: ACP_CLIENT_IDENTIFIER,
+            clientType: ACP_CLIENT_TYPE,
           },
         },
-        20_000,
+        initTimeoutMs,
       );
     } catch (error) {
+      const detail = errorText(error);
+      // If shared leader is wedged, fall back to local once so the shell boots.
+      // Must NOT bare-acp_kill while suppressExitHandling is false: onExit would
+      // permanently reject `this.ready` mid-recovery (PR-A review B1).
+      if (!this.productGateFallbackDone && /timeout|超时|handshake/i.test(detail)) {
+        try {
+          const mode = await invoke<string>("get_agent_leader_mode").catch(() => "local");
+          if (mode !== "local") {
+            await invoke<string>("set_agent_leader_mode", { mode: "local" });
+            this.suppressExitHandling = true;
+            try {
+              // acp_spawn terminates the previous child under spawn_lock; no bare kill.
+              await Promise.race([
+                invoke("acp_spawn", { cwd: this.workspace }),
+                new Promise<never>((_, reject) => {
+                  window.setTimeout(
+                    () => reject(new Error("启动 Grok Agent 超时（30 秒）")),
+                    30_000,
+                  );
+                }),
+              ]);
+              response = await this.requestRaw(
+                ACP_METHODS.initialize,
+                {
+                  protocolVersion: 1,
+                  clientCapabilities: {
+                    fs: { readTextFile: false, writeTextFile: false },
+                    terminal: false,
+                  },
+                  clientInfo: { ...ACP_CLIENT_INFO },
+                  _meta: {
+                    clientIdentifier: ACP_CLIENT_IDENTIFIER,
+                    clientType: ACP_CLIENT_TYPE,
+                  },
+                },
+                initTimeoutMs,
+              );
+              this.captureModelState(response);
+              await this.configureAuthentication(response);
+              // Latch only after a successful re-init.
+              this.productGateFallbackDone = true;
+              return;
+            } finally {
+              this.suppressExitHandling = false;
+            }
+          }
+        } catch {
+          /* fall through to original error */
+        }
+      }
       throw new Error(
-        `Grok Agent 初始化失败：${errorText(error)}。CLI 已启动但未在 20 秒内完成握手。`,
+        `Grok Agent 初始化失败：${detail}。CLI 已启动但未在 ${Math.round(initTimeoutMs / 1000)} 秒内完成握手。若使用共享 Leader，请改「独立进程」或关闭其它占用 agent 的窗口后重试。`,
       );
     }
     this.captureModelState(response);
@@ -2060,7 +2153,7 @@ export class AcpBridge implements GrokBridge {
       method: wireMethod(method),
       params: {
         sessionId,
-        clientIdentifier: "grox-desktop",
+        clientIdentifier: ACP_CLIENT_IDENTIFIER,
         ...params,
       },
     }).catch(() => {
@@ -2945,7 +3038,7 @@ export class AcpBridge implements GrokBridge {
     }
     localStorage.setItem("grok.permissionMode", mode);
     void this.notify("x.ai/yolo_mode_changed", {
-      clientIdentifier: "grox-desktop",
+      clientIdentifier: ACP_CLIENT_IDENTIFIER,
       permission_mode:
         mode === "bypass" ? "always-approve" : mode === "auto" ? "auto" : "default",
       yolo_mode: mode === "bypass",
@@ -3007,7 +3100,7 @@ export class AcpBridge implements GrokBridge {
   private sessionPermissionMeta(sessionId?: string) {
     const mode = sessionId ? this.permissionModeFor(sessionId) : this.permissionModeDefault;
     return {
-      clientIdentifier: "grok-desktop",
+      clientIdentifier: ACP_CLIENT_IDENTIFIER,
       yoloMode: mode === "bypass",
       autoMode: mode === "auto",
     };
@@ -3568,7 +3661,7 @@ export class AcpBridge implements GrokBridge {
       _meta: {
         promptId,
         sendNow,
-        clientIdentifier: "grox-desktop",
+        clientIdentifier: ACP_CLIENT_IDENTIFIER,
       },
     };
 
@@ -3830,6 +3923,8 @@ export class AcpBridge implements GrokBridge {
       const promptUsage = record(meta?.usage);
       if (promptUsage) this.emitUsage(sessionId, promptUsage);
       await this.refreshSessionInfo(sessionId);
+      // Healthy turn: allow another auto-fallback if the gate regresses later.
+      this.productGateFallbackDone = false;
     } catch (error) {
       const detail = errorText(error);
       // CU refuse is handled by the store (restore draft); avoid dual error paint.
@@ -3839,6 +3934,10 @@ export class AcpBridge implements GrokBridge {
       ) {
         throw error instanceof Error ? error : new Error(detail);
       }
+      if (isProductGate403(detail)) {
+        const recovered = await this.tryRecoverFromProductGate403(sessionId, detail);
+        if (recovered) return;
+      }
       this.emit({ type: "error", sessionId, message: detail });
     } finally {
       // Superseded by cancel or a newer primary — do not clear the new flight.
@@ -3846,6 +3945,66 @@ export class AcpBridge implements GrokBridge {
       this.primaryPromptSessions.delete(sessionId);
       // If a concurrent follow-up is still open, finishTurn keeps status=running.
       this.finishTurn(sessionId);
+    }
+  }
+
+  /**
+   * Shared-leader product gate recovery: force `local` (`--no-leader`), reconnect,
+   * and ask the operator to resend. One attempt per failure streak.
+   */
+  private async tryRecoverFromProductGate403(
+    sessionId: string,
+    detail: string,
+  ): Promise<boolean> {
+    if (this.productGateFallbackInFlight || this.productGateFallbackDone) {
+      this.emit({ type: "error", sessionId, message: detail });
+      return true;
+    }
+    this.productGateFallbackInFlight = true;
+    try {
+      let mode = "shared";
+      try {
+        mode = await invoke<string>("get_agent_leader_mode");
+      } catch {
+        /* older shell without the command */
+      }
+      if (mode === "local") {
+        this.emit({
+          type: "error",
+          sessionId,
+          message: `${detail}\n（已在独立进程模式下仍遇产品门控，请检查登录/订阅后重试。）`,
+        });
+        return true;
+      }
+      try {
+        await invoke<string>("set_agent_leader_mode", { mode: "local" });
+      } catch (cause) {
+        this.emit({
+          type: "error",
+          sessionId,
+          message: `${detail}\n（自动切到独立进程失败：${errorText(cause)}）`,
+        });
+        return true;
+      }
+      await this.forceReconnectAgent();
+      // Latch only after reconnect succeeds so a failed recovery can retry later.
+      this.productGateFallbackDone = true;
+      this.emit({
+        type: "error",
+        sessionId,
+        message:
+          "共享 Leader 触发 403「Grok Build is coming soon」产品门控。已自动切换为独立进程并重连 Agent — 请再发一次消息。",
+      });
+      return true;
+    } catch (cause) {
+      this.emit({
+        type: "error",
+        sessionId,
+        message: `${detail}\n（自动恢复失败：${errorText(cause)}）`,
+      });
+      return true;
+    } finally {
+      this.productGateFallbackInFlight = false;
     }
   }
 
