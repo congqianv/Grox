@@ -242,7 +242,7 @@ export function EnvironmentSummary() {
         <section
           role="dialog"
           aria-label={zh ? "环境摘要" : "Environment summary"}
-          className="absolute right-0 top-[calc(100%+9px)] z-50 max-h-[calc(100vh-52px)] w-[min(380px,calc(100vw-20px))] overflow-y-auto rounded-[10px] border border-line2 bg-panel shadow-[0_20px_60px_rgba(0,0,0,0.58)] animate-fade-up"
+          className="absolute right-0 top-[calc(100%+9px)] z-[80] max-h-[calc(100vh-52px)] w-[min(380px,calc(100vw-20px))] overflow-y-auto rounded-[10px] border border-line2 bg-panel shadow-[0_20px_60px_rgba(0,0,0,0.58)] animate-fade-up"
         >
           <div className="flex h-11 items-center border-b border-line px-4">
             <span className="lbl !text-[10px] !tracking-[0.12em]">{zh ? "环境信息" : "ENVIRONMENT"}</span>

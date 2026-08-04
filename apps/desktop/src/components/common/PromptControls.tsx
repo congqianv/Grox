@@ -156,18 +156,32 @@ export function PromptOptionsMenu({
             onSelect={(value) => setSandboxPreference(value as SandboxPreference)}
           />
         )}
-        {showSandbox && sandboxPreference !== "follow_cli" && (
-          <p className="mb-2 text-[10.5px] leading-snug text-gold">
-            {zh
-              ? "说明：工作区/只读/Off 偏好仅记录在壳内。桌面 Agent 主进程不注入 --sandbox（注入会导致模型 API 403）。请保持「跟随 CLI」以稳定对话；工具级隔离由 CLI 内部策略处理。"
-              : "Note: workspace/read-only/off is stored in the shell only. Desktop does not inject --sandbox into the agent leader (that caused model API 403). Prefer Follow CLI for stable chat; tool isolation stays CLI-internal."}
-          </p>
-        )}
-        {showSandbox && sandboxPreference === "off" && (
-          <p className="mb-2 text-[10.5px] text-gold">
-            {zh
-              ? "Off 表示希望关闭沙箱；当前桌面不会改 Agent 启动参数。"
-              : "Off means you want no sandbox; desktop does not change agent argv yet."}
+        {showSandbox && (
+          <p className="mb-2 text-[10.5px] leading-snug text-dim">
+            {zh ? (
+              <>
+                <span className="text-mute">工作区</span>
+                ：希望工具主要在项目目录内读写。
+                <span className="text-mute"> 只读</span>
+                ：希望尽量不写文件。
+                <span className="text-mute"> Off</span>
+                ：希望关闭隔离。
+                <br />
+                <span className="text-gold">
+                  当前桌面：选中项只记偏好，不注入 Agent 主进程（避免 API 403）。对话请优先「跟随 CLI」；真正工具隔离仍靠 CLI。
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="text-mute">Workspace</span>: tools prefer project FS.{" "}
+                <span className="text-mute">Read-only</span>: prefer no writes.{" "}
+                <span className="text-mute">Off</span>: no isolation.
+                <br />
+                <span className="text-gold">
+                  Desktop stores the preference only — does not inject into the agent leader (API 403). Prefer Follow CLI; tool isolation stays CLI-side.
+                </span>
+              </>
+            )}
           </p>
         )}
         {showReview && (
